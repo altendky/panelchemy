@@ -1,0 +1,9 @@
+.venv/
+.coverage
+.lycheecache
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+dist/
+node_modules/

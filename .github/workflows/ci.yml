@@ -1,0 +1,111 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow_ref, github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  python-versions:
+    name: Python version pins
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+      primary: ${{ steps.versions.outputs.primary }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Read interpreter matrix from mise
+        id: versions
+        run: python3 scripts/ci-python-versions.py >> "$GITHUB_OUTPUT"
+
+  mise:
+    name: Mise lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5
+        with:
+          install_args: --locked --dry-run
+          cache: false
+
+  pre-commit:
+    name: Repository checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml', 'mise.toml', 'mise.lock', '.mise/locks/**') }}
+      - name: Run blocking checks
+        run: pre-commit run --all-files --show-diff-on-failure
+      - name: Check external links (advisory)
+        continue-on-error: true
+        run: pre-commit run lychee-external --all-files --hook-stage manual
+
+  python:
+    name: Format, lint, and types
+    needs: python-versions
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: ${{ needs.python-versions.outputs.primary }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5
+        with:
+          install_args: python uv
+      - run: uv sync --locked --python "$PYTHON_VERSION"
+      - run: uv run --locked --python "$PYTHON_VERSION" ruff format --check src scripts
+      - run: uv run --locked --python "$PYTHON_VERSION" ruff check src scripts
+      - run: uv run --locked --python "$PYTHON_VERSION" basedpyright
+
+  build:
+    name: Build and installed CLI (Python ${{ matrix.python-version }})
+    needs: python-versions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(needs.python-versions.outputs.versions) }}
+    env:
+      PYTHON_VERSION: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5
+        with:
+          install_args: python uv
+      - name: Build distributions
+        run: uv build --python "$PYTHON_VERSION"
+      - name: Check installed wheel entry point
+        run: |
+          uv run --isolated --no-project --python "$PYTHON_VERSION" --with dist/*.whl panelchemy --version
+          uv run --isolated --no-project --python "$PYTHON_VERSION" --with dist/*.whl python -m panelchemy --help
+
+  all:
+    name: all
+    if: ${{ !cancelled() }}
+    needs: [python-versions, mise, pre-commit, python, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}

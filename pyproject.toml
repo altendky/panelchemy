@@ -1,0 +1,40 @@
+[project]
+name = "panelchemy"
+version = "0.0.0.dev0"
+description = "Comic-panel artwork conversion to layered relief"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "MIT OR Apache-2.0"
+dependencies = []
+
+[project.scripts]
+panelchemy = "panelchemy.cli:main"
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.31",
+  "pytest>=8.4",
+  "pytest-cov>=7.0",
+  "ruff>=0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.basedpyright]
+typeCheckingMode = "recommended"
+pythonVersion = "3.12"
+include = ["src", "scripts"]
