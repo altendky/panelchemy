@@ -214,7 +214,10 @@ def _whole_boundary_contact(
 
 def _bounds(shape: TopoDS_Shape) -> tuple[Coordinate, Coordinate]:
     bounds = Bnd_Box()
-    BRepBndLib.Add_s(shape, bounds, False)
+    # Membership/registration checks need geometric extents. Add_s includes
+    # edge tolerances, which can exceed the crossing allowance after Booleans
+    # even when the actual geometry remains exactly on its material planes.
+    BRepBndLib.AddOptimal_s(shape, bounds, False, False)
     if bounds.IsVoid():
         raise ExportError("cannot export an empty shape")
     low, high = bounds.CornerMin(), bounds.CornerMax()
