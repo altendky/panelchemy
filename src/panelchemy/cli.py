@@ -23,11 +23,26 @@ def main() -> None:
     _ = separation.add_argument("--output", type=Path, required=True)
     _ = separation.add_argument("--config", type=Path)
     _ = separation.add_argument("--silhouette-mask", type=Path)
+    local_server = commands.add_parser("serve", help="open the local browser workflow")
+    _ = local_server.add_argument("--port", type=int, default=8765)
+    _ = local_server.add_argument("--max-pixels", type=int, default=4_000_000)
+    _ = local_server.add_argument("--max-request-mib", type=int, default=32)
     args = parser.parse_args()
     if cast("str | None", args.command) is None:
         parser.print_help()
         return
     try:
+        if cast("str", args.command) == "serve":
+            from panelchemy.server import Limits, serve
+
+            serve(
+                cast("int", args.port),
+                Limits(
+                    max_pixels=cast("int", args.max_pixels),
+                    max_request_bytes=cast("int", args.max_request_mib) * 1024 * 1024,
+                ),
+            )
+            return
         source = cast("Path", args.input)
         output = cast("Path", args.output)
         config_path = cast("Path | None", args.config)
