@@ -6,6 +6,8 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
+from PIL import Image
+
 from panelchemy.separation import load_config, process_file
 
 
@@ -82,6 +84,6 @@ def main() -> None:
             silhouette_path=mask_path,
             protected_paths=(config_path,) if config_path else (),
         )
-    except (ValueError, OSError) as error:
+    except (ValueError, OSError, Image.DecompressionBombError) as error:
         parser.error(str(error))
     print(json.dumps(manifest, indent=2, sort_keys=True))
