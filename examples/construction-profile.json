@@ -6,5 +6,6 @@
   "orange_thickness_mm": 1.0,
   "white_thickness_mm": 1.0,
   "taper_angle_deg": 10.0,
-  "rim_width_mm": 0.2
+  "rim_width_mm": 0.2,
+  "contour_tolerance_mm": 0.0
 }

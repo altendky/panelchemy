@@ -165,3 +165,51 @@ def test_source_snapshot_remains_the_provenance_input(
     )
     assert manifest["source"] == {"name": "input.png", "sha256": original_hash}
     assert sha256(source.read_bytes()).hexdigest() != original_hash
+
+
+def test_optional_approximation_is_recorded_and_comparison_is_protected(
+    tmp_path: Path,
+) -> None:
+    labels = np.zeros((32, 32), dtype=np.uint8)
+    labels[[0, -1], :] = 2
+    labels[:, [0, -1]] = 2
+    for row in range(8, 22):
+        labels[row, 8 + (row - 8) // 2 : 17 + (row - 8) // 2] = 2
+    image = Image.fromarray(
+        np.asarray(SeparationConfig().palette, dtype=np.uint8)[labels]
+    )
+    source = tmp_path / "input.png"
+    image.save(source)
+    profile = ConstructionProfile(
+        long_edge_mm=30, taper_angle_deg=0, contour_tolerance_mm=0.8
+    )
+    output = tmp_path / "model"
+    manifest = process_relief_file(source, output, profile)
+    assert manifest["profile"] == profile.as_dict()
+    diagnostics = cast("dict[str, object]", manifest["diagnostics"])
+    assert diagnostics["contour_approximation"] is not None
+    assert "contours.svg" in cast("dict[str, str]", manifest["files"])
+    assert (output / "contours.svg").is_file()
+    assert (
+        sha256((output / "contours.svg").read_bytes()).hexdigest()
+        == cast("dict[str, str]", manifest["files"])["contours.svg"]
+    )
+    # The post-approximation budget applies to kernel input, not raw allocation.
+    with pytest.raises(ValueError, match="approximated contours require"):
+        _ = build_relief(separate(image), profile, max_vertices=4)
+    for invalid in (True, 0, -1):
+        with pytest.raises(ValueError, match="positive integer"):
+            _ = build_relief(separate(image), profile, max_vertices=invalid)
+    other = tmp_path / "protected"
+    other.mkdir()
+    (other / "contours.svg").hardlink_to(source)
+    with pytest.raises(ValueError, match="overwrite"):
+        _ = process_relief_file(source, other, profile)
+    # Reusing an output directory with exact mode removes the stale comparison.
+    exact = process_relief_file(
+        source, output, replace(profile, contour_tolerance_mm=0)
+    )
+    assert not (output / "contours.svg").exists()
+    assert (
+        cast("dict[str, object]", exact["diagnostics"])["contour_approximation"] is None
+    )

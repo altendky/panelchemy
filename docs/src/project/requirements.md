@@ -21,6 +21,10 @@
   Make those interactions inspectable and account for meaningful changes.
 - Minimum-feature enforcement, small-island removal, and similar cleanup are
   outside the current scope. Consider them separately if needed later.
+- Optional contour approximation is explicitly selected in millimeters and off
+  by default. Retain every island and counter, validate the boundary deviation,
+  and provide original/selected outlines. Tapering preserves the resulting
+  selected tops; approximation is a separate, reported artwork change.
 - Use the supplied art samples to evaluate general behavior without reproducing
   their exact letters, animal anatomy, wear, or halftone rules in the converter.
 

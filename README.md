@@ -41,6 +41,10 @@ Build [layered BRep geometry](docs/src/project/relief.md) with:
 mise exec -- uv run --locked panelchemy relief /path/to/artwork.png --output local-inputs/relief
 ```
 
+Use `--profile examples/construction-profile.json` to configure size, band heights,
+taper angle, and optional contour approximation. Approximation is off by default;
+when enabled, inspect the original/selected outline comparison in `contours.svg`.
+
 ## Layout
 
 - `src/panelchemy/`: reusable Python core and command-line adapter.
