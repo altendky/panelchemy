@@ -6,9 +6,10 @@ follow Scansor's browser/deployment structure if the processing runtime fits.
 
 ## Current Status
 
-The repository foundation, development tooling, documentation, and package entry
-point are the initial stage. No image converter, relief generator, browser
-application, printable mesh, or physical print has been completed.
+The repository foundation and the image-space separation API/CLI are implemented.
+Separation produces reviewable palette, silhouette, visible-color, and cumulative
+support masks. Relief generation, the browser application, printable geometry,
+and physical printing remain subsequent stages.
 
 The handoff's animal panels are evaluation inputs. Their exact artwork details
 are not requirements for the general tool. The broader art-generation prompt
@@ -20,3 +21,4 @@ workflow is separate from the initial conversion work.
 - [Architecture](architecture.md)
 - [Development and automation](development.md)
 - [Work stages](stages.md)
+- [Color separation workflow](separation.md)

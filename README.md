@@ -3,9 +3,9 @@
 Panelchemy is a local tool in development for converting comic-panel artwork
 into configurable, three-color layered relief.
 
-The repository foundation is in place. Image conversion, previews, geometry,
-and printing remain tracked implementation stages; no printable model exists
-yet.
+The repository foundation and image-space separation workflow are in place.
+Geometry, the browser workflow, and physical printing remain tracked stages;
+no printable model exists yet.
 
 ## Development
 
@@ -22,6 +22,12 @@ mise exec -- uv run --locked panelchemy --help
 See the [project documentation](docs/src/project/index.md) for the current
 direction, [development commands](docs/src/project/development.md), and
 [work stages](docs/src/project/stages.md).
+
+Create [separation previews](docs/src/project/separation.md) with:
+
+```sh
+mise exec -- uv run --locked panelchemy separate /path/to/artwork.png --output local-inputs/preview
+```
 
 ## Layout
 
