@@ -10,8 +10,9 @@ The repository foundation, image-space separation API/CLI, and local browser
 workflow are implemented. They produce reviewable palette, silhouette,
 visible-color, and cumulative support masks. The OCCT relief API/CLI additionally
 builds layered solids and projected support previews, using exact contours by
-default or explicitly configured, checked approximation. Validated slicer
-exports and physical printing remain subsequent stages.
+default or explicitly configured, checked approximation. The model exporter
+writes exact STEP and checked combined/registered STL geometry. Physical print
+quality remains unverified; slicer projects and deployment remain later work.
 
 The handoff's animal panels are evaluation inputs. Their exact artwork details
 are not requirements for the general tool. The broader art-generation prompt
@@ -26,3 +27,4 @@ workflow is separate from the initial conversion work.
 - [Color separation workflow](separation.md)
 - [Local browser workflow](local-browser.md)
 - [Layered relief construction](relief.md)
+- [Validated model export](export.md)

@@ -12,6 +12,9 @@ input hashes, file checksums, diagnostics, and dependency versions. Empty materi
 bands are omitted. A BRep is inspectable CAD geometry; this stage does not claim
 a print-ready mesh or validated physical print.
 
+Use [model export](export.md) for exact STEP and checked combined/material STL
+files. Slicer project packaging is separate, deferred work.
+
 ## Construction Profile
 
 Use `--profile settings.json` with the

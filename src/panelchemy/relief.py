@@ -2,7 +2,7 @@
 
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from importlib.metadata import version
 from io import BytesIO
@@ -10,7 +10,7 @@ from math import cos, isclose, pi
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from OCP.TopAbs import TopAbs_SOLID
@@ -31,6 +31,17 @@ from panelchemy.separation import (
     SeparationResult,
     prepare_artifacts,
     separate,
+)
+
+if TYPE_CHECKING:
+    from panelchemy.export import ExportConfig
+
+EXPORT_NAMES = (
+    "relief.stl",
+    "black.stl",
+    "orange.stl",
+    "white.stl",
+    "relief.step",
 )
 
 
@@ -330,8 +341,9 @@ def process_relief_file(
     silhouette_path: Path | None = None,
     protected_paths: tuple[Path, ...] = (),
     max_vertices: int = 25_000,
+    export_config: "ExportConfig | None" = None,
 ) -> dict[str, object]:
-    """Write exact BReps and inspectable previews; this is not a print-ready claim."""
+    """Stage checked CAD and optional validated exports with shared provenance."""
     names = [
         "relief.brep",
         "black.brep",
@@ -341,6 +353,7 @@ def process_relief_file(
         "profile.json",
         "manifest.json",
         "contours.svg",
+        *EXPORT_NAMES,
     ]
     protected = {path.resolve() for path in (source, *protected_paths)}
     if silhouette_path:
@@ -373,6 +386,19 @@ def process_relief_file(
         occt.write_brep(model.solid, stage / "relief.brep")
         for name, shape in model.materials.items():
             occt.write_brep(shape, stage / f"{name}.brep")
+        export_report: dict[str, object] | None = None
+        if export_config is not None:
+            from panelchemy.export import export_model
+
+            bundle = export_model(model, export_config)
+            for name, content in bundle.files.items():
+                if name not in EXPORT_NAMES:
+                    raise ValueError(f"unexpected export artifact: {name}")
+                _ = (stage / name).write_bytes(content)
+            export_report = {
+                "config": asdict(export_config),
+                "validation": bundle.validation,
+            }
         _ = (stage / "preview.svg").write_text(
             preview_svg(model, result.config.palette)
         )
@@ -398,6 +424,9 @@ def process_relief_file(
             "schema_version": 1,
             "kind": "occt-relief",
             "print_ready": False,
+            "mesh_validated": export_report is not None,
+            "physical_print_validated": False,
+            "export": export_report,
             "source": separation_manifest["source"],
             "separation": separation_manifest,
             "profile": model.profile.as_dict(),
@@ -437,6 +466,9 @@ def process_relief_file(
                 (output / f"{name}.brep").unlink(missing_ok=True)
         if model.contour_comparison_svg is None:
             (output / "contours.svg").unlink(missing_ok=True)
+        for name in EXPORT_NAMES:
+            if not (stage / name).exists():
+                (output / name).unlink(missing_ok=True)
         _ = (output / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
