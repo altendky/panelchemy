@@ -1,5 +1,6 @@
 """Serialized registration, material contacts and explicit invalid-mesh failures."""
 
+from fractions import Fraction
 from io import BytesIO
 from typing import cast, override
 
@@ -28,7 +29,10 @@ from panelchemy.export import (
     ExportError,
     _check_float32,  # pyright: ignore[reportPrivateUsage]
     _combined,  # pyright: ignore[reportPrivateUsage]
+    _conform_meshes,  # pyright: ignore[reportPrivateUsage]
     _Mesh,  # pyright: ignore[reportPrivateUsage]
+    _normal,  # pyright: ignore[reportPrivateUsage]
+    _quantize_meshes,  # pyright: ignore[reportPrivateUsage]
     _read_stl,  # pyright: ignore[reportPrivateUsage]
     _step,  # pyright: ignore[reportPrivateUsage]
     _stl,  # pyright: ignore[reportPrivateUsage]
@@ -167,6 +171,153 @@ def _tetra(offset: tuple[float, float, float] = (0, 0, 0)) -> _Mesh:
         for x, y, z in ((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))
     ]
     return _Mesh(points, [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)])
+
+
+def _bridged_tetra(middle_y: float = 0.0) -> _Mesh:
+    return _Mesh(
+        [(0, 0, 0), (2, 0, 0), (0, 2, 0), (0, 0, 2), (1, middle_y, 0)],
+        [(0, 2, 1), (0, 4, 3), (4, 1, 3), (0, 3, 2), (1, 2, 3), (0, 1, 4)],
+    )
+
+
+def _exact_volume(mesh: _Mesh) -> Fraction:
+    terms: list[Fraction] = []
+    for triangle in mesh.triangles:
+        a, b, c = [
+            [Fraction(value) for value in mesh.points[index]] for index in triangle
+        ]
+        cross = (
+            b[1] * c[2] - b[2] * c[1],
+            b[2] * c[0] - b[0] * c[2],
+            b[0] * c[1] - b[1] * c[0],
+        )
+        terms.append(
+            sum((a[index] * cross[index] for index in range(3)), Fraction()) / 6
+        )
+    return sum(terms, Fraction())
+
+
+def _triangle_keys(mesh: _Mesh) -> set[tuple[tuple[float, float, float], ...]]:
+    return {
+        tuple(sorted(mesh.points[index] for index in triangle))
+        for triangle in mesh.triangles
+    }
+
+
+@pytest.mark.parametrize("vertical_edge", [False, True])
+def test_exact_zero_bridge_requires_conforming_subdivision_and_keeps_coordinates(
+    vertical_edge: bool,
+) -> None:
+    mesh = _bridged_tetra()
+    if vertical_edge:
+        mesh.points = [(y, z, x) for x, y, z in mesh.points]
+    with pytest.raises(ExportError, match="zero-area"):
+        _ = _validate_mesh(mesh)
+    with pytest.raises(ExportError, match="open"):
+        _ = _validate_mesh(_Mesh(mesh.points, mesh.triangles[:-1]))
+    conformed, report = _conform_meshes({"part": mesh}, 100)
+    fixed = conformed["part"]
+    assert fixed.points == mesh.points
+    assert _exact_volume(fixed) == _exact_volume(mesh) == Fraction(4, 3)
+    assert _validate_mesh(fixed)["closed_shells"] == 1
+    assert report["removed_exact_zero_triangles"] == 1
+    assert report["added_positive_triangles"] == 1
+    assert report["coordinate_movement_mm"] == 0
+
+
+def test_three_constrained_cap_edges_match_opposite_winding() -> None:
+    points = [
+        (0.0, 0.0, 2.0),
+        (2.0, 0.0, 2.0),
+        (0.0, 2.0, 2.0),
+        (1.0, 0.0, 2.0),
+        (1.0, 1.0, 2.0),
+        (0.0, 1.0, 2.0),
+    ]
+    lower = _Mesh(points, [(0, 1, 2), (0, 1, 3), (1, 2, 4), (2, 0, 5)])
+    upper = _Mesh(points[:3], [(2, 1, 0)])
+    result, report = _conform_meshes({"lower": lower, "upper": upper}, 100)
+    assert _triangle_keys(result["lower"]) == _triangle_keys(result["upper"])
+    assert len(result["lower"].triangles) == len(result["upper"].triangles) == 4
+    assert _exact_volume(result["lower"]) == _exact_volume(lower)
+    assert _exact_volume(result["upper"]) == _exact_volume(upper)
+    assert result["lower"].points == points
+    assert set(result["upper"].points) == set(points)
+    for name, expected_sign in (("lower", 1), ("upper", -1)):
+        assert all(
+            _normal([result[name].points[index] for index in triangle])[2]
+            == expected_sign
+            for triangle in result[name].triangles
+        )
+    assert report["removed_exact_zero_triangles"] == 3
+    assert report["added_positive_triangles"] == 6
+    with pytest.raises(ExportError, match="subdivision exceeds max_triangles"):
+        _ = _conform_meshes({"lower": lower, "upper": upper}, 5)
+
+
+def test_nested_middle_vertices_split_containing_edges_across_parts() -> None:
+    points = [
+        (0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0),
+        (0.0, 2.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (1.5, 0.0, 0.0),
+    ]
+    first = _Mesh(points, [(0, 1, 2), (0, 1, 3), (0, 1, 4)])
+    second = _Mesh(points[:3], [(1, 0, 2)])
+    result, _ = _conform_meshes({"first": first, "second": second}, 100)
+    assert _triangle_keys(result["first"]) == _triangle_keys(result["second"])
+    assert len(result["first"].triangles) == 3
+    assert set(result["second"].points) == set(points)
+
+
+def test_conformance_rejects_losing_a_zero_only_material() -> None:
+    line = _Mesh([(0, 0, 0), (1, 0, 0), (0.5, 0, 0)], [(0, 1, 2)])
+    with pytest.raises(ExportError, match="discard a material vertex"):
+        _ = _conform_meshes({"solid": _tetra(), "line": line}, 100)
+
+
+def test_positive_exact_cross_survives_floating_product_cancellation() -> None:
+    epsilon = 2.0**-27
+    mesh = _Mesh([(0, 0, 0), (1 + epsilon, 1, 0), (1, 1 - epsilon, 0)], [(0, 1, 2)])
+    # Naive multiplication rounds both products to one; the exact determinant
+    # is negative and this face must remain present with an outward normal.
+    assert (1 + epsilon) * (1 - epsilon) - 1 == 0
+    result, report = _conform_meshes({"part": mesh}, 10)
+    assert result["part"].triangles == mesh.triangles
+    assert result["part"].points == mesh.points
+    assert report["removed_exact_zero_triangles"] == 0
+    assert _normal(mesh.points) == (0, 0, -1)
+
+
+def test_float32_created_exact_zero_has_separate_conformance_phase() -> None:
+    mesh = _bridged_tetra(middle_y=1e-46)
+    native, native_report = _conform_meshes({"part": mesh}, 100)
+    assert native_report["removed_exact_zero_triangles"] == 0
+    quantized, quantization = _quantize_meshes(native, 0.02)
+    assert len(set(quantized["part"].points)) == len(mesh.points)
+    assert quantization["maximum_coordinate_error_mm"] == 1e-46
+    final, report = _conform_meshes(quantized, 100)
+    assert report["removed_exact_zero_triangles"] == 1
+    assert report["added_positive_triangles"] == 1
+    assert final["part"].points == quantized["part"].points
+    assert _validate_mesh(final["part"])["closed_shells"] == 1
+    serialized = _read_stl(_stl(final["part"]))
+    assert _check_float32(final["part"], serialized, 0.02) == 0
+
+
+def test_global_quantization_rejects_coordinate_merges_between_materials() -> None:
+    first, second = _tetra((250, 0, 0)), _tetra((250.000001, 0, 0))
+    with pytest.raises(ExportError, match="collapses distinct feature vertices"):
+        _ = _quantize_meshes({"first": first, "second": second}, 0.02)
+
+
+@pytest.mark.parametrize("value", [1e40, float("inf"), float("nan")])
+def test_quantization_unrepresentable_coordinates_fail_actionably(value: float) -> None:
+    mesh = _tetra()
+    mesh.points[0] = (value, 0, 0)
+    with pytest.raises(ExportError, match="float32"):
+        _ = _quantize_meshes({"part": mesh}, 0.02)
 
 
 def test_float32_rejects_collapsing_distinct_feature_vertices() -> None:

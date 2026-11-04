@@ -9,8 +9,9 @@ import struct
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from io import BytesIO
-from math import fsum, isfinite, sqrt, ulp
+from math import fsum, hypot, isfinite, sqrt, ulp
 from threading import Lock
 from typing import Protocol, Self, cast
 
@@ -39,6 +40,7 @@ from panelchemy.contours import PanelContours
 
 type Coordinate = tuple[float, float, float]
 type Triangle = tuple[int, int, int]
+type RationalCoordinate = tuple[Fraction, Fraction, Fraction]
 _NAMES = ("black", "orange", "white")
 _STEP_LOCK = Lock()
 
@@ -144,11 +146,55 @@ def _cross(a: Coordinate, b: Coordinate) -> Coordinate:
 
 
 def _length(a: Coordinate) -> float:
-    return sqrt(_dot(a, a))
+    return hypot(*a)
+
+
+def _rational(point: Coordinate) -> RationalCoordinate:
+    return (Fraction(point[0]), Fraction(point[1]), Fraction(point[2]))
+
+
+def _exact_triangle_cross(
+    a: RationalCoordinate, b: RationalCoordinate, c: RationalCoordinate
+) -> RationalCoordinate:
+    u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    v = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+    return (
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    )
+
+
+def _exact_face_cross(
+    triangle: Triangle, rational: Sequence[RationalCoordinate]
+) -> RationalCoordinate:
+    return _exact_triangle_cross(
+        rational[triangle[0]], rational[triangle[1]], rational[triangle[2]]
+    )
+
+
+def _triangle_cross(points: Sequence[Coordinate]) -> Coordinate:
+    """Keep exact positive faces when floating products cancel to zero.
+
+    This fallback belongs to triangle area/normal predicates, never the generic
+    vector cross product used by the intersection candidate loops.
+    """
+    raw = _cross(_subtract(points[1], points[0]), _subtract(points[2], points[0]))
+    if raw != (0.0, 0.0, 0.0):
+        return raw
+    exact = _exact_triangle_cross(
+        _rational(points[0]), _rational(points[1]), _rational(points[2])
+    )
+    raw = (float(exact[0]), float(exact[1]), float(exact[2]))
+    if raw == (0.0, 0.0, 0.0) and any(exact):
+        raise ExportError(
+            "a positive triangle cross product cannot be represented numerically"
+        )
+    return raw
 
 
 def _normal(points: Sequence[Coordinate]) -> Coordinate:
-    raw = _cross(_subtract(points[1], points[0]), _subtract(points[2], points[0]))
+    raw = _triangle_cross(points)
     length = _length(raw)
     if length == 0:
         raise ExportError("mesh contains a zero-area triangle")
@@ -231,6 +277,241 @@ def _compact(points: Sequence[Coordinate], triangles: Sequence[Triangle]) -> _Me
         [points[i] for i in used],
         [(remap[a], remap[b], remap[c]) for a, b, c in triangles],
     )
+
+
+def _segment_parameter(
+    point: RationalCoordinate, start: RationalCoordinate, end: RationalCoordinate
+) -> Fraction | None:
+    if any(_exact_triangle_cross(start, end, point)):
+        return None
+    axis = next((axis for axis in range(3) if start[axis] != end[axis]), None)
+    if axis is None:
+        raise ExportError("a conformance edge has coincident endpoints")
+    parameter = (point[axis] - start[axis]) / (end[axis] - start[axis])
+    return parameter if 0 < parameter < 1 else None
+
+
+def _conform_meshes(
+    meshes: dict[str, _Mesh], max_triangles: int
+) -> tuple[dict[str, _Mesh], dict[str, object]]:
+    """Partition positive triangles at exact-zero bridge middle vertices.
+
+    All arithmetic deciding collinearity and segment membership is exact on the
+    stored binary floats. An AABB tree only finds candidates. Every split uses
+    an existing global coordinate; positive surfaces and winding are preserved.
+    Shared caps follow the same global edge order even with opposite winding.
+    """
+    if not meshes:
+        raise ExportError("conformance requires nonempty material meshes")
+    input_count = sum(len(mesh.triangles) for mesh in meshes.values())
+    if input_count > max_triangles:
+        raise ExportError(f"mesh conformance exceeds max_triangles={max_triangles:,}")
+    for mesh in meshes.values():
+        if (
+            not mesh.points
+            or not mesh.triangles
+            or not all(isfinite(value) for point in mesh.points for value in point)
+        ):
+            raise ExportError(
+                "mesh conformance requires nonempty finite coordinates and triangles"
+            )
+        if len(set(mesh.points)) != len(mesh.points):
+            raise ExportError(
+                "mesh conformance cannot merge coincident distinct vertices"
+            )
+        if any(
+            len(set(triangle)) != 3
+            or any(index < 0 or index >= len(mesh.points) for index in triangle)
+            for triangle in mesh.triangles
+        ):
+            raise ExportError(
+                "mesh conformance requires distinct valid triangle indices"
+            )
+    points = sorted({point for mesh in meshes.values() for point in mesh.points})
+    global_ids = {point: index for index, point in enumerate(points)}
+    rational = [_rational(point) for point in points]
+    positive: dict[str, list[Triangle]] = {}
+    removed: Counter[str] = Counter()
+    middle_vertices: set[int] = set()
+    for name, mesh in meshes.items():
+        mapping = [global_ids[point] for point in mesh.points]
+        positive[name] = []
+        for a, b, c in mesh.triangles:
+            triangle = (mapping[a], mapping[b], mapping[c])
+            if any(_exact_face_cross(triangle, rational)):
+                positive[name].append(triangle)
+            else:
+                left, middle, right = sorted(triangle)
+                if (
+                    _segment_parameter(
+                        rational[middle], rational[left], rational[right]
+                    )
+                    is None
+                ):
+                    raise ExportError(
+                        "an exact-zero triangle has no unique strict middle vertex"
+                    )
+                middle_vertices.add(middle)
+                removed[name] += 1
+    report: dict[str, object] = {
+        "input_triangles": input_count,
+        "removed_exact_zero_triangles": sum(removed.values()),
+        "strict_middle_vertices": len(middle_vertices),
+        "global_coordinates": len(points),
+        "coordinate_movement_mm": 0.0,
+    }
+    if not middle_vertices:
+        report.update(
+            output_triangles=input_count,
+            added_positive_triangles=0,
+            edge_candidate_checks=0,
+            materials={
+                name: {
+                    "removed_exact_zero_triangles": 0,
+                    "added_positive_triangles": 0,
+                    "added_local_coordinates": 0,
+                }
+                for name in meshes
+            },
+        )
+        return dict(meshes), report
+    edges = sorted(
+        {
+            (min(a, b), max(a, b))
+            for triangles in positive.values()
+            for triangle in triangles
+            for a, b in (
+                (triangle[0], triangle[1]),
+                (triangle[1], triangle[2]),
+                (triangle[2], triangle[0]),
+            )
+        }
+    )
+    if not edges:
+        raise ExportError("exact-zero conformance would discard every positive face")
+    edge_boxes = [
+        box(
+            min(points[a][0], points[b][0]),
+            min(points[a][1], points[b][1]),
+            max(points[a][0], points[b][0]),
+            max(points[a][1], points[b][1]),
+        )
+        for a, b in edges
+    ]
+    tree = STRtree(edge_boxes)
+    insertions: dict[tuple[int, int], list[tuple[Fraction, int]]] = defaultdict(list)
+    checked = 0
+    for middle in sorted(middle_vertices):
+        point = points[middle]
+        candidates = tree.query(Point(point[0], point[1]))
+        for candidate in range(len(candidates)):
+            checked += 1
+            if checked > 5_000_000:
+                raise ExportError(
+                    "exact-zero conformance exceeds 5,000,000 edge candidates; review tessellation settings"
+                )
+            edge = edges[int(cast("int", candidates[candidate]))]
+            a, b = edge
+            if middle in edge or not min(points[a][2], points[b][2]) <= point[2] <= max(
+                points[a][2], points[b][2]
+            ):
+                continue
+            parameter = _segment_parameter(rational[middle], rational[a], rational[b])
+            if parameter is not None:
+                insertions[edge].append((parameter, middle))
+    chains = {
+        edge: [index for _, index in sorted(values)]
+        for edge, values in insertions.items()
+    }
+    output: dict[str, _Mesh] = {}
+    total = 0
+    material_reports: dict[str, object] = {}
+    for name, mesh in meshes.items():
+        local_points = list(mesh.points)
+        local_ids = {point: index for index, point in enumerate(local_points)}
+        output_triangles: list[Triangle] = []
+        added = 0
+        for triangle in positive[name]:
+            pieces = [triangle]
+            boundary_edges = sorted(
+                (min(a, b), max(a, b))
+                for a, b in (
+                    (triangle[0], triangle[1]),
+                    (triangle[1], triangle[2]),
+                    (triangle[2], triangle[0]),
+                )
+            )
+            for edge in boundary_edges:
+                if edge not in chains:
+                    continue
+                children: list[Triangle] = []
+                found = 0
+                for piece in pieces:
+                    for position in range(3):
+                        a, b, c = (
+                            piece[position],
+                            piece[(position + 1) % 3],
+                            piece[(position + 2) % 3],
+                        )
+                        if (min(a, b), max(a, b)) == edge:
+                            chain = [edge[0], *chains[edge], edge[1]]
+                            if a != edge[0]:
+                                chain.reverse()
+                            if total + len(children) + len(chain) - 1 > max_triangles:
+                                raise ExportError(
+                                    f"conforming subdivision exceeds max_triangles={max_triangles:,}; review tessellation settings"
+                                )
+                            children.extend(
+                                (chain[index], chain[index + 1], c)
+                                for index in range(len(chain) - 1)
+                            )
+                            found += 1
+                            break
+                    else:
+                        children.append(piece)
+                if found != 1:
+                    raise ExportError(
+                        "conforming subdivision could not identify one original boundary edge"
+                    )
+                pieces = children
+            added += len(pieces) - 1
+            total += len(pieces)
+            if total > max_triangles:
+                raise ExportError(
+                    f"conforming subdivision exceeds max_triangles={max_triangles:,}; review tessellation settings"
+                )
+            for piece in pieces:
+                if len(pieces) > 1 and not any(_exact_face_cross(piece, rational)):
+                    raise ExportError(
+                        "conforming subdivision created an exact-zero child triangle"
+                    )
+                local: list[int] = []
+                for index in piece:
+                    coordinate = points[index]
+                    if coordinate not in local_ids:
+                        local_ids[coordinate] = len(local_points)
+                        local_points.append(coordinate)
+                    local.append(local_ids[coordinate])
+                output_triangles.append((local[0], local[1], local[2]))
+        if len({index for triangle in output_triangles for index in triangle}) != len(
+            local_points
+        ):
+            raise ExportError(
+                "conforming exact-zero cells would discard a material vertex"
+            )
+        output[name] = _Mesh(local_points, output_triangles)
+        material_reports[name] = {
+            "removed_exact_zero_triangles": removed[name],
+            "added_positive_triangles": added,
+            "added_local_coordinates": len(local_points) - len(mesh.points),
+        }
+    report.update(
+        output_triangles=total,
+        added_positive_triangles=total - input_count + sum(removed.values()),
+        edge_candidate_checks=checked,
+        materials=material_reports,
+    )
+    return output, report
 
 
 def _partition(
@@ -624,12 +905,7 @@ def _validate_mesh(mesh: _Mesh, *, uncertainty_mm: float = 0.0) -> dict[str, obj
         if len(set(triangle)) != 3 or any(i < 0 or i >= len(points) for i in triangle):
             raise ExportError("mesh contains a collapsed triangle or invalid index")
         a, b, c = triangle
-        if (
-            _length(
-                _cross(_subtract(points[b], points[a]), _subtract(points[c], points[a]))
-            )
-            == 0
-        ):
+        if _length(_triangle_cross([points[a], points[b], points[c]])) == 0:
             raise ExportError("mesh contains a zero-area triangle")
         for x, y in ((a, b), (b, c), (c, a)):
             edges[(min(x, y), max(x, y))].append(index)
@@ -906,12 +1182,48 @@ def _step(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
 
 
 def _float32(point: Coordinate) -> Coordinate:
+    if not all(isfinite(value) for value in point):
+        raise ExportError("STL float32 requires finite model coordinates")
     try:
-        return struct.unpack("<3f", struct.pack("<3f", *point))
+        converted = struct.unpack("<3f", struct.pack("<3f", *point))
     except (OverflowError, struct.error) as error:
         raise ExportError(
             "STL float32 cannot represent the model coordinates"
         ) from error
+    if not all(isfinite(value) for value in converted):
+        raise ExportError("STL float32 cannot represent finite model coordinates")
+    return converted
+
+
+def _quantize_meshes(
+    meshes: dict[str, _Mesh], budget: float
+) -> tuple[dict[str, _Mesh], dict[str, object]]:
+    """Measure global native-to-float32 displacement before any conformance."""
+    conversions = {
+        point: _float32(point) for mesh in meshes.values() for point in mesh.points
+    }
+    if len(set(conversions.values())) != len(conversions):
+        raise ExportError(
+            "STL float32 collapses distinct feature vertices; the model cannot be represented at this registration"
+        )
+    error = max(
+        (
+            _length(_subtract(point, converted))
+            for point, converted in conversions.items()
+        ),
+        default=0.0,
+    )
+    if error > budget:
+        raise ExportError("STL float32 coordinate error exceeds linear_deflection_mm")
+    converted_meshes = {
+        name: _Mesh([conversions[point] for point in mesh.points], list(mesh.triangles))
+        for name, mesh in meshes.items()
+    }
+    return converted_meshes, {
+        "maximum_coordinate_error_mm": error,
+        "global_coordinates": len(conversions),
+        "coordinate_collapses": 0,
+    }
 
 
 def _check_float32(original: _Mesh, serialized: _Mesh, budget: float) -> float:
@@ -1052,9 +1364,10 @@ def _export_model(
 ) -> ExportBundle:
     """Return bytes only after CAD, mesh, interface and serialized checks pass.
 
-    No minimum-feature cleanup is performed. Native cone-tip triangles collapsed
-    by the reported 12-decimal numerical weld are removed; any resulting mesh
-    defect or subsequent float32 feature collapse rejects the complete export.
+    No minimum-feature cleanup is performed. Repeated-coordinate cone tips and
+    exact-zero bridges receive reported conformance without moving coordinates.
+    Distinct-coordinate float32 merges or any remaining mesh defect reject the
+    complete export.
     """
     config = config or ExportConfig()
     # Some kernel queries populate geometry caches. Keep even those queries off
@@ -1074,21 +1387,29 @@ def _export_model(
         meshes, native = _partition(model, config)
     except RuntimeError as error:
         raise ExportError("OCCT material partition or tessellation failed") from error
+    meshes, native_conformance = _conform_meshes(meshes, config.max_triangles)
+    native["native_conformance"] = native_conformance
     interfaces = _interfaces(meshes, model)
-    combined = _combined(meshes)
-    native_meshes = {**meshes, "relief": combined}
+    native_meshes = {**meshes, "relief": _combined(meshes)}
+    rounding_error = cast("float", native["maximum_coordinate_rounding_mm"])
+    for mesh in native_meshes.values():
+        _ = _validate_mesh(mesh, uncertainty_mm=rounding_error)
+    quantized, quantization = _quantize_meshes(meshes, config.linear_deflection_mm)
+    final_parts, float_conformance = _conform_meshes(quantized, config.max_triangles)
+    native["float32_quantization"] = quantization
+    native["float32_conformance"] = float_conformance
+    float_error = cast("float", quantization["maximum_coordinate_error_mm"])
+    _ = _interfaces(final_parts, model)
+    expected_meshes = {**final_parts, "relief": _combined(final_parts)}
     files: dict[str, bytes] = {}
     reports: dict[str, object] = {}
     serialized_meshes: dict[str, _Mesh] = {}
-    float_error = 0.0
-    rounding_error = cast("float", native["maximum_coordinate_rounding_mm"])
-    for name, mesh in native_meshes.items():
-        _ = _validate_mesh(mesh, uncertainty_mm=rounding_error)
+    for name, mesh in expected_meshes.items():
         data = _stl(mesh)
         roundtrip = _read_stl(data)
-        float_error = max(
-            float_error, _check_float32(mesh, roundtrip, config.linear_deflection_mm)
-        )
+        # Expected meshes already contain the globally conformed float32
+        # coordinates. Compare the actual bytes to that final connectivity.
+        _ = _check_float32(mesh, roundtrip, config.linear_deflection_mm)
         report = _validate_mesh(roundtrip, uncertainty_mm=rounding_error + float_error)
         if name == "relief" and report["closed_shells"] != 1:
             raise ExportError("combined STL must remain one connected closed shell")
