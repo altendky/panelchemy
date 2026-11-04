@@ -22,6 +22,7 @@ from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
 from panelchemy import occt
+from panelchemy.approximation import approximate
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours, vectorize
 from panelchemy.separation import (
@@ -62,6 +63,7 @@ class ReliefModel:
     materials: dict[str, TopoDS_Shape]
     sections: dict[str, Polygon | MultiPolygon]
     diagnostics: dict[str, object]
+    contour_comparison_svg: str | None = None
 
 
 def build_relief(
@@ -78,11 +80,31 @@ def build_relief(
     """
     started = monotonic()
     profile = profile or ConstructionProfile()
+    if type(max_vertices) is not int or max_vertices < 1:
+        raise ValueError("max_vertices must be a positive integer")
     if result.silhouette_method != "explicit-mask" and result.warnings:
         raise ValueError(
             "Review the boundary warnings and supply an explicit silhouette before building relief"
         )
-    contours = vectorize(result, profile.long_edge_mm, max_vertices)
+    # Approximation still starts from exact cells. Bound source allocation
+    # separately, then enforce the configured kernel budget on the result.
+    source_budget = (
+        max(max_vertices, 100_000) if profile.contour_tolerance_mm > 0 else max_vertices
+    )
+    contours = vectorize(result, profile.long_edge_mm, source_budget)
+    approximation_diagnostics: dict[str, object] | None = None
+    comparison_svg: str | None = None
+    if profile.contour_tolerance_mm > 0:
+        approximated = approximate(
+            contours, profile.contour_tolerance_mm, palette=result.config.palette
+        )
+        contours = approximated.contours
+        approximation_diagnostics = approximated.diagnostics
+        comparison_svg = approximated.comparison_svg
+        if contours.vertex_count > max_vertices:
+            raise ValueError(
+                f"approximated contours require {contours.vertex_count:,} vertices, exceeding max_vertices={max_vertices:,}; increase the budget or review another tolerance"
+            )
     guard_segments = 32
     guard_radius = profile.rim_width_mm / cos(pi / (4 * guard_segments))
     interior = _polygonal(
@@ -146,7 +168,7 @@ def build_relief(
     top_tolerance = max(1e-12, sum(p.area for p in contours.white) * 1e-8)
     if top_missing > top_tolerance or top_extra > top_tolerance:
         raise occt.KernelError(
-            "combined relief changed the original white top footprint"
+            "combined relief changed the selected white top footprint"
         )
     orange, white = _union(contours.orange), _union(contours.white)
     # These round-arc polygon approximations are previews, never kernel inputs.
@@ -181,7 +203,7 @@ def build_relief(
     source_support = _union([*contours.orange, *contours.white])
     if _topology(source_support) != _topology(orange_floor):
         warnings.append(
-            "Colored support footprints merge or counters close within the orange band; source tops remain unchanged."
+            "Colored support footprints merge or counters close within the orange band; selected tops remain unchanged."
         )
     diagnostics: dict[str, object] = {
         "vertex_count": contours.vertex_count,
@@ -205,6 +227,9 @@ def build_relief(
         "warnings": warnings,
         "elapsed_seconds": monotonic() - started,
         "max_vertices": max_vertices,
+        "source_vertex_budget": source_budget,
+        "contour_approximation": approximation_diagnostics,
+        "top_footprint_reference": "selected contours (exact unless approximation is enabled)",
         "white_top_missing_mm2": top_missing,
         "white_top_extra_mm2": top_extra,
         "white_top_area_tolerance_mm2": top_tolerance,
@@ -222,6 +247,7 @@ def build_relief(
             "white-top": white,
         },
         diagnostics,
+        comparison_svg,
     )
 
 
@@ -252,7 +278,9 @@ def preview_svg(model: ReliefModel, palette: tuple[tuple[int, int, int], ...]) -
     label_height = max(gap, label_font * 2)
     panels = [
         (
-            "Source plateaus",
+            "Selected plateaus"
+            if model.contour_comparison_svg is not None
+            else "Source plateaus",
             [
                 (model.contours.silhouette, colors[0]),
                 (model.sections["orange-top"], colors[1]),
@@ -312,6 +340,7 @@ def process_relief_file(
         "preview.svg",
         "profile.json",
         "manifest.json",
+        "contours.svg",
     ]
     protected = {path.resolve() for path in (source, *protected_paths)}
     if silhouette_path:
@@ -347,6 +376,8 @@ def process_relief_file(
         _ = (stage / "preview.svg").write_text(
             preview_svg(model, result.config.palette)
         )
+        if model.contour_comparison_svg is not None:
+            _ = (stage / "contours.svg").write_text(model.contour_comparison_svg)
         _ = (stage / "profile.json").write_text(
             json.dumps(model.profile.as_dict(), indent=2, sort_keys=True) + "\n"
         )
@@ -404,6 +435,8 @@ def process_relief_file(
         for name in ("orange", "white"):
             if name not in model.materials:
                 (output / f"{name}.brep").unlink(missing_ok=True)
+        if model.contour_comparison_svg is None:
+            (output / "contours.svg").unlink(missing_ok=True)
         _ = (output / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )

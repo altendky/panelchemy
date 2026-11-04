@@ -29,3 +29,8 @@ Separation enables both the local browser work and relief work. Validation
 depends on relief geometry. A physical coupon additionally needs user-selected
 size and printer settings. Deployment follows a useful local workflow; no
 domain, hosting runtime, or publication target is selected yet.
+
+[Optional contour approximation](https://github.com/altendky/panelchemy/issues/14)
+addresses dense raster outlines between relief construction and full-size export
+evaluation. It is off by default and must retain islands and counters while
+reporting its physical tolerance and original/selected outline comparison.

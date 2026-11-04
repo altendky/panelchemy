@@ -9,7 +9,8 @@ follow Scansor's browser/deployment structure if the processing runtime fits.
 The repository foundation, image-space separation API/CLI, and local browser
 workflow are implemented. They produce reviewable palette, silhouette,
 visible-color, and cumulative support masks. The OCCT relief API/CLI additionally
-builds exact layered solids and projected support previews. Validated slicer
+builds layered solids and projected support previews, using exact contours by
+default or explicitly configured, checked approximation. Validated slicer
 exports and physical printing remain subsequent stages.
 
 The handoff's animal panels are evaluation inputs. Their exact artwork details

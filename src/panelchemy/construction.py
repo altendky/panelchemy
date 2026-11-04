@@ -32,6 +32,7 @@ class ConstructionProfile:
     white_thickness_mm: float = 1.0
     taper_angle_deg: float = 10.0
     rim_width_mm: float = 0.2
+    contour_tolerance_mm: float = 0.0
 
     def __post_init__(self) -> None:
         for field in fields(self):
@@ -41,6 +42,9 @@ class ConstructionProfile:
                     raise ValueError(
                         "taper_angle_deg must be at least 0 and less than 90"
                     )
+            elif field.name == "contour_tolerance_mm":
+                if value < 0:
+                    raise ValueError("contour_tolerance_mm must be non-negative")
             elif value <= 0:
                 raise ValueError(f"{field.name} must be positive")
         for thickness in (

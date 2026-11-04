@@ -14,6 +14,7 @@ def test_user_defaults_define_twenty_layers_and_three_bands() -> None:
     assert profile.layer_height_mm == 0.2
     assert (profile.black_top, profile.orange_top, profile.white_top) == (2, 3, 4)
     assert profile.white_top / profile.layer_height_mm == 20
+    assert profile.contour_tolerance_mm == 0
 
 
 def test_taper_is_configurable_from_vertical_including_no_taper() -> None:
@@ -37,6 +38,9 @@ def test_taper_is_configurable_from_vertical_including_no_taper() -> None:
         {"long_edge_mm": float("inf")},
         {"long_edge_mm": 10**1000},
         {"old_name": 2},
+        {"contour_tolerance_mm": -0.1},
+        {"contour_tolerance_mm": True},
+        {"contour_tolerance_mm": float("nan")},
         {"orange_thickness_mm": 1e-12},
         {"orange_thickness_mm": 200000000.02},
         {

@@ -70,6 +70,35 @@ Its two support diagrams show material footprints at the lower band boundaries.
 Source images are read into a fixed snapshot so a later file edit cannot change
 the recorded input of an already-running conversion.
 
+## Optional Contour Approximation
+
+Set `contour_tolerance_mm` in the construction profile to a positive physical
+distance to request simpler feature outlines before kernel construction. The
+default is zero: exact raster-cell contours. Approximation changes the selected
+top outlines within the declared distance; tapering then preserves those selected
+tops and expands downward as usual. It does not impose a minimum feature size.
+
+The silhouette stays exact, preserving the panel dimensions and vertical outer
+wall. Every source island and counter must survive. Invalid candidates or changed
+relationships between neighboring features retain their exact outlines, with
+the reason recorded. Conservative buffer coverage checks apply to complete
+boundaries in both directions; a vertex-sampled distance alone is insufficient.
+
+`contours.svg` compares original and selected outlines. The manifest records the
+requested tolerance, vertex counts, validation results, and any exact fallbacks.
+Inspect that comparison before accepting an approximated panel; a tolerance is
+an explicit artwork choice, not a print-quality guarantee. With approximation
+enabled, source contour allocation permits at least 100,000 vertices; increasing
+`--max-vertices` above that also raises the source limit. The normal kernel budget
+still applies after approximation.
+
+A larger tolerance can cause more ring proposals to fail topology checks and
+retain exact geometry, so it does not guarantee fewer vertices or faster kernel
+construction. In the four evaluation panels, 0.05 mm changed no contours; 0.2 mm
+reduced total counts from 31,842–36,656 to 15,324–20,796 while retaining all islands
+and counters. Those are contour measurements, not completed full-panel builds or
+recommended print settings.
+
 ## Boundary and Resource Limits
 
 Automatic silhouettes with unresolved boundary warnings require an explicit
