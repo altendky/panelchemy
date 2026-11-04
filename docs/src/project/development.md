@@ -6,7 +6,8 @@
 current tool configuration. `mise.lock` records platform resolutions, with
 referenced pipx dependency locks under `.mise/locks/`. Python
 dependencies live in `pyproject.toml` and `uv.lock`. Node is available for
-repository checks and a future isolated front end; no browser package exists yet.
+repository checks and the isolated browser-test package. Front-end assets are
+plain HTML/CSS/JavaScript packaged with Python.
 
 The initial interpreter matrix is Python 3.12 and 3.13. CI reads exact pins from
 `mise.toml`, so local tooling and CI share one source.

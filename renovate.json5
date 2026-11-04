@@ -2,10 +2,11 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "rebaseWhen": "conflicted",
-  "enabledManagers": ["github-actions", "mise", "pep621", "pre-commit", "custom.regex"],
+  "enabledManagers": ["github-actions", "mise", "pep621", "npm", "pre-commit", "custom.regex"],
   "includePaths": [
     "pyproject.toml", "uv.lock", "mise.toml", "mise.lock", ".mise/locks/**",
-    ".github/**", ".pre-commit-config.yaml"
+    ".github/**", ".pre-commit-config.yaml",
+    "browser-tests/package.json", "browser-tests/package-lock.json"
   ],
   "pep621": { "managerFilePatterns": ["/^pyproject\\.toml$/"] },
   "mise": { "managerFilePatterns": ["/^mise\\.toml$/"] },

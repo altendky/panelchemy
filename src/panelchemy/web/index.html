@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="Inspect comic-panel color separation and silhouette previews locally.">
+    <title>Panelchemy · Local workspace</title>
+    <link rel="stylesheet" href="/style.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Panelchemy home">
+        <span class="brand-mark" aria-hidden="true">P</span>
+        <span>panelchemy<span class="brand-period">.</span></span>
+      </a>
+      <span class="local-badge"><span aria-hidden="true"></span>Local workspace</span>
+    </header>
+
+    <main>
+      <section class="intro" aria-labelledby="page-title">
+        <p class="eyebrow">01 / Color separation</p>
+        <h1 id="page-title">Start with the ink.</h1>
+        <p class="intro-copy">Separate the palette, find the panel edge, and inspect every detail.</p>
+      </section>
+
+      <div class="workspace">
+        <aside class="controls" aria-labelledby="controls-title">
+          <div class="section-heading">
+            <h2 id="controls-title">Prepare your panel</h2>
+            <span class="step-number" aria-hidden="true">01</span>
+          </div>
+          <form id="artwork-form">
+            <div class="field-group">
+              <label for="source-file">Artwork <span class="required-label">required</span></label>
+              <input id="source-file" name="source" type="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/bmp" required aria-describedby="source-note">
+              <p id="source-note" class="field-note">Choose an image with a visible enclosing rim.</p>
+            </div>
+
+            <div class="field-group">
+              <label for="silhouette-file">Silhouette override <span class="optional-label">optional</span></label>
+              <input id="silhouette-file" name="silhouette" type="file" accept="image/png,image/jpeg,image/webp,image/tiff,image/bmp" aria-describedby="silhouette-note">
+              <p id="silhouette-note" class="field-note">Same dimensions as the artwork. White inside; black outside.</p>
+            </div>
+
+            <fieldset class="palette-fieldset">
+              <legend>Three-color palette</legend>
+              <div class="palette-controls">
+                <label class="color-field" for="color-black">
+                  <input id="color-black" type="color" value="#000000" aria-label="Black color">
+                  <span>Black</span>
+                  <span class="color-value" id="value-black">#000000</span>
+                </label>
+                <label class="color-field" for="color-orange">
+                  <input id="color-orange" type="color" value="#f5a623" aria-label="Orange color">
+                  <span>Orange</span>
+                  <span class="color-value" id="value-orange">#F5A623</span>
+                </label>
+                <label class="color-field" for="color-white">
+                  <input id="color-white" type="color" value="#ffffff" aria-label="White color">
+                  <span>White</span>
+                  <span class="color-value" id="value-white">#FFFFFF</span>
+                </label>
+              </div>
+            </fieldset>
+
+            <div class="field-group tolerance-field">
+              <label for="neutral-tolerance">Neutral tolerance</label>
+              <input id="neutral-tolerance" name="neutral_tolerance" type="number" min="0" max="255" step="1" value="20" required aria-describedby="tolerance-note">
+              <p id="tolerance-note" class="field-note">Near-gray pixels choose black or white. This is the maximum RGB channel spread, from 0 to 255.</p>
+            </div>
+
+            <button id="generate-button" class="button button-primary" type="submit" disabled>
+              <span id="generate-label">Generate previews</span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+          </form>
+          <p class="privacy-note">Processed on this computer. <br>Original files stay unchanged.</p>
+          <details class="method-note">
+            <summary>What happens to the details?</summary>
+            <p>No gap closing, small-feature removal, or artwork cleanup is applied. Review the extracted edge and masks before moving on.</p>
+          </details>
+        </aside>
+
+        <section class="results" aria-labelledby="results-title" aria-busy="false">
+          <div class="results-heading">
+            <div>
+              <p class="eyebrow">Your working proof</p>
+              <h2 id="results-title">Inspect the separation</h2>
+            </div>
+            <button id="download-button" class="button button-secondary" type="button" disabled>Download outputs <span aria-hidden="true">↓</span></button>
+          </div>
+
+          <div id="status" class="status-line" role="status" aria-live="polite" aria-atomic="true">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="status-text">Choose artwork to begin.</span>
+          </div>
+          <p id="error-message" class="error-message" role="alert" hidden></p>
+          <noscript><p class="error-message">Enable JavaScript to use the local preview workspace.</p></noscript>
+
+          <div class="comparison-grid">
+            <figure class="preview-card">
+              <figcaption><span>Source</span><span class="card-number">01</span></figcaption>
+              <div class="preview-stage" id="source-stage">
+                <img id="source-preview" alt="Source artwork" hidden>
+                <p class="preview-placeholder" id="source-placeholder"><span aria-hidden="true">＋</span>Choose your artwork</p>
+              </div>
+              <p id="source-caption" class="preview-caption">Your original image</p>
+            </figure>
+            <figure class="preview-card">
+              <figcaption><span>Normalized palette</span><span class="card-number">02</span></figcaption>
+              <div class="preview-stage">
+                <img id="normalized-preview" alt="Normalized three-color artwork" hidden>
+                <p class="preview-placeholder" id="normalized-placeholder"><span aria-hidden="true">◫</span>Three colors, clearly separated</p>
+              </div>
+              <p class="preview-caption">Black · Orange · White</p>
+            </figure>
+            <figure class="preview-card">
+              <figcaption><span>Panel cutout</span><span class="card-number">03</span></figcaption>
+              <div class="preview-stage checkerboard">
+                <img id="panel-preview" alt="Panel silhouette with the exterior gutter removed" hidden>
+                <p class="preview-placeholder" id="panel-placeholder"><span aria-hidden="true">⌑</span>Inspect the outside edge</p>
+              </div>
+              <p class="preview-caption">Exterior gutter removed</p>
+            </figure>
+          </div>
+
+          <div class="inspection-grid">
+            <section class="inspection-card mask-card" aria-labelledby="mask-title">
+              <div class="inspection-header">
+                <h3 id="mask-title">Look closer</h3>
+                <label class="visually-hidden" for="mask-kind">Mask preview</label>
+                <select id="mask-kind" disabled>
+                  <option value="silhouette">Panel silhouette</option>
+                  <option value="exterior">Outside gutter</option>
+                  <optgroup label="Visible colors">
+                    <option value="black">Visible black</option>
+                    <option value="orange">Visible orange</option>
+                    <option value="white">Visible white</option>
+                  </optgroup>
+                  <optgroup label="Material supports">
+                    <option value="support-black">Black support</option>
+                    <option value="support-orange">Orange support</option>
+                    <option value="support-white">White support</option>
+                  </optgroup>
+                </select>
+              </div>
+              <div class="mask-stage">
+                <img id="mask-preview" alt="Selected binary mask" hidden>
+                <p class="preview-placeholder" id="mask-placeholder">Generate previews to inspect the masks.</p>
+              </div>
+              <p id="mask-caption" class="preview-caption">White marks the selected region.</p>
+            </section>
+
+            <section class="inspection-card record-card" aria-labelledby="record-title">
+              <div class="inspection-header"><h3 id="record-title">Review notes</h3><span id="result-badge" class="result-badge">Not generated</span></div>
+              <div id="warning-area" class="warning-area">
+                <p id="warning-summary">Boundary notes will appear here.</p>
+                <ul id="warning-list" hidden></ul>
+              </div>
+              <dl class="provenance">
+                <div><dt>Input</dt><dd id="record-source">—</dd></div>
+                <div><dt>Dimensions</dt><dd id="record-dimensions">—</dd></div>
+                <div><dt>Boundary</dt><dd id="record-method">—</dd></div>
+                <div><dt>Components</dt><dd id="record-components">—</dd></div>
+                <div><dt>SHA-256</dt><dd id="record-hash" class="hash-value">—</dd></div>
+              </dl>
+              <details id="manifest-details" class="manifest-details" hidden>
+                <summary>Reproducibility record</summary>
+                <p>Configuration and this manifest are included in the output bundle.</p>
+                <pre id="manifest-json"></pre>
+              </details>
+            </section>
+          </div>
+          <p class="workspace-note">Image-space previews · Review the boundary and fine detail before building relief geometry.</p>
+        </section>
+      </div>
+    </main>
+    <footer>Made for the space between artwork and object.</footer>
+  </body>
+</html>

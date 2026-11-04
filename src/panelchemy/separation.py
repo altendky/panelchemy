@@ -2,13 +2,14 @@
 
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import version
 from io import BytesIO
 from math import isfinite
 from pathlib import Path
 from typing import Self, cast
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import numpy as np
 from numpy.typing import NDArray
@@ -195,51 +196,67 @@ def load_silhouette(path: Path) -> Mask:
         return np.asarray(image.convert("L"), dtype=np.uint8) >= 128
 
 
-def process_file(
-    source: Path,
-    output: Path,
+def png_bytes(image: Image.Image) -> bytes:
+    """Encode pixels without copying source metadata into derived previews."""
+    image = image.copy()
+    image.info.clear()
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+@dataclass
+class ArtifactBundle:
+    """The same reproducible artifacts for filesystem and browser adapters."""
+
+    manifest: dict[str, object]
+    files: dict[str, bytes]
+    source_preview: bytes
+
+    def archive(self) -> bytes:
+        output = BytesIO()
+        with ZipFile(output, "w") as archive:
+            for name, content in self.files.items():
+                entry = ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                entry.compress_type = ZIP_DEFLATED
+                archive.writestr(entry, content)
+        return output.getvalue()
+
+
+def prepare_artifacts(
+    source_bytes: bytes,
+    source_name: str,
     config: SeparationConfig | None = None,
     *,
-    silhouette_path: Path | None = None,
-    protected_paths: tuple[Path, ...] = (),
-) -> dict[str, object]:
-    """Write reproducible previews and provenance without modifying input files."""
-    source_bytes = source.read_bytes()
+    silhouette_bytes: bytes | None = None,
+    silhouette_name: str = "silhouette.png",
+) -> ArtifactBundle:
+    """Convert in memory; adapters decide how the resulting bytes are retained."""
+    silhouette = None
+    if silhouette_bytes is not None:
+        with Image.open(BytesIO(silhouette_bytes)) as mask_image:
+            silhouette = np.asarray(mask_image.convert("L"), dtype=np.uint8) >= 128
     with Image.open(BytesIO(source_bytes)) as image:
-        result = separate(
-            image,
-            config,
-            silhouette=load_silhouette(silhouette_path) if silhouette_path else None,
-        )
+        result = separate(image, config, silhouette=silhouette)
+        source_preview = png_bytes(image.convert("RGBA"))
     masks = result.masks
-    filenames = ["normalized.png", "panel.png", "config.json", "manifest.json"]
-    filenames.extend(f"{name}.png" for name in masks)
-    protected = {p.resolve() for p in (source, *protected_paths)}
-    if silhouette_path is not None:
-        protected.add(silhouette_path.resolve())
-    if any(
-        (output / name).resolve() in protected
-        or (
-            (output / name).exists()
-            and any(p.exists() and (output / name).samefile(p) for p in protected)
-        )
-        for name in filenames
-    ):
-        raise ValueError(
-            "output would overwrite an input file; choose another directory"
-        )
-    output.mkdir(parents=True, exist_ok=True)
-    result.normalized_image().save(output / "normalized.png")
-    result.panel_image().save(output / "panel.png")
+    files = {
+        "normalized.png": png_bytes(result.normalized_image()),
+        "panel.png": png_bytes(result.panel_image()),
+    }
     for name, mask in masks.items():
-        Image.fromarray(mask.astype(np.uint8) * 255).save(output / f"{name}.png")
-    resolved_config = asdict(result.config)
-    _ = (output / "config.json").write_text(
+        files[f"{name}.png"] = png_bytes(Image.fromarray(mask.astype(np.uint8) * 255))
+    resolved_config = {
+        "palette": [list(color) for color in result.config.palette],
+        "neutral_tolerance": result.config.neutral_tolerance,
+    }
+    files["config.json"] = (
         json.dumps(resolved_config, indent=2, sort_keys=True) + "\n"
-    )
+    ).encode()
+    filenames = [*files, "manifest.json"]
     manifest: dict[str, object] = {
         "schema_version": 1,
-        "source": {"name": source.name, "sha256": sha256(source_bytes).hexdigest()},
+        "source": {"name": source_name, "sha256": sha256(source_bytes).hexdigest()},
         "dimensions_px": {
             "width": result.labels.shape[1],
             "height": result.labels.shape[0],
@@ -247,11 +264,8 @@ def process_file(
         "config": resolved_config,
         "silhouette_method": result.silhouette_method,
         "silhouette_override": (
-            {
-                "name": silhouette_path.name,
-                "sha256": sha256(silhouette_path.read_bytes()).hexdigest(),
-            }
-            if silhouette_path
+            {"name": silhouette_name, "sha256": sha256(silhouette_bytes).hexdigest()}
+            if silhouette_bytes is not None
             else None
         ),
         "component_count": result.component_count,
@@ -264,7 +278,43 @@ def process_file(
         },
         "outputs": filenames,
     }
-    _ = (output / "manifest.json").write_text(
+    files["manifest.json"] = (
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    ).encode()
+    return ArtifactBundle(manifest, files, source_preview)
+
+
+def process_file(
+    source: Path,
+    output: Path,
+    config: SeparationConfig | None = None,
+    *,
+    silhouette_path: Path | None = None,
+    protected_paths: tuple[Path, ...] = (),
+) -> dict[str, object]:
+    """Write reproducible previews and provenance without modifying input files."""
+    bundle = prepare_artifacts(
+        source.read_bytes(),
+        source.name,
+        config,
+        silhouette_bytes=silhouette_path.read_bytes() if silhouette_path else None,
+        silhouette_name=silhouette_path.name if silhouette_path else "silhouette.png",
     )
-    return manifest
+    protected = {p.resolve() for p in (source, *protected_paths)}
+    if silhouette_path is not None:
+        protected.add(silhouette_path.resolve())
+    if any(
+        (output / name).resolve() in protected
+        or (
+            (output / name).exists()
+            and any(p.exists() and (output / name).samefile(p) for p in protected)
+        )
+        for name in bundle.files
+    ):
+        raise ValueError(
+            "output would overwrite an input file; choose another directory"
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    for name, content in bundle.files.items():
+        _ = (output / name).write_bytes(content)
+    return bundle.manifest
