@@ -1,17 +1,37 @@
 """Exact roof geometry, plateau retention, and material-section primitives."""
 
+from collections.abc import Sequence
 from math import cos, pi, sin
 from pathlib import Path
 
 import pytest
 from OCP.BRep import BRep_Builder
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakePolygon
 from OCP.BRepTools import BRepTools
-from OCP.TopoDS import TopoDS_Shape
+from OCP.gp import gp_Pnt
+from OCP.TopoDS import TopoDS_Face, TopoDS_Shape, TopoDS_Wire
 from shapely import union_all
 from shapely.affinity import translate
 from shapely.geometry import MultiPolygon, Polygon, box
 
 from panelchemy import occt
+
+
+def independent_wires_face(
+    rings: Sequence[Sequence[occt.Point2]], z: float
+) -> TopoDS_Face:
+    """Exercise the checked fallback with intentionally unshared contact vertices."""
+    wires: list[TopoDS_Wire] = []
+    for ring in rings:
+        builder = BRepBuilderAPI_MakePolygon()
+        for x, y in ring:
+            builder.Add(gp_Pnt(x, y, z))
+        builder.Close()
+        wires.append(builder.Wire())
+    face = BRepBuilderAPI_MakeFace(wires[0])
+    for wire in wires[1:]:
+        face.Add(wire)
+    return face.Face()
 
 
 def test_square_roof_matches_integrated_round_offset_area() -> None:
@@ -214,6 +234,7 @@ def test_counter_arrangement_rejects_a_valid_face_that_loses_the_holes(
     def lose_counters(*_args: object) -> TopoDS_Shape:
         return wrong_face
 
+    monkeypatch.setattr(occt, "_shared_polygon_face", independent_wires_face)
     monkeypatch.setattr(occt, "_boolean", lose_counters)
     with pytest.raises(occt.KernelError, match="changed the exact source area"):
         _ = occt.polygon_face(polygon)
@@ -233,9 +254,33 @@ def test_counter_arrangement_rejects_multiple_faces(
     def multiple_faces(*_args: object) -> TopoDS_Shape:
         return wrong_faces
 
+    monkeypatch.setattr(occt, "_shared_polygon_face", independent_wires_face)
     monkeypatch.setattr(occt, "_boolean", multiple_faces)
     with pytest.raises(occt.KernelError, match="one valid face"):
         _ = occt.polygon_face(polygon)
+
+
+def test_direct_contact_builder_failure_uses_checked_counter_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polygon = Polygon(
+        box(0, 0, 5, 5).exterior.coords, [box(1, 1, 2, 2).exterior.coords]
+    )
+
+    def unsupported_multiple_wires(
+        rings: Sequence[Sequence[occt.Point2]], z: float
+    ) -> TopoDS_Face:
+        if len(rings) > 1:
+            raise RuntimeError("unsupported direct contact arrangement")
+        return independent_wires_face(rings, z)
+
+    monkeypatch.setattr(occt, "_shared_polygon_face", unsupported_multiple_wires)
+    face = occt.polygon_face(polygon)
+    assert occt.valid(face)
+    assert occt.area(face) == pytest.approx(24)
+    solid = occt.prism(polygon, 0, 2)
+    assert occt.valid(solid)
+    assert occt.volume(solid) == pytest.approx(48)
 
 
 def test_fast_roof_with_correct_top_but_no_expansion_is_rejected(
@@ -272,3 +317,75 @@ def test_critical_narrow_mouth_retains_a_supported_bottom_section() -> None:
     assert occt.area(occt.cut(occt.polygon_face(geometry, 2), bottom)) == pytest.approx(
         0, abs=1e-9
     )
+
+
+@pytest.mark.parametrize(
+    "polygon",
+    [
+        Polygon(box(0, 0, 5, 5).exterior.coords, [box(1, 1, 2, 2).exterior.coords]),
+        Polygon(
+            box(0, 0, 5, 5).exterior.coords,
+            [box(1, 1, 2, 2).exterior.coords, box(2, 2, 3, 3).exterior.coords],
+        ),
+        Polygon(
+            [(0, 1), (1, 1), (1, 0), (3, 0), (3, 3), (0, 3)],
+            [box(1, 1, 2, 2).exterior.coords],
+        ),
+        Polygon(box(0, 0, 4, 4).exterior.coords, [[(2, 4), (1, 2), (3, 2)]]),
+        Polygon(
+            box(0, 0, 6, 6).exterior.coords,
+            [box(1, 1, 3, 3).exterior.coords, [(3, 2), (4, 1), (4, 3)]],
+        ),
+    ],
+    ids=[
+        "ordinary",
+        "hole-hole-point",
+        "hole-outer-corner",
+        "hole-outer-edge",
+        "hole-hole-edge",
+    ],
+)
+def test_shared_contact_faces_and_prisms_do_not_require_planar_booleans(
+    polygon: Polygon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert polygon.is_valid
+
+    def unexpected_boolean(*_args: object) -> TopoDS_Shape:
+        raise AssertionError(
+            "shared contact topology must not require a planar Boolean"
+        )
+
+    monkeypatch.setattr(occt, "_boolean", unexpected_boolean)
+    face = occt.polygon_face(polygon, 1.25)
+    assert occt.valid(face)
+    assert occt.area(face) == pytest.approx(polygon.area, abs=1e-10)
+    solid = occt.prism(polygon, 1.25, 3.25)
+    assert occt.valid(solid)
+    assert occt.volume(solid) == pytest.approx(polygon.area * 2, abs=1e-10)
+
+
+@pytest.mark.parametrize(
+    "polygon",
+    [
+        Polygon(box(0, 0, 4, 4).exterior.coords, [[(2, 4), (1, 2), (3, 2)]]),
+        Polygon(
+            box(0, 0, 6, 6).exterior.coords,
+            [box(1, 1, 3, 3).exterior.coords, [(3, 2), (4, 1), (4, 3)]],
+        ),
+    ],
+    ids=["hole-outer-edge", "hole-hole-edge"],
+)
+def test_mid_edge_noding_preserves_roof_top_against_independent_native_cut(
+    polygon: Polygon,
+) -> None:
+    reference: TopoDS_Shape = occt.polygon_face(Polygon(polygon.exterior.coords), 4)
+    for hole in polygon.interiors:
+        reference = occt.cut(reference, occt.polygon_face(Polygon(hole.coords), 4))
+    face = occt.polygon_face(polygon, 4)
+    assert occt.area(occt.cut(face, reference)) < 1e-10
+    assert occt.area(occt.cut(reference, face)) < 1e-10
+    solid, _ = occt.roof(polygon, 2, 4, 0.25)
+    assert occt.valid(solid)
+    top = occt.cross_section(solid, 4)
+    assert occt.area(occt.cut(top, reference)) < 1e-10
+    assert occt.area(occt.cut(reference, top)) < 1e-10

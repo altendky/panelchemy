@@ -58,6 +58,12 @@ before writing geometry. The evolved sweep also checks five distance sections,
 including both caps, for expected area, retained source material, and nested
 support; a failed check selects the exact construction.
 
+Face construction reuses native vertices where counter boundaries touch. If a
+contact lies in the middle of an edge, the edge is split at that exact contact
+without moving its outline. Wire edge counts, native face validity, and source
+area must still agree. A checked native planar Boolean remains available for
+unsupported arrangements; no counter is removed to obtain a valid face.
+
 The protected rim uses a conservative polygonal offset with 32 arc segments per
 quadrant. Its radius is increased by the corresponding cosine factor so arc
 chords cannot reduce the requested rim width. The radius increase is recorded
