@@ -30,8 +30,10 @@ palette or art-generation system remains a later product decision.
 ## Open Choices
 
 Final panel size, printer and nozzle, layer configuration, material-band heights,
-taper width/angle, geometry libraries, export formats, and slicer workflow remain
-open. If an angle is exposed, document which axis it is measured from.
+taper width/angle, image-processing libraries, export formats, and slicer workflow
+remain open. OpenCascade is the selected solid-modeling kernel; its Python binding
+and geometry construction strategy will be established during implementation.
+If an angle is exposed, document which axis it is measured from.
 
 The handoff proposed black/orange/white heights of 2.0/0.6/1.0 mm. These are
 unvalidated examples, not approved dimensions or a default physical profile.
