@@ -28,6 +28,11 @@ dimensions, band heights, material-volume accounting, and shared interfaces.
 Numerical vertex normalization is recorded; failed validation aborts export.
 No nozzle-based filtering or minimum-feature cleanup is applied.
 
+Exact-zero numerical seam triangles are replaced by conforming subdivisions
+using existing coordinates, preserving positive-area faces and material
+interfaces. Native and float32 conformance are reported separately. Coordinate
+collapse and unresolved mesh defects still reject export.
+
 `--mesh-deflection-mm` sets linear tessellation deflection (default 0.02 mm),
 `--mesh-angle-deg` sets angular deflection (default about 11.46 degrees), and
 `--max-triangles` limits the accepted mesh triangle count (default 2,000,000).
