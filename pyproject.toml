@@ -5,7 +5,11 @@ description = "Comic-panel artwork conversion to layered relief"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = "MIT OR Apache-2.0"
-dependencies = []
+dependencies = [
+    "numpy>=2.3",
+    "pillow>=12",
+    "scipy>=1.16",
+]
 
 [project.scripts]
 panelchemy = "panelchemy.cli:main"
@@ -16,6 +20,7 @@ dev = [
   "pytest>=8.4",
   "pytest-cov>=7.0",
   "ruff>=0.12",
+  "scipy-stubs>=1.16",
 ]
 
 [build-system]
@@ -37,4 +42,4 @@ ignore = ["E501"]
 [tool.basedpyright]
 typeCheckingMode = "recommended"
 pythonVersion = "3.12"
-include = ["src", "scripts"]
+include = ["src", "scripts", "tests"]

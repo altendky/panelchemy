@@ -15,17 +15,16 @@ The initial interpreter matrix is Python 3.12 and 3.13. CI reads exact pins from
 
 ```sh
 mise exec -- uv sync --locked
-mise exec -- uv run --locked ruff format --check src scripts
-mise exec -- uv run --locked ruff check src scripts
+mise exec -- uv run --locked ruff format --check src scripts tests
+mise exec -- uv run --locked ruff check src scripts tests
 mise exec -- uv run --locked basedpyright
 mise exec -- uv build
 mise exec -- uv run --locked panelchemy --version
 mise exec -- pre-commit run --all-files --show-diff-on-failure
 ```
 
-When feature tests are added, run them with `uv run --locked pytest` and add them
-to the Python CI gate in the same change. The foundation currently validates
-builds and the installed CLI on both interpreter versions.
+Run behavioral tests with `uv run --locked pytest`. CI tests conversion behavior,
+builds, and installed entry points on both interpreter versions.
 
 ## CI and Repository Settings
 

@@ -72,8 +72,8 @@ jobs:
         with:
           install_args: python uv
       - run: uv sync --locked --python "$PYTHON_VERSION"
-      - run: uv run --locked --python "$PYTHON_VERSION" ruff format --check src scripts
-      - run: uv run --locked --python "$PYTHON_VERSION" ruff check src scripts
+      - run: uv run --locked --python "$PYTHON_VERSION" ruff format --check src scripts tests
+      - run: uv run --locked --python "$PYTHON_VERSION" ruff check src scripts tests
       - run: uv run --locked --python "$PYTHON_VERSION" basedpyright
 
   build:
@@ -95,6 +95,8 @@ jobs:
           install_args: python uv
       - name: Build distributions
         run: uv build --python "$PYTHON_VERSION"
+      - name: Test conversion behavior
+        run: uv run --locked --python "$PYTHON_VERSION" pytest --cov=panelchemy --cov-report=term-missing
       - name: Check installed wheel entry point
         run: |
           uv run --isolated --no-project --python "$PYTHON_VERSION" --with dist/*.whl panelchemy --version
