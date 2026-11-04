@@ -8,7 +8,7 @@ from PIL import Image
 from panelchemy.cli import main
 
 
-@pytest.mark.parametrize("command", ["separate", "relief"])
+@pytest.mark.parametrize("command", ["separate", "relief", "export"])
 def test_oversize_image_is_reported_without_traceback(
     command: str,
     tmp_path: Path,

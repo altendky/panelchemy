@@ -4,8 +4,9 @@ Panelchemy is a local tool in development for converting comic-panel artwork
 into configurable, three-color layered relief.
 
 The repository foundation, image-space separation, and local browser workflow
-are in place, along with the OCCT relief API/CLI. Validated slicer export and
-physical printing remain tracked stages; no physical print is verified yet.
+are in place, along with the OCCT relief API/CLI and checked STEP/STL model
+exports. No physical print is verified yet; slicer projects and deployment remain
+later work.
 
 ## Development
 
@@ -44,6 +45,12 @@ mise exec -- uv run --locked panelchemy relief /path/to/artwork.png --output loc
 Use `--profile examples/construction-profile.json` to configure size, band heights,
 taper angle, and optional contour approximation. Approximation is off by default;
 when enabled, inspect the original/selected outline comparison in `contours.svg`.
+
+Export [validated model geometry](docs/src/project/export.md) with:
+
+```sh
+mise exec -- uv run --locked panelchemy export /path/to/artwork.png --output local-inputs/model
+```
 
 ## Layout
 

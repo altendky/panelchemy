@@ -17,7 +17,7 @@ delivery and current state. This document records the intended sequence.
    tops, supporting material bands, and a vertical exterior.
 5. [Validation and export](https://github.com/altendky/panelchemy/issues/6):
    checked solids, registered material volumes, manifests,
-   and a verified slicer import.
+   exact STEP, and validated serialized STL models.
 6. [Physical profile and coupon](https://github.com/altendky/panelchemy/issues/7):
    choose real print settings and evaluate artwork
    features at final XY scale before full-panel printing.
