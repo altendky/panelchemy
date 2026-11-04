@@ -3,6 +3,7 @@
 from collections.abc import Iterable, Sequence
 from math import atan2, hypot, isfinite, pi, sin
 from pathlib import Path
+from typing import cast
 
 from OCP.Bnd import Bnd_Box
 from OCP.BRep import BRep_Builder
@@ -14,8 +15,11 @@ from OCP.BRepAlgoAPI import (
 )
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakePolygon,
+    BRepBuilderAPI_MakeVertex,
+    BRepBuilderAPI_MakeWire,
     BRepBuilderAPI_Transform,
 )
 from OCP.BRepCheck import BRepCheck_Analyzer
@@ -27,7 +31,7 @@ from OCP.collections import List_TopoDS_Shape
 from OCP.GeomAbs import GeomAbs_Arc
 from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
 from OCP.GProp import GProp_GProps
-from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_FACE
+from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_EDGE, TopAbs_FACE
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import (
     TopoDS,
@@ -35,10 +39,13 @@ from OCP.TopoDS import (
     TopoDS_Face,
     TopoDS_Iterator,
     TopoDS_Shape,
+    TopoDS_Vertex,
     TopoDS_Wire,
 )
-from shapely.geometry import MultiPolygon, Polygon, box
+from shapely import get_coordinates
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 from shapely.geometry.polygon import orient
+from shapely.strtree import STRtree
 
 type Point2 = tuple[float, float]
 
@@ -150,26 +157,141 @@ def _face(points: Sequence[gp_Pnt]) -> TopoDS_Face:
     return builder.Face()
 
 
+def _shared_polygon_face(rings: Sequence[Sequence[Point2]], z: float) -> TopoDS_Face:
+    """Reuse identical vertices across rings instead of rediscovering contacts."""
+    vertices: dict[Point2, TopoDS_Vertex] = {}
+    wires: list[TopoDS_Wire] = []
+    for ring in rings:
+        native_vertices: list[TopoDS_Vertex] = []
+        for point in ring:
+            if point not in vertices:
+                vertices[point] = BRepBuilderAPI_MakeVertex(gp_Pnt(*point, z)).Vertex()
+            native_vertices.append(vertices[point])
+        edges: list[TopoDS_Shape] = []
+        for index, vertex in enumerate(native_vertices):
+            edge = BRepBuilderAPI_MakeEdge(
+                vertex, native_vertices[(index + 1) % len(native_vertices)]
+            )
+            if not edge.IsDone():
+                raise KernelError("OpenCascade could not construct a source edge")
+            edges.append(edge.Edge())
+        wire = BRepBuilderAPI_MakeWire()
+        wire.Add(_shape_list(edges))
+        if not wire.IsDone():
+            raise KernelError("OpenCascade could not connect the source edges")
+        selected = wire.Wire()
+        explorer = TopExp_Explorer(selected, TopAbs_EDGE)
+        edge_count = 0
+        while explorer.More():
+            edge_count += 1
+            explorer.Next()
+        if edge_count != len(edges):
+            raise KernelError("OpenCascade wire construction lost a source edge")
+        wires.append(selected)
+    builder = BRepBuilderAPI_MakeFace(wires[0])
+    for wire in wires[1:]:
+        builder.Add(wire)
+    if not builder.IsDone():
+        raise KernelError("OpenCascade could not construct the polygon face")
+    return builder.Face()
+
+
+def _contact_noded_rings(rings: Sequence[Sequence[Point2]]) -> list[list[Point2]]:
+    """Insert only exact point contacts into straight segments, without moving them."""
+    boundaries = [LineString([*ring, ring[0]]) for ring in rings]
+    tree = STRtree(boundaries)
+    contacts: list[set[Point2]] = [set() for _ in rings]
+    for index, boundary in enumerate(boundaries):
+        neighbors = cast(
+            "list[int]", tree.query(boundary, predicate="intersects").tolist()
+        )
+        for neighbor in neighbors:
+            if neighbor <= index:
+                continue
+            intersection = boundary.intersection(boundaries[neighbor])
+            if intersection.geom_type not in {"Point", "MultiPoint"}:
+                raise KernelError(
+                    "polygon rings share more than isolated source contacts"
+                )
+            coordinates = cast(
+                "list[list[float]]", get_coordinates(intersection).tolist()
+            )
+            for coordinate in coordinates:
+                point = (coordinate[0], coordinate[1])
+                contacts[index].add(point)
+                contacts[neighbor].add(point)
+    noded: list[list[Point2]] = []
+    for ring, boundary, points in zip(rings, boundaries, contacts, strict=True):
+        missing = points - set(ring)
+        if not missing:
+            noded.append(list(ring))
+            continue
+        segments = [
+            LineString([point, ring[(index + 1) % len(ring)]])
+            for index, point in enumerate(ring)
+        ]
+        segment_tree = STRtree(segments)
+        insertions: dict[int, list[tuple[float, Point2]]] = {}
+        for point in sorted(missing):
+            contact = Point(point)
+            candidates = cast("list[int]", segment_tree.query(contact).tolist())
+            found = False
+            for candidate in candidates:
+                segment = segments[candidate]
+                if segment.covers(contact):
+                    insertions.setdefault(candidate, []).append(
+                        (segment.project(contact), point)
+                    )
+                    found = True
+            if not found:
+                raise KernelError(
+                    "a source contact cannot be noded without moving its boundary"
+                )
+        selected: list[Point2] = []
+        for index, point in enumerate(ring):
+            selected.append(point)
+            selected.extend(point for _, point in sorted(insertions.get(index, [])))
+        if not LineString([*selected, selected[0]]).equals(boundary):
+            raise KernelError("contact noding changed the exact source boundary")
+        noded.append(selected)
+    return noded
+
+
 def polygon_face(polygon: Polygon, z: float = 0) -> TopoDS_Face:
     """Construct the exact face, including point-touching counter boundaries.
 
-    Independently built wires do not share vertices at tangencies, so a valid
-    planar cell union can initially fail the kernel's wire-intersection check.
-    A native planar Boolean arrangement shares that topology without moving
-    edges or removing any counter. It must still produce exactly one face.
+    Ring wires share native vertices at identical source points. Contacts within
+    an edge are noded without changing its geometry. A checked native planar
+    Boolean remains a fallback when the direct arrangement is unsupported.
     """
     if not isfinite(z):
         raise KernelError("face height must be finite")
     polygon = _normalized(polygon)
     rings = _rings(polygon)
     try:
-        builder = BRepBuilderAPI_MakeFace(_wire([gp_Pnt(x, y, z) for x, y in rings[0]]))
-        for ring in rings[1:]:
-            builder.Add(_wire([gp_Pnt(x, y, z) for x, y in ring]))
-        result = builder.Face()
+        result = _shared_polygon_face(rings, z)
     except Exception as error:
-        raise KernelError("OpenCascade could not construct the polygon face") from error
-    if not valid(result):
+        if not polygon.interiors:
+            raise KernelError(
+                "OpenCascade could not construct the polygon face"
+            ) from error
+        # A direct multi-wire arrangement may be unsupported even though its
+        # exterior and counter faces can be built independently for the cut.
+        result = TopoDS_Face()
+        result_valid = False
+    else:
+        result_valid = valid(result)
+    if not result_valid and polygon.interiors:
+        try:
+            noded = _contact_noded_rings(rings)
+            if noded != rings:
+                result = _shared_polygon_face(noded, z)
+                result_valid = valid(result)
+        except Exception:
+            # The unchanged exterior-minus-counters operation below is checked
+            # independently; no failed candidate is accepted as a replacement.
+            pass
+    if not result_valid:
         if not polygon.interiors:
             raise KernelError("OpenCascade constructed an invalid polygon face")
         exterior = polygon_face(Polygon(polygon.exterior.coords), z)
