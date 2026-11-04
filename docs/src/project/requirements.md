@@ -29,14 +29,17 @@ palette or art-generation system remains a later product decision.
 
 ## Open Choices
 
-Final panel size, printer and nozzle, layer configuration, material-band heights,
-taper width/angle, image-processing libraries, export formats, and slicer workflow
-remain open. OpenCascade is the selected solid-modeling kernel; its Python binding
-and geometry construction strategy will be established during implementation.
-If an angle is exposed, document which axis it is measured from.
+The user selected configurable defaults: 250 mm on the long edge, 0.4 mm nozzle,
+0.2 mm layer height, and black/orange/white band thicknesses of 2/1/1 mm (4 mm
+total). Taper angle is also configurable, in degrees from vertical. Zero gives
+vertical internal walls; larger angles expand the lower footprint while retaining
+the original top. Nozzle size is recorded without minimum-feature enforcement.
 
-The handoff proposed black/orange/white heights of 2.0/0.6/1.0 mm. These are
-unvalidated examples, not approved dimensions or a default physical profile.
+The implementation starts with a 10-degree internal taper and a 0.2 mm protected
+rim. Those are adjustable software defaults, not physically validated settings.
+The actual printer, slicer/material configuration, mesh export settings, and
+observed print quality remain to be established. OpenCascade via OCP is the
+selected solid-modeling kernel.
 
 Validate geometry before claiming a usable exported model. Evaluate a coupon at
 the final artwork scale before claiming physical print quality. The coupon

@@ -1,0 +1,274 @@
+"""Exact roof geometry, plateau retention, and material-section primitives."""
+
+from math import cos, pi, sin
+from pathlib import Path
+
+import pytest
+from OCP.BRep import BRep_Builder
+from OCP.BRepTools import BRepTools
+from OCP.TopoDS import TopoDS_Shape
+from shapely import union_all
+from shapely.affinity import translate
+from shapely.geometry import MultiPolygon, Polygon, box
+
+from panelchemy import occt
+
+
+def test_square_roof_matches_integrated_round_offset_area() -> None:
+    polygon = box(0, 0, 4, 4)
+    shape, method = occt.roof(polygon, 2, 4, 0.25)
+    expected_volume = 16 * 2 + 16 * 0.25 * 2**2 / 2 + pi * 0.25**2 * 2**3 / 3
+    assert method == "evolved"
+    assert occt.valid(shape)
+    assert occt.volume(shape) == pytest.approx(expected_volume, rel=1e-8)
+    assert occt.area(occt.cross_section(shape, 4)) == pytest.approx(16)
+    assert occt.area(occt.cross_section(shape, 3)) == pytest.approx(
+        16 + 16 * 0.25 + pi * 0.25**2
+    )
+
+
+@pytest.mark.parametrize("width", [0.5, 4.0])
+def test_counter_retains_its_top_when_lower_hole_closes(width: float) -> None:
+    polygon = Polygon(
+        box(0, 0, 10, 10).exterior.coords,
+        [
+            box(
+                5 - width / 2, 5 - width / 2, 5 + width / 2, 5 + width / 2
+            ).exterior.coords
+        ],
+    )
+    shape, _ = occt.roof(polygon, 2, 4, 0.25)
+    assert occt.valid(shape)
+    top = occt.cross_section(shape, 4)
+    assert occt.area(top) == pytest.approx(100 - width**2)
+    assert occt.area(occt.cut(top, occt.polygon_face(polygon, 4))) < 1e-8
+    if width == 0.5:
+        outer_volume = 100 * 2 + 40 * 0.25 * 2**2 / 2 + pi * 0.25**2 * 2**3 / 3
+        assert occt.volume(shape) == pytest.approx(outer_volume - 1 / 12, rel=1e-8)
+        assert occt.area(occt.cross_section(shape, 2.5)) == pytest.approx(
+            100 + 40 * 0.375 + pi * 0.375**2
+        )
+
+
+def test_narrow_notch_can_close_below_an_unchanged_plateau() -> None:
+    polygon = Polygon(
+        [(0, 0), (4, 0), (4, 4), (2.25, 4), (2.25, 1), (1.75, 1), (1.75, 4), (0, 4)]
+    )
+    shape, _ = occt.roof(polygon, 2, 4, 0.25)
+    assert occt.valid(shape)
+    assert occt.area(occt.cross_section(shape, 4)) == pytest.approx(14.5)
+    assert occt.area(occt.cross_section(shape, 3)) > 14.5
+
+
+def test_thin_stroke_top_is_preserved_by_the_exact_construction() -> None:
+    polygon = box(0, 0, 0.01, 4)
+    shape, method = occt.roof(polygon, 2, 4, 0.2, prefer_fast=False)
+    assert method == "exact"
+    assert occt.valid(shape)
+    assert occt.area(occt.cross_section(shape, 4)) == pytest.approx(0.04, rel=1e-8)
+    assert occt.area(occt.cross_section(shape, 2)) == pytest.approx(
+        0.04 + 8.02 * 0.4 + pi * 0.4**2
+    )
+
+
+def test_evolved_roof_handles_translated_profiles_and_many_edges() -> None:
+    polygon = Polygon(
+        [(5 * cos(index * pi / 32), 5 * sin(index * pi / 32)) for index in range(64)]
+    )
+    reference, _ = occt.roof(polygon, 0.6, 2.3, 0.1)
+    moved, method = occt.roof(translate(polygon, xoff=50, yoff=-70), 0.6, 2.3, 0.1)
+    assert method == "evolved"
+    assert occt.volume(moved) == pytest.approx(occt.volume(reference), rel=1e-8)
+    assert occt.area(occt.cross_section(moved, 2.3)) == pytest.approx(polygon.area)
+
+
+@pytest.mark.parametrize("replacement", [box(0, 0, 10, 10), box(0, 0, 2, 2)])
+def test_valid_but_changed_fast_top_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, replacement: Polygon
+) -> None:
+    original = Polygon(
+        box(0, 0, 10, 10).exterior.coords, [box(3, 3, 7, 7).exterior.coords]
+    )
+
+    def wrong_top(
+        _polygon: Polygon, z0: float, z1: float, _run_per_height: float
+    ) -> TopoDS_Shape:
+        return occt.prism(replacement, z0, z1)
+
+    monkeypatch.setattr(occt, "_evolved_roof", wrong_top)
+    shape, method = occt.roof(original, 2, 4, 0.25)
+    assert method == "exact"
+    assert occt.valid(shape)
+    assert occt.area(occt.cross_section(shape, 4)) == pytest.approx(original.area)
+
+
+def test_zero_taper_and_disjoint_regions_have_registered_prism_sections() -> None:
+    first, method = occt.roof(box(0, 0, 2, 3), 2, 4, 0)
+    assert method == "prism"
+    assert occt.volume(first) == pytest.approx(12)
+    assert occt.area(occt.cross_section(first, 2)) == pytest.approx(6)
+    assert occt.area(occt.cross_section(first, 4)) == pytest.approx(6)
+    second = occt.prism(MultiPolygon([box(0, 0, 2, 3), box(5, 0, 6, 1)]), 2, 4)
+    assert occt.valid(second)
+    assert occt.volume(second) == pytest.approx(14)
+    assert occt.area(occt.cross_section(second, 3)) == pytest.approx(7)
+
+
+def test_boolean_material_bands_have_disjoint_interiors_and_matching_total_volume() -> (
+    None
+):
+    shape, _ = occt.roof(box(0, 0, 4, 4), 2, 4, 0.25)
+    orange = occt.common(shape, occt.prism(box(-1, -1, 5, 5), 2, 3))
+    white = occt.common(shape, occt.prism(box(-1, -1, 5, 5), 3, 4))
+    assert occt.volume(occt.common(orange, white)) == pytest.approx(0, abs=1e-10)
+    assert occt.volume(orange) + occt.volume(white) == pytest.approx(occt.volume(shape))
+    assert occt.area(occt.cross_section(orange, 3)) == pytest.approx(
+        occt.area(occt.cross_section(white, 3))
+    )
+
+
+def test_empty_regions_remain_explicitly_empty() -> None:
+    empty = occt.prism(Polygon(), 0, 2)
+    solid = occt.prism(box(0, 0, 2, 2), 0, 2)
+    assert occt.valid(empty)
+    assert occt.volume(empty) == 0
+    assert occt.area(occt.cross_section(empty, 1)) == 0
+    assert occt.volume(occt.common(empty, solid)) == 0
+    assert occt.volume(occt.cut(solid, empty)) == pytest.approx(8)
+    assert occt.volume(occt.fuse([empty, solid])) == pytest.approx(8)
+
+
+@pytest.mark.parametrize(
+    ("z0", "z1", "run"),
+    [(2.0, 2.0, 0.1), (3.0, 2.0, 0.1), (2.0, 4.0, -0.1), (2.0, 4.0, float("nan"))],
+)
+def test_invalid_taper_parameters_fail_before_native_construction(
+    z0: float, z1: float, run: float
+) -> None:
+    with pytest.raises(occt.KernelError):
+        _ = occt.roof(box(0, 0, 2, 2), z0, z1, run)
+
+
+def test_brep_round_trip_preserves_the_checked_solid(tmp_path: Path) -> None:
+    shape, _ = occt.roof(box(0, 0, 4, 4), 2, 4, 0.25)
+    output = tmp_path / "roof.brep"
+    occt.write_brep(shape, output)
+    restored = TopoDS_Shape()
+    assert BRepTools.Read_s(restored, str(output), BRep_Builder())
+    assert occt.valid(restored)
+    assert occt.volume(restored) == pytest.approx(occt.volume(shape))
+
+
+@pytest.mark.parametrize(
+    "polygon",
+    [
+        Polygon(
+            box(0, 0, 5, 5).exterior.coords,
+            [box(1, 1, 2, 2).exterior.coords, box(2, 2, 3, 3).exterior.coords],
+        ),
+        Polygon(
+            [(0, 1), (1, 1), (1, 0), (3, 0), (3, 3), (0, 3)],
+            [box(1, 1, 2, 2).exterior.coords],
+        ),
+        Polygon(box(0, 0, 5, 5).exterior.coords, [box(1, 1, 2, 2).exterior.coords]),
+    ],
+    ids=["touching-holes", "hole-touching-outer", "disjoint-hole"],
+)
+def test_exact_face_and_roof_preserve_point_touching_counter_arrangements(
+    polygon: Polygon,
+) -> None:
+    assert polygon.is_valid
+    face = occt.polygon_face(polygon, 4)
+    assert occt.valid(face)
+    assert occt.area(face) == pytest.approx(polygon.area, abs=1e-10)
+    prism = occt.prism(polygon, 2, 4)
+    assert occt.valid(prism)
+    assert occt.volume(prism) == pytest.approx(polygon.area * 2, abs=1e-10)
+    # A simple cell-face union is independent of the touching-ring constructor.
+    reference = occt.fuse(
+        [
+            occt.polygon_face(box(x, y, x + 1, y + 1), 4)
+            for x in range(5)
+            for y in range(5)
+            if polygon.covers(box(x, y, x + 1, y + 1))
+        ]
+    )
+    assert occt.area(occt.cut(face, reference)) < 1e-10
+    assert occt.area(occt.cut(reference, face)) < 1e-10
+    roof, _ = occt.roof(polygon, 2, 4, 0.25)
+    assert occt.valid(roof)
+    top = occt.cross_section(roof, 4)
+    assert occt.area(occt.cut(top, reference)) < 1e-10
+    assert occt.area(occt.cut(reference, top)) < 1e-10
+
+
+def test_counter_arrangement_rejects_a_valid_face_that_loses_the_holes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polygon = Polygon(
+        box(0, 0, 5, 5).exterior.coords,
+        [box(1, 1, 2, 2).exterior.coords, box(2, 2, 3, 3).exterior.coords],
+    )
+    wrong_face = occt.polygon_face(box(0, 0, 5, 5))
+
+    def lose_counters(*_args: object) -> TopoDS_Shape:
+        return wrong_face
+
+    monkeypatch.setattr(occt, "_boolean", lose_counters)
+    with pytest.raises(occt.KernelError, match="changed the exact source area"):
+        _ = occt.polygon_face(polygon)
+
+
+def test_counter_arrangement_rejects_multiple_faces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polygon = Polygon(
+        box(0, 0, 5, 5).exterior.coords,
+        [box(1, 1, 2, 2).exterior.coords, box(2, 2, 3, 3).exterior.coords],
+    )
+    wrong_faces = occt.fuse(
+        [occt.polygon_face(box(0, 0, 1, 1)), occt.polygon_face(box(2, 2, 3, 3))]
+    )
+
+    def multiple_faces(*_args: object) -> TopoDS_Shape:
+        return wrong_faces
+
+    monkeypatch.setattr(occt, "_boolean", multiple_faces)
+    with pytest.raises(occt.KernelError, match="one valid face"):
+        _ = occt.polygon_face(polygon)
+
+
+def test_fast_roof_with_correct_top_but_no_expansion_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polygon = box(0, 0, 4, 4)
+
+    def vertical_only(
+        region: Polygon, z0: float, z1: float, _slope: float
+    ) -> TopoDS_Shape:
+        return occt.prism(region, z0, z1)
+
+    monkeypatch.setattr(occt, "_evolved_roof", vertical_only)
+    shape, method = occt.roof(polygon, 2, 4, 0.25)
+    assert method == "exact"
+    assert occt.area(occt.cross_section(shape, 2)) > polygon.area
+
+
+def test_critical_narrow_mouth_retains_a_supported_bottom_section() -> None:
+    geometry = union_all(
+        [
+            box(0, 0, 2, 4),
+            box(0, 0, 5, 1),
+            box(3, 3, 5, 4),
+            box(4, 0, 5, 4),
+        ]
+    )
+    assert isinstance(geometry, Polygon)
+    shape, _ = occt.roof(geometry, 2, 4, 0.25)
+    bottom = occt.cross_section(shape, 2)
+    assert occt.area(bottom) == pytest.approx(
+        geometry.buffer(0.5, quad_segs=64).area, abs=0.001
+    )
+    assert occt.area(occt.cut(occt.polygon_face(geometry, 2), bottom)) == pytest.approx(
+        0, abs=1e-9
+    )

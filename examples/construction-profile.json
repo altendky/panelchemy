@@ -1,0 +1,10 @@
+{
+  "long_edge_mm": 250.0,
+  "nozzle_diameter_mm": 0.4,
+  "layer_height_mm": 0.2,
+  "black_thickness_mm": 2.0,
+  "orange_thickness_mm": 1.0,
+  "white_thickness_mm": 1.0,
+  "taper_angle_deg": 10.0,
+  "rim_width_mm": 0.2
+}
