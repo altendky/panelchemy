@@ -5,10 +5,16 @@ from typing import cast, override
 
 import numpy as np
 import pytest
+from OCP.Bnd import Bnd_Box
+from OCP.BRep import BRep_Builder
+from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepTools import BRepTools
 from OCP.IFSelect import IFSelect_ReturnStatus
 from OCP.Interface import Interface_Static
 from OCP.STEPControl import STEPControl_Writer
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopoDS import TopoDS
 from PIL import Image
 
 from panelchemy import export as export_module
@@ -118,6 +124,41 @@ def test_taper_counter_and_shared_interfaces_are_serialized_conformally() -> Non
     processing = cast("dict[str, object]", bundle.validation["numerical_processing"])
     assert cast("float", processing["maximum_coordinate_rounding_mm"]) < 1e-11
     assert "collapsed_native_triangles_discarded" in processing
+
+
+def test_shape_tolerance_envelope_does_not_cross_geometric_material_planes() -> None:
+    model = _model(1)
+    builder = BRep_Builder()
+    for kind in (TopAbs_EDGE, TopAbs_VERTEX):
+        explorer = TopExp_Explorer(model.materials["black"], kind)
+        while explorer.More():
+            if kind == TopAbs_EDGE:
+                builder.UpdateEdge(TopoDS.Edge(explorer.Current()), 2.5e-6)
+            else:
+                builder.UpdateVertex(TopoDS.Vertex(explorer.Current()), 2.5e-6)
+            explorer.Next()
+    assert occt.valid(model.materials["black"])
+    conservative = Bnd_Box()
+    BRepBndLib.Add_s(model.materials["black"], conservative, False)
+    assert conservative.CornerMin().Z() < -1e-6
+    assert conservative.CornerMax().Z() > model.profile.black_top + 1e-6
+    before = _snapshot(model)
+    bundle = export_model(model)
+    assert _snapshot(model) == before
+    points = _read_stl(bundle.files["black.stl"]).points
+    assert min(point[2] for point in points) == 0
+    assert max(point[2] for point in points) == model.profile.black_top
+
+
+def test_actual_material_geometry_crossing_still_rejects() -> None:
+    model = _model(1)
+    model.materials["black"] = occt.prism(
+        model.contours.silhouette, -0.01, model.profile.black_top
+    )
+    before = _snapshot(model)
+    with pytest.raises(ExportError, match="partition cell crosses a material boundary"):
+        _ = export_model(model)
+    assert _snapshot(model) == before
 
 
 def _tetra(offset: tuple[float, float, float] = (0, 0, 0)) -> _Mesh:
