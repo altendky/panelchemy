@@ -4,8 +4,8 @@ Panelchemy is a local tool in development for converting comic-panel artwork
 into configurable, three-color layered relief.
 
 The repository foundation, image-space separation, and local browser workflow
-are in place. Geometry and physical printing remain tracked stages; no printable
-model exists yet.
+are in place, along with the OCCT relief API/CLI. Validated slicer export and
+physical printing remain tracked stages; no physical print is verified yet.
 
 ## Development
 
@@ -33,6 +33,12 @@ Create [separation previews](docs/src/project/separation.md) with:
 
 ```sh
 mise exec -- uv run --locked panelchemy separate /path/to/artwork.png --output local-inputs/preview
+```
+
+Build [layered BRep geometry](docs/src/project/relief.md) with:
+
+```sh
+mise exec -- uv run --locked panelchemy relief /path/to/artwork.png --output local-inputs/relief
 ```
 
 ## Layout

@@ -27,6 +27,15 @@ def main() -> None:
     _ = local_server.add_argument("--port", type=int, default=8765)
     _ = local_server.add_argument("--max-pixels", type=int, default=4_000_000)
     _ = local_server.add_argument("--max-request-mib", type=int, default=32)
+    relief = commands.add_parser(
+        "relief", help="build inspectable layered OCCT geometry"
+    )
+    _ = relief.add_argument("input", type=Path)
+    _ = relief.add_argument("--output", type=Path, required=True)
+    _ = relief.add_argument("--config", type=Path)
+    _ = relief.add_argument("--profile", type=Path)
+    _ = relief.add_argument("--silhouette-mask", type=Path)
+    _ = relief.add_argument("--max-vertices", type=int, default=25_000)
     args = parser.parse_args()
     if cast("str | None", args.command) is None:
         parser.print_help()
@@ -42,6 +51,25 @@ def main() -> None:
                     max_request_bytes=cast("int", args.max_request_mib) * 1024 * 1024,
                 ),
             )
+            return
+        if cast("str", args.command) == "relief":
+            from panelchemy.construction import load_profile
+            from panelchemy.relief import process_relief_file
+
+            config_path = cast("Path | None", args.config)
+            profile_path = cast("Path | None", args.profile)
+            manifest = process_relief_file(
+                cast("Path", args.input),
+                cast("Path", args.output),
+                load_profile(profile_path),
+                load_config(config_path),
+                silhouette_path=cast("Path | None", args.silhouette_mask),
+                protected_paths=tuple(
+                    p for p in (config_path, profile_path) if p is not None
+                ),
+                max_vertices=cast("int", args.max_vertices),
+            )
+            print(json.dumps(manifest, indent=2, sort_keys=True))
             return
         source = cast("Path", args.input)
         output = cast("Path", args.output)

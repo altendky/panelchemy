@@ -6,9 +6,11 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 license = "MIT OR Apache-2.0"
 dependencies = [
+    "cadquery-ocp-novtk==8.0.1.1.0",
     "numpy>=2.3",
     "pillow>=12",
     "scipy>=1.16",
+    "shapely>=2.1",
 ]
 
 [project.scripts]
@@ -17,10 +19,12 @@ panelchemy = "panelchemy.cli:main"
 [dependency-groups]
 dev = [
   "basedpyright>=1.31",
+  "cadquery-ocp-stubs==8.0.1.1.0",
   "pytest>=8.4",
   "pytest-cov>=7.0",
   "ruff>=0.12",
   "scipy-stubs>=1.16",
+  "types-shapely>=2.1.0.20261030",
 ]
 
 [build-system]
