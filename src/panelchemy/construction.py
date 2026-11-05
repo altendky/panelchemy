@@ -5,7 +5,17 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from math import isclose, isfinite, radians, tan
 from pathlib import Path
-from typing import Self, cast
+from typing import Literal, Self, cast
+
+type ContourMode = Literal["curves", "lines"]
+
+
+def _contour_mode(value: object) -> ContourMode:
+    if value == "curves":
+        return "curves"
+    if value == "lines":
+        return "lines"
+    raise ValueError("contour_mode must be curves or lines")
 
 
 def _number(value: object, name: str) -> float:
@@ -33,9 +43,13 @@ class ConstructionProfile:
     taper_angle_deg: float = 10.0
     rim_width_mm: float = 0.2
     contour_tolerance_mm: float = 0.0
+    contour_mode: ContourMode = "curves"
 
     def __post_init__(self) -> None:
         for field in fields(self):
+            if field.name == "contour_mode":
+                _ = _contour_mode(self.contour_mode)
+                continue
             value = _number(cast("object", getattr(self, field.name)), field.name)
             if field.name == "taper_angle_deg":
                 if not 0 <= value < 90:
@@ -80,9 +94,9 @@ class ConstructionProfile:
     def taper_run_per_height(self) -> float:
         return tan(radians(self.taper_angle_deg))
 
-    def as_dict(self) -> dict[str, float]:
+    def as_dict(self) -> dict[str, float | str]:
         return {
-            field.name: cast("float", getattr(self, field.name))
+            field.name: cast("float | str", getattr(self, field.name))
             for field in fields(self)
         }
 
@@ -94,7 +108,14 @@ class ConstructionProfile:
             raise ValueError(
                 f"unknown construction settings: {', '.join(sorted(unknown))}"
             )
-        return cls(**{name: _number(value, name) for name, value in data.items()})
+        return cls(
+            **{
+                name: _number(value, name)
+                for name, value in data.items()
+                if name != "contour_mode"
+            },
+            contour_mode=_contour_mode(data.get("contour_mode", "curves")),
+        )
 
 
 def load_profile(path: Path | None) -> ConstructionProfile:

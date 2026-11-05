@@ -18,10 +18,12 @@ from typing import Protocol, Self, cast
 from OCP.Bnd import Bnd_Box
 from OCP.BOPAlgo import BOPAlgo_Builder
 from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.collections import List_TopoDS_Shape, Sequence_TCollection_AsciiString
+from OCP.GeomAbs import GeomAbs_Plane
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.Interface import Interface_Static
 from OCP.Poly import Poly_Triangulation
@@ -56,6 +58,7 @@ class _Relief(Protocol):
     contours: PanelContours
     solid: TopoDS_Shape
     materials: dict[str, TopoDS_Shape]
+    footprint_proxy_tolerance_mm: float
 
 
 @dataclass
@@ -64,6 +67,7 @@ class _CopiedRelief:
     contours: PanelContours
     solid: TopoDS_Shape
     materials: dict[str, TopoDS_Shape]
+    footprint_proxy_tolerance_mm: float
 
 
 def _positive_number(value: object, name: str) -> None:
@@ -762,8 +766,17 @@ def _triangle_intersections(
                 numeric_contacts.add((i, j))
                 continue
             na, nb = normals[i], normals[j]
-            da = [_dot(_subtract(point, b[0]), nb) for point in a]
-            db = [_dot(_subtract(point, a[0]), na) for point in b]
+            # An indexed shared vertex belongs to both exact triangle planes.
+            # A floating normal dot product can invent a tiny signed distance
+            # there, then amplify it into a spurious edge/plane crossing.
+            da = [
+                0.0 if vertex in shared else _dot(_subtract(point, b[0]), nb)
+                for vertex, point in zip(mesh.triangles[i], a, strict=True)
+            ]
+            db = [
+                0.0 if vertex in shared else _dot(_subtract(point, a[0]), na)
+                for vertex, point in zip(mesh.triangles[j], b, strict=True)
+            ]
             if (
                 all(d > epsilon for d in da)
                 or all(d < -epsilon for d in da)
@@ -1255,11 +1268,20 @@ def _check_float32(original: _Mesh, serialized: _Mesh, budget: float) -> float:
 
 
 def _footprints(
-    meshes: dict[str, _Mesh], model: _Relief, uncertainty_mm: float
+    meshes: dict[str, _Mesh],
+    model: _Relief,
+    uncertainty_mm: float,
+    linear_deflection_mm: float = 0.0,
 ) -> dict[str, object]:
     """Check planar source tops and the vertical black wall after serialization."""
     scale = max(1.0, model.profile.long_edge_mm)
     tolerance = uncertainty_mm * 4 + ulp(scale) * 64
+    # Display contours are a certified polygonal proxy of native curves. Only
+    # those feature references need a tessellation allowance; the exact panel
+    # silhouette and its vertical wall retain the coordinate-only checks.
+    proxy_tolerance = model.footprint_proxy_tolerance_mm
+    mesh_tolerance = linear_deflection_mm if proxy_tolerance > 0 else 0.0
+    curve_tolerance = proxy_tolerance + mesh_tolerance
 
     def cap(name: str, height: float) -> BaseGeometry:
         if name not in meshes:
@@ -1301,40 +1323,70 @@ def _footprints(
 
     result: dict[str, object] = {}
     for name, expected, actual in checks:
+        feature_tolerance = curve_tolerance if name == "white_top" else 0.0
+        boundary_tolerance = tolerance * 2 + feature_tolerance
         error = expected.symmetric_difference(actual).area
-        budget = expected.length * tolerance * 2 + tolerance**2 * 4
+        budget = expected.length * boundary_tolerance + boundary_tolerance**2
         if (
             topology(expected) != topology(actual)
             or error > budget
-            or expected.hausdorff_distance(actual) > tolerance * 2
+            or expected.hausdorff_distance(actual) > boundary_tolerance
         ):
+            budget_kind = "curve and coordinate" if feature_tolerance else "coordinate"
             raise ExportError(
-                f"serialized {name} footprint exceeds its coordinate error budget"
+                f"serialized {name} footprint exceeds its {budget_kind} error budget"
             )
         result[name] = {
             "symmetric_difference_mm2": error,
             "area_error_budget_mm2": budget,
-            "boundary_tolerance_mm": tolerance * 2,
+            "boundary_tolerance_mm": boundary_tolerance,
+            "coordinate_tolerance_mm": tolerance * 2,
+            "curve_proxy_tolerance_mm": proxy_tolerance if feature_tolerance else 0.0,
+            "mesh_linear_deflection_mm": mesh_tolerance if feature_tolerance else 0.0,
         }
     if "orange" in meshes:
         source = union_all([*model.contours.orange, *model.contours.white])
         top = cap("orange", model.profile.orange_top)
-        if not source.difference(top.buffer(tolerance)).is_empty:
+        if not source.difference(top.buffer(tolerance + curve_tolerance)).is_empty:
             raise ExportError(
                 "serialized orange top no longer covers the source feature tops"
             )
         result["orange_source_top_coverage"] = True
+        result["orange_source_top_coverage_tolerance_mm"] = tolerance + curve_tolerance
     black = meshes["black"]
     boundary = model.contours.silhouette.boundary
+    # Native cap vertices may differ slightly from their supporting plane even
+    # before coordinate rounding. Use that plane's existing CAD tolerance only
+    # for cap-height classification; the wall's XY boundary stays coordinate-only.
+    cap_planes: list[tuple[float, float]] = []
+    faces = TopExp_Explorer(model.materials["black"], TopAbs_FACE)
+    while faces.More():
+        face = TopoDS.Face(faces.Current())
+        surface = BRepAdaptor_Surface(face)
+        if surface.GetType() == GeomAbs_Plane:
+            plane = surface.Plane()
+            direction = plane.Axis().Direction()
+            if direction.X() == 0 and direction.Y() == 0:
+                cap_planes.append(
+                    (plane.Location().Z(), BRep_Tool.Tolerance_s(face) + tolerance)
+                )
+        faces.Next()
     for triangle in black.triangles:
         points = [black.points[index] for index in triangle]
-        if len({point[2] for point in points}) > 1 and any(
+        on_cap = any(
+            all(abs(point[2] - height) <= height_tolerance for point in points)
+            for height, height_tolerance in cap_planes
+        )
+        if not on_cap and any(
             boundary.distance(Point(point[0], point[1])) > tolerance for point in points
         ):
             raise ExportError(
                 "serialized black outer wall is not vertical on the silhouette boundary"
             )
     result["vertical_outer_wall"] = True
+    result["black_cap_height_tolerance_mm"] = max(
+        (height_tolerance for _, height_tolerance in cap_planes), default=tolerance
+    )
     return result
 
 
@@ -1370,6 +1422,14 @@ def _export_model(
     complete export.
     """
     config = config or ExportConfig()
+    proxy_tolerance = cast("object", model.footprint_proxy_tolerance_mm)
+    if (
+        isinstance(proxy_tolerance, bool)
+        or not isinstance(proxy_tolerance, (int, float))
+        or not isfinite(proxy_tolerance)
+        or proxy_tolerance < 0
+    ):
+        raise ExportError("footprint_proxy_tolerance_mm must be finite and nonnegative")
     # Some kernel queries populate geometry caches. Keep even those queries off
     # the caller's shapes; exact CAD snapshots must survive exporting unchanged.
     model = _CopiedRelief(
@@ -1380,6 +1440,7 @@ def _export_model(
             name: BRepBuilderAPI_Copy(shape, True, False).Shape()
             for name, shape in model.materials.items()
         },
+        proxy_tolerance,
     )
     if not occt.valid(model.solid) or occt.volume(model.solid) <= 0:
         raise ExportError("source relief CAD must be valid with positive volume")
@@ -1434,9 +1495,12 @@ def _export_model(
         if name != "relief":
             serialized_meshes[name] = roundtrip
     stl_interfaces = _interfaces(serialized_meshes, model)
-    footprints = _footprints(meshes, model, rounding_error)
+    footprints = _footprints(meshes, model, rounding_error, config.linear_deflection_mm)
     serialized_footprints = _footprints(
-        serialized_meshes, model, rounding_error + float_error
+        serialized_meshes,
+        model,
+        rounding_error + float_error,
+        config.linear_deflection_mm,
     )
     try:
         files["relief.step"], step_report = _step(model.solid)

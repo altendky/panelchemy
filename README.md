@@ -8,6 +8,9 @@ are in place, along with the OCCT relief API/CLI and checked STEP/STL model
 exports. No physical print is verified yet; slicer projects and deployment remain
 later work.
 
+Start with [Preparing artwork](docs/src/project/artwork-guide.md) for flat colors,
+feature-size targets, panel boundaries, and a copyable image-generation prompt.
+
 ## Development
 
 Install [mise](https://mise.jdx.dev/), then run:

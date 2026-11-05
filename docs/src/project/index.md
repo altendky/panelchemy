@@ -15,11 +15,13 @@ writes exact STEP and checked combined/registered STL geometry. Physical print
 quality remains unverified; slicer projects and deployment remain later work.
 
 The handoff's animal panels are evaluation inputs. Their exact artwork details
-are not requirements for the general tool. The broader art-generation prompt
-workflow is separate from the initial conversion work.
+are not requirements for the general tool. Artwork preparation guidance and a
+copyable image-generation prompt describe input requirements; automated artwork
+generation is separate from conversion.
 
 ## Documentation
 
+- [Preparing artwork and image-generation prompts](artwork-guide.md)
 - [Construction requirements and open choices](requirements.md)
 - [Architecture](architecture.md)
 - [Development and automation](development.md)

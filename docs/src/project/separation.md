@@ -1,5 +1,8 @@
 # Color Separation
 
+See [Preparing artwork](artwork-guide.md) for feature-size design targets, flat
+colors, boundary options, and a copyable image-generation prompt.
+
 ```sh
 uv run --locked panelchemy separate /path/to/artwork.png --output local-inputs/preview
 ```

@@ -6,15 +6,184 @@ from pathlib import Path
 
 import pytest
 from OCP.BRep import BRep_Builder
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakePolygon
-from OCP.BRepTools import BRepTools
+from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_MakeEdge,
+    BRepBuilderAPI_MakeFace,
+    BRepBuilderAPI_MakePolygon,
+    BRepBuilderAPI_MakeVertex,
+)
+from OCP.BRepTools import BRepTools, BRepTools_ReShape
 from OCP.gp import gp_Pnt
-from OCP.TopoDS import TopoDS_Face, TopoDS_Shape, TopoDS_Wire
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_INTERNAL, TopAbs_WIRE
+from OCP.TopExp import TopExp_Explorer
+from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Face, TopoDS_Shape, TopoDS_Wire
 from shapely import union_all
 from shapely.affinity import translate
 from shapely.geometry import MultiPolygon, Polygon, box
 
 from panelchemy import occt
+from panelchemy.occt import (
+    _annotation_boundary_unchanged,  # pyright: ignore[reportPrivateUsage]
+    _bounds,  # pyright: ignore[reportPrivateUsage]
+    _is_open_internal_wire,  # pyright: ignore[reportPrivateUsage]
+    _open_internal_wires,  # pyright: ignore[reportPrivateUsage]
+    _without_open_internal_wires,  # pyright: ignore[reportPrivateUsage]
+)
+
+
+def test_annotation_cleanup_keeps_counter_despite_volume_integration_noise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polygon = Polygon(
+        box(0, 0, 4, 4).exterior.coords, [box(1, 1, 3, 3).exterior.coords]
+    )
+    solid = occt.prism(polygon, 0, 2)
+    faces = TopExp_Explorer(solid, TopAbs_FACE)
+    face = TopoDS_Face()
+    while faces.More():
+        face = TopoDS.Face(faces.Current())
+        if _bounds(face)[2] > 1.999:
+            break
+        faces.Next()
+    assert faces.More()
+    edge = BRepBuilderAPI_MakeEdge(gp_Pnt(0.2, 0.2, 2), gp_Pnt(0.8, 0.2, 2)).Edge()
+    edge.Orientation(TopAbs_INTERNAL)
+    annotation = TopoDS_Wire()
+    builder = BRep_Builder()
+    builder.MakeWire(annotation)
+    builder.Add(annotation, edge)
+    face.Free(True)
+    builder.Add(face, annotation)
+    assert occt.valid(solid)
+    assert _open_internal_wires(solid)
+    native_volume = occt.volume
+
+    def noisy_volume(shape: TopoDS_Shape) -> float:
+        # Independent integration can vary after identical face boundaries are
+        # copied and their non-boundary annotation wires disappear.
+        return native_volume(shape) + (0.0 if shape.IsSame(solid) else 1e-7)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(occt, "volume", noisy_volume)
+        cleaned = _without_open_internal_wires(solid)
+    assert occt.valid(cleaned)
+    assert not _open_internal_wires(cleaned)
+    assert native_volume(cleaned) == pytest.approx(24, abs=1e-10)
+    top = occt.cross_section(cleaned, 2)
+    assert occt.area(top) == pytest.approx(polygon.area, abs=1e-10)
+    counter = occt.polygon_face(box(1, 1, 3, 3), 2)
+    assert occt.area(occt.common(top, counter)) == pytest.approx(0, abs=1e-10)
+
+
+def test_closed_internal_loop_is_retained_even_with_unset_closed_flag() -> None:
+    face = occt.polygon_face(box(0, 0, 4, 4))
+    boundary = BRepBuilderAPI_MakePolygon()
+    for x, y in ((1, 1), (2, 1), (2, 2), (1, 2)):
+        boundary.Add(gp_Pnt(x, y, 0))
+    boundary.Close()
+    loop = TopoDS_Wire()
+    builder = BRep_Builder()
+    builder.MakeWire(loop)
+    edges = TopExp_Explorer(boundary.Wire(), TopAbs_EDGE)
+    while edges.More():
+        edge = edges.Current()
+        edge.Orientation(TopAbs_INTERNAL)
+        builder.Add(loop, edge)
+        edges.Next()
+    assert not loop.Closed()
+    builder.Add(face, loop)
+    assert not _is_open_internal_wire(loop)
+    assert not _open_internal_wires(face)
+    assert _without_open_internal_wires(face).IsEqual(face)
+
+
+@pytest.mark.parametrize("links", [((0, 1), (1, 2), (1, 3)), ((0, 1), (2, 3))])
+def test_annotation_cleanup_accepts_internal_trees(
+    links: tuple[tuple[int, int], ...],
+) -> None:
+    vertices = [
+        BRepBuilderAPI_MakeVertex(gp_Pnt(x, y, 0)).Vertex()
+        for x, y in ((0.5, 0.5), (1.5, 0.5), (1, 1.5), (2, 2))
+    ]
+    builder = BRep_Builder()
+    annotation = TopoDS_Wire()
+    builder.MakeWire(annotation)
+    for start, end in links:
+        edge = BRepBuilderAPI_MakeEdge(vertices[start], vertices[end]).Edge()
+        edge.Orientation(TopAbs_INTERNAL)
+        builder.Add(annotation, edge)
+    face = occt.polygon_face(box(0, 0, 4, 4))
+    builder.Add(face, annotation)
+    assert _is_open_internal_wire(annotation)
+    cleaned = _without_open_internal_wires(face)
+    assert occt.valid(cleaned)
+    assert not _open_internal_wires(cleaned)
+    assert occt.area(cleaned) == pytest.approx(16, abs=1e-10)
+
+
+@pytest.mark.parametrize(
+    "links",
+    [
+        ((0, 1), (1, 2), (2, 0), (2, 3)),  # Loop with an open tail.
+        ((0, 1), (1, 2), (2, 0), (3, 4)),  # Disconnected loop and chain.
+        ((0, 1), (0, 1)),  # Two distinct edges close a multigraph cycle.
+    ],
+)
+def test_internal_annotation_with_any_cycle_is_retained(
+    links: tuple[tuple[int, int], ...],
+) -> None:
+    vertices = [
+        BRepBuilderAPI_MakeVertex(gp_Pnt(x, y, 0)).Vertex()
+        for x, y in ((0.5, 0.5), (1.5, 0.5), (1, 1.5), (2, 2), (2.5, 2.5))
+    ]
+    builder = BRep_Builder()
+    annotation = TopoDS_Wire()
+    builder.MakeWire(annotation)
+    for start, end in links:
+        edge = BRepBuilderAPI_MakeEdge(vertices[start], vertices[end]).Edge()
+        edge.Orientation(TopAbs_INTERNAL)
+        builder.Add(annotation, edge)
+    assert not _is_open_internal_wire(annotation)
+
+
+def test_annotation_certificate_rejects_removing_a_counter_boundary() -> None:
+    face = occt.polygon_face(
+        Polygon(box(0, 0, 4, 4).exterior.coords, [box(1, 1, 3, 3).exterior.coords])
+    )
+    outer = BRepTools.OuterWire_s(face)
+    wires = TopExp_Explorer(face, TopAbs_WIRE)
+    counter = TopoDS_Wire()
+    while wires.More():
+        counter = TopoDS.Wire(wires.Current())
+        if not counter.IsSame(outer):
+            break
+        wires.Next()
+    assert wires.More()
+    reshape = BRepTools_ReShape()
+    reshape.Remove(counter)
+    filled = reshape.Apply(face)
+    assert occt.valid(filled)
+    assert not _annotation_boundary_unchanged(face, filled, [counter])
+
+
+def test_annotation_certificate_rejects_global_wire_removal_outside_a_face() -> None:
+    edge = BRepBuilderAPI_MakeEdge(gp_Pnt(1, 1, 0), gp_Pnt(2, 1, 0)).Edge()
+    edge.Orientation(TopAbs_INTERNAL)
+    builder = BRep_Builder()
+    annotation = TopoDS_Wire()
+    builder.MakeWire(annotation)
+    builder.Add(annotation, edge)
+    face = occt.polygon_face(box(0, 0, 4, 4))
+    builder.Add(face, annotation)
+    assembly = TopoDS_Compound()
+    builder.MakeCompound(assembly)
+    builder.Add(assembly, face)
+    # ReShape removal works by identity, including this separate wire use.
+    builder.Add(assembly, annotation)
+    reshape = BRepTools_ReShape()
+    reshape.Remove(annotation)
+    cleaned = reshape.Apply(assembly)
+    assert not _annotation_boundary_unchanged(assembly, cleaned, [annotation])
 
 
 def independent_wires_face(
@@ -80,10 +249,10 @@ def test_narrow_notch_can_close_below_an_unchanged_plateau() -> None:
     assert occt.area(occt.cross_section(shape, 3)) > 14.5
 
 
-def test_thin_stroke_top_is_preserved_by_the_exact_construction() -> None:
+def test_thin_stroke_top_is_preserved_by_the_regional_construction() -> None:
     polygon = box(0, 0, 0.01, 4)
     shape, method = occt.roof(polygon, 2, 4, 0.2, prefer_fast=False)
-    assert method == "exact"
+    assert method in {"draft", "surface", "evolved-volume"}
     assert occt.valid(shape)
     assert occt.area(occt.cross_section(shape, 4)) == pytest.approx(0.04, rel=1e-8)
     assert occt.area(occt.cross_section(shape, 2)) == pytest.approx(
@@ -117,7 +286,7 @@ def test_valid_but_changed_fast_top_is_rejected(
 
     monkeypatch.setattr(occt, "_evolved_roof", wrong_top)
     shape, method = occt.roof(original, 2, 4, 0.25)
-    assert method == "exact"
+    assert method in {"draft", "surface"}
     assert occt.valid(shape)
     assert occt.area(occt.cross_section(shape, 4)) == pytest.approx(original.area)
 
@@ -295,7 +464,7 @@ def test_fast_roof_with_correct_top_but_no_expansion_is_rejected(
 
     monkeypatch.setattr(occt, "_evolved_roof", vertical_only)
     shape, method = occt.roof(polygon, 2, 4, 0.25)
-    assert method == "exact"
+    assert method in {"draft", "surface"}
     assert occt.area(occt.cross_section(shape, 2)) > polygon.area
 
 
