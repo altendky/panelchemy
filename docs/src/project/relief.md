@@ -176,31 +176,133 @@ Inspect that comparison before accepting an approximated panel; a tolerance is
 an explicit artwork choice, not a print-quality guarantee. With approximation
 enabled, source contour allocation permits at least 100,000 vertices; increasing
 `--max-vertices` above that also raises the source limit. The normal kernel budget
-still applies after fitting, where it counts native outline edges rather than
+still applies after fitting, where it counts fitted polynomial spans rather than
 the denser polylines used to display and validate curves.
+
+Tangent-continuous cubic spans are encoded as longer native B-spline edges.
+This joins their exact polynomial representations without refitting, removing
+knots, or changing the approved outline. Real corners, palette junctions, point
+contacts, and analytic lines remain separate. Internal knots retain their full
+multiplicity; geometric tangency does not imply parametric C1 continuity.
+Experimental consolidated draft wires retain the source seam and add splits at
+existing span boundaries to combine cubics only while their derivative
+directions fit a quarter turn;
+an individual wider-turn cubic remains intact. This
+avoids a regression where a closing counter lost its original top opening.
+Production taper sweeps continue to use separate input spans: OCCT's composite
+draft surfaces can change their top boundary enough to fail preservation checks.
+The core `roof(..., consolidate_draft=True)` option allows explicit experiments;
+it does not relax those checks. Planar faces and zero-taper extrusions use
+consolidation by default. Diagnostics distinguish fitted spans, native top edges,
+and generated draft wall faces. Consolidation alone does not guarantee a valid
+taper arrangement.
 
 ## Physical-Scale Outline Fitting
 
 With positive tolerance and `contour_mode: "curves"`, relief construction uses
 `panelchemy.outline_fitting.fit_outlines`. It fits shared boundary
 chains jointly as cubic B-splines, represented as lines and cubic Bézier spans.
-Its `corner_scale_mm` argument defaults to 1 mm: corner detection compares turns
-over physical neighborhoods rather than preserving every pixel turn. This is
-separate from a minimum feature width and does not delete islands or counters.
+During relief construction, the configured nozzle diameter defines an assumed
+printed line width of 1.25 times that diameter. Corner detection compares turns
+over neighborhoods of two line widths, then requires a physical prominence of
+half a line width. For the default 0.4 mm nozzle these values are 1 mm and
+0.25 mm. On a closed loop shorter than four neighborhoods, the prominence
+threshold is limited to a quarter of the available neighborhood; the loop must
+remain fit-able before optional local softening. A turn's prominence is its
+distance from the chord across that physical neighborhood; a tiny raster tread
+does not earn a protected corner solely from
+its local angle. These are tracing scales, not circular fillets or minimum
+curvature constraints. This is separate from a minimum feature width and does
+not delete islands or counters.
 Ordinary joins may move within the requested outline tolerance. Smooth joins
 share tangent directions; detected corners and actual palette junctions can
 remain sharp. The outer silhouette remains exact.
 
+For 2D evaluation, the fitting API can also attempt bounded local softening of
+detected corners.
+It trims the adjoining fitted curves and inserts a tangent-aligned cubic bridge.
+The removed tails and bridge control hull must lie inside a neighborhood of
+half an assumed line width around the fitted corner (0.25 mm by default).
+This is a bound on the spatial extent of the edit, not a claim that every
+bridge has an exact circular radius. The complete result is rechecked against
+the original raster distance bound and all shared-boundary, counter, island,
+and native/proxy topology checks. A corner remains sharp when softening cannot
+pass those gates; the diagnostics report applied and blocked softenings.
+Actual graph junctions and the outer silhouette are retained. This experimental
+phase is enabled explicitly through the fitting API or the construction profile's
+`corner_softening_mm` setting, which defaults to zero. A construction profile
+cannot exceed the nozzle-derived tracing radius. Planar acceptance does not establish taper-kernel
+compatibility: a previously working native taper regression rejects the local
+bridge geometry even though the original planar distance/topology gates pass.
+
 The fitter also penalizes unnecessary bending within smooth spans. Its physical
-fairing scale, `fairing_mm`, defaults to 0.25 mm; zero disables that penalty.
+fairing scale, `fairing_mm`, uses half the assumed line width during relief
+construction (0.25 mm by default); zero disables that penalty in the fitting API.
+The solver constrains movable spline joins to 90% of the configured outline
+tolerance. Four two-sided linear bounds form an inscribed octagon within that
+Euclidean target, reusing the existing constrained quadratic solver. This gives
+the joins headroom without changing the final acceptance limit. Curve interiors
+still undergo continuous source-distance and topology certification at the full
+configured tolerance and can require further refinement.
+If a coarse basis does not yield a verified constrained solve, the existing
+bounded refinement loop adds a knot in the interval identified by the failed
+constraint and retries. A failed join cap selects its larger adjacent interval.
+Unchanged chain fits are reused while distance and topology checks still run.
+No failed solver candidate is accepted as an outline.
+
+For tracing experiments, `fit_outlines(..., span_simplification_mm=...)` can
+replace several adjoining tangent-continuous cubic pieces with one cubic.
+Unlike CAD edge joining, this reduces the actual polynomial count. Each merge
+retains its endpoints and endpoint tangent directions, obeys the requested
+continuous displacement bound from the accepted trace, and must still satisfy
+the original artwork tolerance. Shared palette boundaries are reduced once and
+reused in reverse. Complete topology checks retain every island, counter, and
+contact; unsafe reductions are rejected. This phase defaults to zero. The
+construction profile's `span_simplification_mm` enables it explicitly and cannot
+exceed the nozzle-derived tracing radius.
 The penalty does not cross intentional corner knots. Forward derivative
 constraints are part of the fit, so backward-pointing handles are constrained
 before final curve checks. Fixed source directions guide that optimization;
 the final curves must still pass the existing chord-direction and topology
 checks after conversion. Neither the fairing scale nor optimizer convergence
 replaces the requested outline error bound or enforces a manufacturing width.
+The independent fitting API accepts `corner_scale_mm`, `corner_prominence_mm`,
+`corner_softening_mm`, and `fairing_mm` directly for tuning; zero prominence
+disables the prominence gate. Softening defaults to zero in the independent
+API. For nozzle-guided experiments, supply the profile's `tracing_radius_mm`
+as `corner_softening_mm` (0.25 mm with the default nozzle). This also enables
+full native model/STEP trials explicitly, without changing the default pipeline.
+Exact raster mode and explicit straight-line mode retain their existing
+behavior. Coarse images continue through fitting and are not rejected merely
+for falling below the artwork guide's recommended sampling resolution.
 
 The API also remains usable for 2D outline review without CAD construction.
+For fitted-curve relief with a positive taper, a final curvature-refinement pass
+uses the height difference across each shared boundary. With 2/1/1 mm bands and
+a 10-degree taper, black/orange and orange/white use a 0.176 mm horizontal run;
+black/white uses 0.353 mm. The independent fitting API accepts cumulative
+`material_taper_runs_mm=(black, orange, white)`; adjacent differences determine
+each boundary's run. The fixed outer silhouette remains vertical.
+
+The pass targets only the curvature sign whose offset normals converge. It
+tries bounded smooth periodic or endpoint-pinned splines, then canonicalizes
+the joins and certifies continuously that curvature times boundary run is at
+most 0.9. This provides 10% curvature headroom: a minimum local radius of about
+0.196 mm for the one-band example. This is an initial engineering margin, not a
+guarantee that native intersections will succeed. The check runs after corner
+softening and polynomial reduction so those phases cannot undo it. Shared
+boundaries are refined once and reused in reverse. Corners can change within
+the original outline tolerance; actual graph junctions remain pinned.
+
+Every proposed change must still pass the original source-error bound and the
+complete palette topology checks. No islands or counters are deleted. When the
+bounded search or a proof cannot accept a proposal, the already certified trace
+is retained and `boundary_curvature.unrefined_chains` reports it. The pass does
+not reject legitimate early counter closure. Nor does it replace native CAD
+validation or resolve collisions between distant edges. White support currently
+extends below the exposed orange/white boundary, so hidden support construction
+can still encounter a fold even when the exposed boundary meets its limit.
+
 Exact circular-arc primitives are not implemented by this API. Continuous distance,
 per-span monotonicity, native/proxy separation, and palette topology must all
 pass before it returns accepted outlines. A candidate can satisfy the distance

@@ -25,13 +25,26 @@ The current converter does not automatically enforce them or delete small
 features. Contour approximation controls outline accuracy; its tolerance is a
 separate setting and does not impose a minimum feature size.
 
-Measure at the final physical size. When the panel itself spans 1,000 pixels
-and will measure 250 mm, 1 mm is four pixels. At 2,000 panel pixels, it is eight
-pixels. Exclude outside padding when counting the panel's pixel extent. Prefer
-2,000 pixels along the panel's long edge when available; 1,000 is a useful
-starting target. More pixels improve sampling but do not widen physical details.
-Doubling the physical panel size doubles every feature width; resizing only the
-image's pixel dimensions does not.
+Measure at the final physical size. Use the configured nozzle diameter to plan
+resolution: assume a printed line width of **1.25 × nozzle diameter**, and aim
+for **at least four independent source pixels per line width**, preferably eight.
+For a 0.4 mm nozzle, the assumed width is 0.5 mm; a 250 mm panel therefore has
+a 2,000-pixel starting target and a preferred 4,000-pixel long edge. Count the
+panel itself, excluding padding. These are sampling recommendations, not input
+requirements or verified print limits; lower-resolution artwork can still be
+traced and inspected.
+
+Count independent samples: doubling an image with nearest-neighbor enlargement
+does not add detail. A genuinely higher-resolution rendering or original vector
+artwork is more useful than an enlarged bitmap. At 2,000 panel pixels, a 1 mm
+feature spans eight pixels; at 4,000 it spans sixteen. More pixels improve
+sampling but do not widen physical features. Doubling the physical panel size
+doubles every feature width; resizing only the pixel dimensions does not.
+
+The assumed half-line width (0.25 mm with the default nozzle) guides tracing
+smoothness and corner significance. It is not a command to draw circular corners
+or round every pointed tip. Retain crisp corners on substantial shapes. This
+scale does not automatically delete narrow features or guarantee their printing.
 
 ## Flat Colors
 
@@ -128,9 +141,13 @@ Leave plain white padding around all sides; do not crop the border or let it
 touch the canvas edge. Keep every artwork element inside the border.
 
 Deliver an opaque PNG with no mockup, perspective, scene background, frame
-shadow, dimension labels, or color swatches. Prefer at least 2,000 pixels along
-the panel itself, excluding padding. At that resolution a 1 mm feature should
-span at least eight pixels for this 250 mm panel.
+shadow, dimension labels, or color swatches. The planned nozzle diameter is
+0.4 mm; assume a 0.5 mm printed line width. Aim for 4,000 genuinely rendered
+pixels along the panel itself, excluding padding; 2,000 is a useful starting
+target. This gives eight or four independent pixels per printed line width.
+Do not meet the resolution target by simply enlarging a coarse bitmap.
+Keep intentional corners and terminal points sharp rather than applying
+0.25 mm circular rounding to the artwork.
 ```
 
 Image models may miss exact colors, widths, or boundary requirements. Check the

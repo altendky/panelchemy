@@ -62,6 +62,8 @@ from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 from shapely.geometry.polygon import orient
 from shapely.strtree import STRtree
 
+from panelchemy.surface_measure import AreaIntegrationError, surface_area
+
 type Point2 = tuple[float, float]
 
 
@@ -105,13 +107,28 @@ def volume(shape: TopoDS_Shape) -> float:
     """Compute signed closed-solid volume from the exact surfaces."""
     if _is_empty(shape):
         return 0.0
+    # OnlyClosed excludes faces and open shells. GK reports -1 when there is
+    # no eligible domain at all, whereas the previous overload returned zero.
+    shells = TopExp_Explorer(shape, TopAbs_SHELL)
+    while shells.More():
+        if BRep_Tool.IsClosed_s(shells.Current()):
+            break
+        shells.Next()
+    else:
+        return 0.0
     properties = GProp_GProps()
-    # Curved faces need adaptive integration: the fixed-order overload can
-    # disagree across otherwise identical material partitions.
-    error = BRepGProp.VolumeProperties_s(shape, properties, Eps=1e-11, OnlyClosed=True)
+    # Consolidated curves can contain several polynomial intervals inside one
+    # native face. The older Gauss integrator can miss their contribution and
+    # report a near-zero error despite a percent-level mass error. Kronrod
+    # integration with span handling preserves the signed closed-solid mass.
+    error = BRepGProp.VolumePropertiesGK_s(
+        shape, properties, Eps=1e-11, OnlyClosed=True, IsUseSpan=True
+    )
     result = properties.Mass()
     if not isfinite(result) or not isfinite(error):
         raise KernelError("OpenCascade returned a non-finite volume")
+    if error < 0:
+        raise KernelError("OpenCascade could not integrate the closed-solid volume")
     return result
 
 
@@ -119,12 +136,10 @@ def area(shape: TopoDS_Shape) -> float:
     """Compute surface area, including planar faces returned by cross_section."""
     if _is_empty(shape):
         return 0.0
-    properties = GProp_GProps()
-    error = BRepGProp.SurfaceProperties_s(shape, properties, Eps=1e-11)
-    result = properties.Mass()
-    if not isfinite(result) or not isfinite(error):
-        raise KernelError("OpenCascade returned a non-finite area")
-    return result
+    try:
+        return surface_area(shape)
+    except AreaIntegrationError as error:
+        raise KernelError(str(error)) from error
 
 
 def _is_open_internal_wire(wire: TopoDS_Wire) -> bool:

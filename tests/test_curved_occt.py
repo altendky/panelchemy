@@ -8,7 +8,7 @@ import pytest
 from OCP.BRep import BRep_Builder
 from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
-from OCP.GeomAbs import GeomAbs_BezierCurve
+from OCP.GeomAbs import GeomAbs_BSplineCurve
 from OCP.gp import gp_Vec
 from OCP.ShapeBuild import ShapeBuild_ReShape
 from OCP.Standard import Standard_OutOfMemory
@@ -22,7 +22,13 @@ from panelchemy.curved_occt import (
     _cell_repair_state,  # pyright: ignore[reportPrivateUsage]
     _cell_repair_unchanged,  # pyright: ignore[reportPrivateUsage]
 )
-from panelchemy.curves import BezierSpan, CurvePolygon, CurveRing, polygon_lines
+from panelchemy.curves import (
+    BezierSpan,
+    Controls,
+    CurvePolygon,
+    CurveRing,
+    polygon_lines,
+)
 from panelchemy.export import _step  # pyright: ignore[reportPrivateUsage]
 
 
@@ -42,7 +48,7 @@ def circle(radius: float) -> CurveRing:
     return CurveRing(tuple(BezierSpan(points, False) for points in coordinates))
 
 
-def test_curve_face_keeps_cubic_edges_and_counter_area() -> None:
+def test_curve_face_consolidates_smooth_edges_and_preserves_counter_area() -> None:
     region = CurvePolygon(circle(5), (circle(1),))
     face = curved_occt.polygon_face(region, 4)
     assert occt.valid(face)
@@ -52,11 +58,24 @@ def test_curve_face_keeps_cubic_edges_and_counter_area() -> None:
     while edges.More():
         assert (
             BRepAdaptor_Curve(TopoDS.Edge(edges.Current())).GetType()
-            == GeomAbs_BezierCurve
+            == GeomAbs_BSplineCurve
         )
         count += 1
         edges.Next()
-    assert count == 8
+    assert count == 2
+
+
+def test_curve_face_keeps_a_globally_protected_smooth_join() -> None:
+    region = CurvePolygon(circle(5))
+    # A junction belonging to a neighboring palette region is not visible in
+    # this polygon alone, but must remain an explicit vertex in its CAD face.
+    face = curved_occt.polygon_face(region, protected_points=frozenset({(0, 5)}))
+    assert occt.valid(face)
+    assert occt.topology_counts(face)["edges"] == 1
+    assert occt.topology_counts(face)["vertices"] == 1
+    edges = TopExp_Explorer(face, TopAbs_EDGE)
+    curve = BRepAdaptor_Curve(TopoDS.Edge(edges.Current()))
+    assert curve.Value(curve.FirstParameter()).Coord() == (0, 5, 0)
 
 
 def test_line_face_rejects_disconnected_span_endpoints() -> None:
@@ -79,6 +98,28 @@ def test_zero_taper_extrudes_one_fitted_region_with_hole() -> None:
         2 * occt.area(curved_occt.polygon_face(region)), rel=1e-10
     )
     assert occt.topology_counts(shape)["solids"] == 1
+
+
+def test_consolidated_curved_holes_keep_their_shared_contact_vertex() -> None:
+    def moved_ring(x: float) -> CurveRing:
+        return CurveRing(
+            tuple(
+                replace(
+                    span,
+                    control_points=cast(
+                        "Controls", tuple((p[0] + x, p[1]) for p in span.control_points)
+                    ),
+                )
+                for span in circle(1).spans
+            )
+        )
+
+    region = CurvePolygon(circle(5), (moved_ring(-1), moved_ring(1)))
+    face = curved_occt.polygon_face(region)
+    assert occt.valid(face)
+    assert occt.topology_counts(face)["edges"] == 3
+    assert occt.topology_counts(face)["vertices"] == 2
+    assert occt.area(face) == pytest.approx(pi * 23, rel=0.0003)
 
 
 def test_native_curved_draft_preserves_top_and_expands_downward() -> None:
@@ -149,10 +190,13 @@ def test_point_touching_counter_boundaries_remain_explicit(polygon: Polygon) -> 
     )
 
 
-def test_curved_counter_closes_below_its_preserved_top() -> None:
+@pytest.mark.parametrize("consolidate_draft", [False, True])
+def test_curved_counter_closes_below_its_preserved_top(consolidate_draft: bool) -> None:
     region = CurvePolygon(circle(5), (circle(0.1),))
     diagnostics: dict[str, object] = {}
-    shape, method = curved_occt.roof(region, 2, 4, 0.2, diagnostics=diagnostics)
+    shape, method = curved_occt.roof(
+        region, 2, 4, 0.2, diagnostics=diagnostics, consolidate_draft=consolidate_draft
+    )
     assert method == "surface"
     assert diagnostics["repaired_draft_cells"] == 3
     assert occt.valid(shape)

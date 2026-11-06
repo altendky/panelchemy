@@ -21,10 +21,10 @@ from shapely import union_all
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
-from panelchemy import curved_occt, material_partition, occt
+from panelchemy import curved_occt, material_partition, native_curves, occt
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours, vectorize
-from panelchemy.curves import CurveContours, fit_contours
+from panelchemy.curves import CurveContours, Point2, fit_contours
 from panelchemy.material_partition import MaterialPartition
 from panelchemy.outline_fitting import fit_outlines
 from panelchemy.separation import (
@@ -114,10 +114,25 @@ def build_relief(
     curves: CurveContours | None = None
     proxy_tolerance = 0.0
     native_edge_count = contours.vertex_count
+    fitted_span_count = contours.vertex_count
+    protected_points: frozenset[Point2] = frozenset()
     if profile.contour_tolerance_mm > 0:
         if profile.contour_mode == "curves":
             fitted = fit_outlines(
-                contours, profile.contour_tolerance_mm, palette=result.config.palette
+                contours,
+                profile.contour_tolerance_mm,
+                corner_scale_mm=2 * profile.assumed_line_width_mm,
+                corner_prominence_mm=profile.tracing_radius_mm,
+                corner_softening_mm=profile.corner_softening_mm,
+                fairing_mm=profile.tracing_radius_mm,
+                span_simplification_mm=profile.span_simplification_mm,
+                material_taper_runs_mm=(
+                    0.0,
+                    profile.orange_thickness_mm * profile.taper_run_per_height,
+                    (profile.orange_thickness_mm + profile.white_thickness_mm)
+                    * profile.taper_run_per_height,
+                ),
+                palette=result.config.palette,
             )
         else:
             fitted = fit_contours(
@@ -131,15 +146,23 @@ def build_relief(
         approximation_diagnostics = fitted.diagnostics
         comparison_svg = fitted.comparison_svg
         proxy_tolerance = fitted.proxy_deviation_mm
-        native_edge_count = sum(
+        fitted_span_count = sum(
             len(ring.spans)
             for polygon in (curves.silhouette, *curves.orange, *curves.white)
             for ring in (polygon.exterior, *polygon.interiors)
         )
-        if native_edge_count > max_vertices:
+        if fitted_span_count > max_vertices:
             raise ValueError(
-                f"approximated contours require {native_edge_count:,} native edges, exceeding max_vertices={max_vertices:,}; increase the budget or review another tolerance"
+                f"approximated contours require {fitted_span_count:,} fitted spans, exceeding max_vertices={max_vertices:,}; increase the budget or review another tolerance"
             )
+        protected_points = native_curves.protected_vertices(
+            [curves.silhouette, *curves.orange, *curves.white]
+        )
+        native_edge_count = sum(
+            len(native_curves.smooth_runs(ring, protected_points))
+            for polygon in (curves.silhouette, *curves.orange, *curves.white)
+            for ring in (polygon.exterior, *polygon.interiors)
+        )
     guard_segments = 32
     guard_radius = profile.rim_width_mm / cos(pi / (4 * guard_segments))
     interior = _polygonal(
@@ -196,7 +219,9 @@ def build_relief(
                     expected_white_faces.append(occt.polygon_face(polygon, top))
             else:
                 region = native_regions[index]
-                selected_top = curved_occt.polygon_face(region, top)
+                selected_top = curved_occt.polygon_face(
+                    region, top, protected_points=protected_points
+                )
                 if occt.area(occt.cut(selected_top, guard_tops[top])) > 1e-9:
                     raise ValueError(
                         "the protected rim intersects a fitted feature top; reduce rim_width_mm or revise the boundary"
@@ -207,6 +232,7 @@ def build_relief(
                     top,
                     slope,
                     diagnostics=native_diagnostics,
+                    protected_points=protected_points,
                 )
                 if color == "white":
                     expected_white_faces.append(selected_top)
@@ -296,6 +322,7 @@ def build_relief(
     diagnostics: dict[str, object] = {
         "vertex_count": contours.vertex_count,
         "native_outline_edges": native_edge_count,
+        "fitted_outline_spans": fitted_span_count,
         "footprint_proxy_tolerance_mm": proxy_tolerance,
         "regions": region_diagnostics,
         "combined_topology": occt.topology_counts(solid),

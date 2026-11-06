@@ -43,10 +43,12 @@ def _solve(
     fairing_mm: float,
     length_mm: float,
     pin_ends: bool = False,
+    fit_target_mm: float = 0.0,
+    sample_count: int = 401,
 ) -> BSpline[np.float64]:
     """Supply densely sampled data; test the solver's public geometric output."""
     count = len(knots) - 4
-    times = np.linspace(0, 1, 401)
+    times = np.linspace(0, 1, sample_count)
     points = np.column_stack(
         [np.interp(times, source_parameters, source_points[:, axis]) for axis in (0, 1)]
     )
@@ -76,6 +78,7 @@ def _solve(
         source_points,
         length_mm,
         fairing_mm,
+        fit_target_mm=fit_target_mm,
     )
     return BSpline(knots, offsets + transform @ coefficients, 3)
 
@@ -133,6 +136,84 @@ def test_zero_fairing_still_prevents_backward_motion_on_a_synthetic_notch() -> N
     assert np.all(np.isfinite(selected.c))
 
 
+def test_fit_target_bounds_a_movable_join_and_preserves_forward_motion() -> None:
+    parameters = np.linspace(0, 1, 81)
+    points = np.column_stack(
+        (8 * parameters, 0.4 * np.exp(-(((parameters - 0.55) / 0.07) ** 2)))
+    )
+    knots = np.array([0.0] * 4 + [0.55] + [1.0] * 4)
+    baseline = _solve(parameters, points, knots, fairing_mm=0.25, length_mm=8)
+    selected = _solve(
+        parameters, points, knots, fairing_mm=0.25, length_mm=8, fit_target_mm=0.18
+    )
+    source_join = np.array([4.4, 0.4])
+    assert np.linalg.norm(baseline(0.55) - source_join) > 0.2
+    assert np.linalg.norm(selected(0.55) - source_join) <= 0.18
+    assert float(np.min(selected(parameters, nu=1)[:, 0])) > 0
+
+
+def test_fit_target_keeps_a_fit_already_inside_its_target_unchanged() -> None:
+    parameters = np.linspace(0, 1, 81)
+    points = np.column_stack(
+        (8 * parameters, 0.25 * np.exp(-(((parameters - 0.55) / 0.07) ** 2)))
+    )
+    knots = np.array([0.0] * 4 + [1.0] * 4)
+    baseline = _solve(parameters, points, knots, fairing_mm=0.25, length_mm=8)
+    selected = _solve(
+        parameters, points, knots, fairing_mm=0.25, length_mm=8, fit_target_mm=0.18
+    )
+    assert np.array_equal(selected.c, baseline.c)
+
+
+def test_join_target_does_not_replace_the_continuous_source_error_check() -> None:
+    parameters = np.linspace(0, 1, 81)
+    points = np.column_stack(
+        (8 * parameters, 0.6 * np.exp(-(((parameters - 0.55) / 0.07) ** 2)))
+    )
+    knots = np.array([0.0] * 4 + [0.55] + [1.0] * 4)
+    selected = _solve(
+        parameters, points, knots, fairing_mm=0.25, length_mm=8, fit_target_mm=0.18
+    )
+    assert np.linalg.norm(selected(0.55) - np.array([4.4, 0.6])) <= 0.18
+    # This deliberately coarse basis needs refinement between its joins.
+    assert np.max(np.linalg.norm(selected(parameters) - points, axis=1)) > 0.2
+
+
+def test_active_fit_target_respects_physical_scaling_and_sample_density() -> None:
+    parameters = np.linspace(0, 1, 81)
+    points = np.column_stack(
+        (8 * parameters, 0.4 * np.exp(-(((parameters - 0.55) / 0.07) ** 2)))
+    )
+    knots = np.array([0.0] * 4 + [0.55] + [1.0] * 4)
+    first = _solve(
+        parameters, points, knots, fairing_mm=0.25, length_mm=8, fit_target_mm=0.18
+    )
+    scaled = _solve(
+        parameters,
+        points * 2,
+        knots,
+        fairing_mm=0.5,
+        length_mm=16,
+        fit_target_mm=0.36,
+    )
+    dense_parameters = np.linspace(0, 1, 161)
+    dense_points = np.column_stack(
+        [np.interp(dense_parameters, parameters, points[:, axis]) for axis in (0, 1)]
+    )
+    dense = _solve(
+        dense_parameters,
+        dense_points,
+        knots,
+        fairing_mm=0.25,
+        length_mm=8,
+        fit_target_mm=0.18,
+        sample_count=801,
+    )
+    samples = np.linspace(0, 1, 1001)
+    assert np.max(np.linalg.norm(first(samples) - scaled(samples) / 2, axis=1)) < 2e-5
+    assert np.max(np.linalg.norm(first(samples) - dense(samples), axis=1)) < 5e-4
+
+
 def _join_angles(ring: CurveRing) -> list[tuple[tuple[float, float], float]]:
     def direction(span: BezierSpan, end: bool) -> tuple[float, float]:
         a, b, c, d = span.control_points
@@ -156,6 +237,8 @@ def test_fairing_keeps_a_deliberate_sharp_point() -> None:
     tip = (17.0, 10.0)
     original = _source(Polygon([(3, 3), tip, (3, 17)]))
     result = fit_outlines(original, 0.2, corner_scale_mm=1, fairing_mm=0.5)
+    assert result.diagnostics["fit_target_mm"] == pytest.approx(0.18)
+    assert result.diagnostics["tolerance_mm"] == 0.2
     point, angle = min(
         _join_angles(result.contours.white[0].exterior),
         key=lambda join: hypot(join[0][0] - tip[0], join[0][1] - tip[1]),
