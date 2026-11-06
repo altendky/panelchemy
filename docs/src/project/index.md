@@ -13,6 +13,8 @@ builds layered solids and projected support previews, using exact contours by
 default or explicitly configured, checked approximation. The model exporter
 writes exact STEP and checked combined/registered STL geometry. Physical print
 quality remains unverified; slicer projects and deployment remain later work.
+STEP-only export also writes a colored assembly with named material components,
+without depending on mesh construction or STL validation.
 
 The handoff's animal panels are evaluation inputs. Their exact artwork details
 are not requirements for the general tool. Artwork preparation guidance and a
