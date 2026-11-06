@@ -33,6 +33,12 @@ using existing coordinates, preserving positive-area faces and material
 interfaces. Native and float32 conformance are reported separately. Coordinate
 collapse and unresolved mesh defects still reject export.
 
+After native conformance, exact coincident facet pairs with opposite winding
+within one material cancel as an oriented boundary. Retained coordinates and
+facets remain unchanged, and the removed pair counts are recorded. Same-winding
+duplicates and higher multiplicities remain errors. All subsequent topology,
+intersection, interface, and serialization checks still apply.
+
 `--mesh-deflection-mm` sets linear tessellation deflection (default 0.02 mm),
 `--mesh-angle-deg` sets angular deflection (default about 11.46 degrees), and
 `--max-triangles` limits the accepted mesh triangle count (default 2,000,000).

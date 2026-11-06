@@ -1076,6 +1076,38 @@ def _combined(meshes: dict[str, _Mesh]) -> _Mesh:
     return _compact(points, boundary)
 
 
+def _normalize_material_boundaries(
+    meshes: dict[str, _Mesh],
+) -> tuple[dict[str, _Mesh], dict[str, object]]:
+    """Cancel exact opposite triangles after bridge conformance, per material.
+
+    Each removed pair is the zero oriented boundary chain at the same three
+    coordinates. No area threshold, coordinate movement or tolerance is used.
+    Same-winding duplicates and higher multiplicities retain _combined's errors.
+    """
+    normalized: dict[str, _Mesh] = {}
+    materials: dict[str, object] = {}
+    removed_pairs = 0
+    for name, mesh in meshes.items():
+        boundary = _combined({name: mesh})
+        pairs = (len(mesh.triangles) - len(boundary.triangles)) // 2
+        normalized[name] = boundary
+        removed_pairs += pairs
+        materials[name] = {
+            "input_vertices": len(mesh.points),
+            "output_vertices": len(boundary.points),
+            "input_triangles": len(mesh.triangles),
+            "output_triangles": len(boundary.triangles),
+            "exact_opposite_pairs_removed": pairs,
+            "coordinate_movement_mm": 0.0,
+        }
+    return normalized, {
+        "materials": materials,
+        "exact_opposite_pairs_removed": removed_pairs,
+        "coordinate_movement_mm": 0.0,
+    }
+
+
 def _stl(mesh: _Mesh) -> bytes:
     output = bytearray(b"Panelchemy registered millimeter mesh".ljust(80, b"\0"))
     output.extend(struct.pack("<I", len(mesh.triangles)))
@@ -1418,6 +1450,7 @@ def _export_model(
 
     No minimum-feature cleanup is performed. Repeated-coordinate cone tips and
     exact-zero bridges receive reported conformance without moving coordinates.
+    Exact opposite triangle pairs then cancel within each material boundary.
     Distinct-coordinate float32 merges or any remaining mesh defect reject the
     complete export.
     """
@@ -1450,6 +1483,9 @@ def _export_model(
         raise ExportError("OCCT material partition or tessellation failed") from error
     meshes, native_conformance = _conform_meshes(meshes, config.max_triangles)
     native["native_conformance"] = native_conformance
+    # Exact-zero bridges must first supply their required edge subdivisions.
+    meshes, boundary_normalization = _normalize_material_boundaries(meshes)
+    native["native_boundary_normalization"] = boundary_normalization
     interfaces = _interfaces(meshes, model)
     native_meshes = {**meshes, "relief": _combined(meshes)}
     rounding_error = cast("float", native["maximum_coordinate_rounding_mm"])

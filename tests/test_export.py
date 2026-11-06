@@ -32,8 +32,10 @@ from panelchemy.export import (
     _conform_meshes,  # pyright: ignore[reportPrivateUsage]
     _Mesh,  # pyright: ignore[reportPrivateUsage]
     _normal,  # pyright: ignore[reportPrivateUsage]
+    _normalize_material_boundaries,  # pyright: ignore[reportPrivateUsage]
     _quantize_meshes,  # pyright: ignore[reportPrivateUsage]
     _read_stl,  # pyright: ignore[reportPrivateUsage]
+    _Relief,  # pyright: ignore[reportPrivateUsage]
     _step,  # pyright: ignore[reportPrivateUsage]
     _stl,  # pyright: ignore[reportPrivateUsage]
     _triangle_intersections,  # pyright: ignore[reportPrivateUsage]
@@ -70,6 +72,70 @@ def _snapshot(model: ReliefModel) -> list[bytes]:
         BRepTools.Write_s(shape, stream)
         snapshots.append(stream.getvalue())
     return snapshots
+
+
+@pytest.mark.parametrize("zero_bridge", [False, True])
+def test_export_cancels_opposite_sheets_after_preserving_zero_bridge_hints(
+    monkeypatch: pytest.MonkeyPatch,
+    zero_bridge: bool,
+) -> None:
+    model = _model(1, taper=0)
+    clean = export_model(model)
+    original_partition = export_module._partition  # pyright: ignore[reportPrivateUsage]
+    input_triangles = 0
+
+    def with_double_sheet(
+        selected: _Relief, config: ExportConfig
+    ) -> tuple[dict[str, _Mesh], dict[str, object]]:
+        nonlocal input_triangles
+        meshes, diagnostics = original_partition(selected, config)
+        black = meshes["black"]
+        a, b, c = black.triangles[0]
+        left, right = black.points[a], black.points[b]
+        axis = min(range(3), key=lambda i: abs(left[i] - right[i]))
+        middle = [(left[i] + right[i]) / 2 for i in range(3)]
+        if not zero_bridge:
+            middle[axis] += 2.0**-40
+        point = (middle[0], middle[1], middle[2])
+        if not zero_bridge:
+            _ = _normal([left, right, point])  # Positive, tiny sheet area.
+        extra = len(black.points)
+        positive = (
+            [(a, extra, c), (extra, b, c), *black.triangles[1:]]
+            if zero_bridge
+            else black.triangles
+        )
+        meshes["black"] = _Mesh(
+            [*black.points, point],
+            [*positive, (a, b, extra), (a, extra, b)],
+        )
+        input_triangles = len(meshes["black"].triangles)
+        return meshes, diagnostics
+
+    monkeypatch.setattr(export_module, "_partition", with_double_sheet)
+    repaired = export_model(model)
+    for name in ("black.stl", "relief.stl"):
+        assert _exact_volume(_read_stl(repaired.files[name])) == _exact_volume(
+            _read_stl(clean.files[name])
+        )
+        if not zero_bridge:
+            assert repaired.files[name] == clean.files[name]
+    numerical = cast("dict[str, object]", repaired.validation["numerical_processing"])
+    conformance = cast("dict[str, object]", numerical["native_conformance"])
+    normalization = cast(
+        "dict[str, object]", numerical["native_boundary_normalization"]
+    )
+    materials = cast("dict[str, dict[str, object]]", normalization["materials"])
+    assert conformance["input_triangles"] == input_triangles
+    assert materials["black"]["input_triangles"] == conformance["output_triangles"]
+    assert materials["black"]["output_triangles"] == input_triangles - (
+        1 if zero_bridge else 2
+    )
+    assert materials["black"]["exact_opposite_pairs_removed"] == int(not zero_bridge)
+    assert materials["black"]["coordinate_movement_mm"] == 0
+    if zero_bridge:
+        assert conformance["removed_exact_zero_triangles"] == 2
+        assert conformance["added_positive_triangles"] == 1
 
 
 @pytest.mark.parametrize("colors,highest", [(1, 2), (2, 3), (3, 4)])
@@ -195,6 +261,51 @@ def _exact_volume(mesh: _Mesh) -> Fraction:
             sum((a[index] * cross[index] for index in range(3)), Fraction()) / 6
         )
     return sum(terms, Fraction())
+
+
+def test_boundary_cancellation_preserves_closed_surface_and_exact_volume() -> None:
+    clean = _tetra()
+    sheet = _Mesh(
+        [*clean.points, (0.5, -(2.0**-40), 0.0)],
+        [*clean.triangles, (0, 1, 4), (0, 4, 1)],
+    )
+    _ = _normal([sheet.points[i] for i in (0, 1, 4)])
+    with pytest.raises(ExportError, match="nonmanifold edge"):
+        _ = _validate_mesh(sheet)
+    normalized, report = _normalize_material_boundaries({"part": sheet})
+    result = normalized["part"]
+    assert result.points == clean.points
+    assert result.triangles == clean.triangles
+    assert _exact_volume(result) == _exact_volume(sheet) == Fraction(1, 6)
+    assert _validate_mesh(result)["closed_shells"] == 1
+    assert report["exact_opposite_pairs_removed"] == 1
+    assert report["coordinate_movement_mm"] == 0
+
+
+def test_boundary_normalization_keeps_close_distinct_closed_facets() -> None:
+    upper = _tetra()
+    lower = _tetra()
+    lower.points = [(x, y, -z - 2.0**-40) for x, y, z in lower.points]
+    lower.triangles = [(a, c, b) for a, b, c in lower.triangles]
+    mesh = _combined({"upper": upper, "lower": lower})
+    normalized, report = _normalize_material_boundaries({"part": mesh})
+    result = normalized["part"]
+    assert result.points == mesh.points
+    assert result.triangles == mesh.triangles
+    assert _exact_volume(result) == _exact_volume(mesh)
+    assert _validate_mesh(result)["closed_shells"] == 2
+    assert report["exact_opposite_pairs_removed"] == 0
+
+
+@pytest.mark.parametrize("multiplicity", [2, 3])
+def test_boundary_normalization_still_rejects_duplicate_corruption(
+    multiplicity: int,
+) -> None:
+    mesh = _tetra()
+    mesh.triangles.extend([mesh.triangles[0]] * (multiplicity - 1))
+    message = "inconsistent winding" if multiplicity == 2 else "multiplicity"
+    with pytest.raises(ExportError, match=message):
+        _ = _normalize_material_boundaries({"part": mesh})
 
 
 def _triangle_keys(mesh: _Mesh) -> set[tuple[tuple[float, float, float], ...]]:
