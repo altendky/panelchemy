@@ -1450,7 +1450,8 @@ def _export_model(
 
     No minimum-feature cleanup is performed. Repeated-coordinate cone tips and
     exact-zero bridges receive reported conformance without moving coordinates.
-    Exact opposite triangle pairs then cancel within each material boundary.
+    Exact opposite triangle pairs cancel within each material boundary after
+    each conformance phase.
     Distinct-coordinate float32 merges or any remaining mesh defect reject the
     complete export.
     """
@@ -1495,6 +1496,10 @@ def _export_model(
     final_parts, float_conformance = _conform_meshes(quantized, config.max_triangles)
     native["float32_quantization"] = quantization
     native["float32_conformance"] = float_conformance
+    final_parts, float_boundary_normalization = _normalize_material_boundaries(
+        final_parts
+    )
+    native["float32_boundary_normalization"] = float_boundary_normalization
     float_error = cast("float", quantization["maximum_coordinate_error_mm"])
     _ = _interfaces(final_parts, model)
     expected_meshes = {**final_parts, "relief": _combined(final_parts)}
