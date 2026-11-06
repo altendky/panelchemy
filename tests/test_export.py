@@ -245,6 +245,9 @@ def test_taper_counter_and_shared_interfaces_are_serialized_conformally() -> Non
 
 def test_shape_tolerance_envelope_does_not_cross_geometric_material_planes() -> None:
     model = _model(1)
+    # Deliberate CAD edits use the custom path; retained canonical proofs reject
+    # geometry/precision mutation rather than silently discarding their proof.
+    model.material_partition = None
     builder = BRep_Builder()
     for kind in (TopAbs_EDGE, TopAbs_VERTEX):
         explorer = TopExp_Explorer(model.materials["black"], kind)

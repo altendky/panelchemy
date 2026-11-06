@@ -25,8 +25,10 @@ from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.collections import List_TopoDS_Shape, Sequence_TCollection_AsciiString
 from OCP.GeomAbs import GeomAbs_Plane
 from OCP.IFSelect import IFSelect_RetDone
+from OCP.IMeshTools import IMeshTools_Parameters
 from OCP.Interface import Interface_Static
 from OCP.Poly import Poly_Triangulation
+from OCP.Precision import Precision
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Reader, STEPControl_Writer
 from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED, TopAbs_SOLID
 from OCP.TopExp import TopExp_Explorer
@@ -36,7 +38,7 @@ from shapely import STRtree, union_all
 from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon, box
 from shapely.geometry.base import BaseGeometry
 
-from panelchemy import occt
+from panelchemy import material_partition, occt
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours
 
@@ -68,6 +70,7 @@ class _CopiedRelief:
     solid: TopoDS_Shape
     materials: dict[str, TopoDS_Shape]
     footprint_proxy_tolerance_mm: float
+    shared_partition: TopoDS_Shape | None = None
 
 
 def _positive_number(value: object, name: str) -> None:
@@ -518,6 +521,27 @@ def _conform_meshes(
     return output, report
 
 
+def _meshing_parameters(config: ExportConfig) -> IMeshTools_Parameters:
+    """Resolve curved trims more finely while retaining interior mesh limits."""
+    parameters = IMeshTools_Parameters()
+    parameters.Deflection = min(
+        config.linear_deflection_mm,
+        max(Precision.Confusion_s(), config.linear_deflection_mm * 0.05),
+    )
+    parameters.DeflectionInterior = config.linear_deflection_mm
+    parameters.Angle = config.angular_deflection_rad
+    # Preserve the interior angle and minimum-size guard derived by OCCT's
+    # scalar constructor; only the boundary deflection is tightened.
+    parameters.AngleInterior = config.angular_deflection_rad * 2
+    parameters.MinSize = max(
+        Precision.Confusion_s(),
+        IMeshTools_Parameters.RelMinSize_s() * config.linear_deflection_mm,
+    )
+    parameters.Relative = False
+    parameters.InParallel = False
+    return parameters
+
+
 def _partition(
     model: _Relief, config: ExportConfig
 ) -> tuple[dict[str, _Mesh], dict[str, object]]:
@@ -527,37 +551,45 @@ def _partition(
         or "black" not in model.materials
     ):
         raise ExportError("expected nonempty black/orange/white material solids")
-    compound = TopoDS_Compound()
-    builder = BRep_Builder()
-    builder.MakeCompound(compound)
-    for name in _NAMES:
-        if name in model.materials:
-            _ = builder.Add(compound, model.materials[name])
-    copied = BRepBuilderAPI_Copy(compound, True, False).Shape()
-    arguments = List_TopoDS_Shape()
-    children = TopoDS_Iterator(copied)
-    while children.More():
-        _ = arguments.Append(children.Value())
-        children.Next()
-    if len(model.materials) == 1:
-        partition = copied
+    if isinstance(model, _CopiedRelief) and model.shared_partition is not None:
+        partition = model.shared_partition
+        partition_method = "retained-native-partition"
     else:
-        operation = BOPAlgo_Builder()
-        operation.SetArguments(arguments)
-        operation.SetNonDestructive(True)
-        operation.Perform()
-        if operation.HasErrors():
-            raise ExportError("OCCT could not create shared material interfaces")
-        partition = operation.Shape()
+        # Custom models without a retained proof keep their supplied materials
+        # as the construction inputs; no geometry is replaced from model.solid.
+        try:
+            material_partition.validate_materials(model.materials, model.profile)
+        except occt.KernelError as error:
+            raise ExportError(str(error)) from error
+        compound = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(compound)
+        for name in _NAMES:
+            if name in model.materials:
+                _ = builder.Add(compound, model.materials[name])
+        copied = BRepBuilderAPI_Copy(compound, True, False).Shape()
+        if not occt.valid(copied):
+            raise ExportError("copied material CAD is invalid")
+        arguments = List_TopoDS_Shape()
+        children = TopoDS_Iterator(copied)
+        while children.More():
+            _ = arguments.Append(children.Value())
+            children.Next()
+        if len(model.materials) == 1:
+            partition = copied
+            partition_method = "legacy-single-material"
+        else:
+            operation = BOPAlgo_Builder()
+            operation.SetArguments(arguments)
+            operation.SetNonDestructive(True)
+            operation.Perform()
+            if operation.HasErrors():
+                raise ExportError("OCCT could not create shared material interfaces")
+            partition = operation.Shape()
+            partition_method = "legacy-general-fuse"
     if not occt.valid(partition):
         raise ExportError("shared material partition is invalid")
-    mesher = BRepMesh_IncrementalMesh(
-        partition,
-        config.linear_deflection_mm,
-        False,
-        config.angular_deflection_rad,
-        False,
-    )
+    mesher = BRepMesh_IncrementalMesh(partition, _meshing_parameters(config))
     if not mesher.IsDone() or mesher.GetStatusFlags() != 0:
         raise ExportError(f"OCCT meshing failed (status {mesher.GetStatusFlags()})")
     bands = {
@@ -635,6 +667,16 @@ def _partition(
     if sum(occt.volume(shape) for shape in model.materials.values()) <= 0:
         raise ExportError("material CAD has no positive volume")
     return {name: _compact(points, triangles) for name, triangles in faces.items()}, {
+        "partition_method": partition_method,
+        "meshing_parameters": {
+            "boundary_linear_deflection_mm": mesher.Parameters().Deflection,
+            "interior_linear_deflection_mm": mesher.Parameters().DeflectionInterior,
+            "boundary_angular_deflection_rad": mesher.Parameters().Angle,
+            "interior_angular_deflection_rad": mesher.Parameters().AngleInterior,
+            "minimum_mesh_edge_mm": mesher.Parameters().MinSize,
+            "relative": mesher.Parameters().Relative,
+            "parallel": mesher.Parameters().InParallel,
+        },
         "partition_cells": dict(cells),
         "native_triangle_count": total_triangles,
         "coordinate_decimal_places": 12,
@@ -1466,15 +1508,31 @@ def _export_model(
         raise ExportError("footprint_proxy_tolerance_mm must be finite and nonnegative")
     # Some kernel queries populate geometry caches. Keep even those queries off
     # the caller's shapes; exact CAD snapshots must survive exporting unchanged.
+    proof: object = getattr(model, "material_partition", None)
+    shared_partition: TopoDS_Shape | None = None
+    if proof is not None:
+        if not isinstance(proof, material_partition.MaterialPartition):
+            raise ExportError("invalid retained material partition proof")
+        try:
+            shared_partition, copied_materials = (
+                material_partition.copy_verified_partition(
+                    model.solid, model.materials, model.profile, proof
+                )
+            )
+        except occt.KernelError as error:
+            raise ExportError(str(error)) from error
+    else:
+        copied_materials = {
+            name: BRepBuilderAPI_Copy(shape, True, False).Shape()
+            for name, shape in model.materials.items()
+        }
     model = _CopiedRelief(
         model.profile,
         model.contours,
         BRepBuilderAPI_Copy(model.solid, True, False).Shape(),
-        {
-            name: BRepBuilderAPI_Copy(shape, True, False).Shape()
-            for name, shape in model.materials.items()
-        },
+        copied_materials,
         proxy_tolerance,
+        shared_partition,
     )
     if not occt.valid(model.solid) or occt.volume(model.solid) <= 0:
         raise ExportError("source relief CAD must be valid with positive volume")

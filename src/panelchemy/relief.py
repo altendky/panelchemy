@@ -21,10 +21,11 @@ from shapely import union_all
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
-from panelchemy import curved_occt, occt
+from panelchemy import curved_occt, material_partition, occt
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours, vectorize
 from panelchemy.curves import CurveContours, fit_contours
+from panelchemy.material_partition import MaterialPartition
 from panelchemy.outline_fitting import fit_outlines
 from panelchemy.separation import (
     Mask,
@@ -78,6 +79,7 @@ class ReliefModel:
     contour_comparison_svg: str | None = None
     curves: CurveContours | None = None
     footprint_proxy_tolerance_mm: float = 0.0
+    material_partition: MaterialPartition | None = None
 
 
 def build_relief(
@@ -231,14 +233,15 @@ def build_relief(
         solids.Next()
     if solid_count != 1 or not occt.valid(solid):
         raise occt.KernelError("relief must be one valid connected solid")
-    materials = {"black": black}
-    for name, bottom, top in (
-        ("orange", profile.black_top, profile.orange_top),
-        ("white", profile.orange_top, profile.white_top),
-    ):
-        part = occt.common(raised, occt.prism(interior, bottom, top))
-        if occt.volume(part) > 0:
-            materials[name] = part
+    material_names = (
+        ("black", "orange", "white")
+        if contours.white
+        else ("black", "orange")
+        if contours.orange
+        else ("black",)
+    )
+    partition = material_partition.build_partition(solid, profile, material_names)
+    materials = material_partition.materials_for(partition)
     volumes = {name: occt.volume(shape) for name, shape in materials.items()}
     solid_volume = occt.volume(solid)
     if solid_volume <= 0 or not isclose(
@@ -303,6 +306,7 @@ def build_relief(
         "solid_count": solid_count,
         "solid_volume_mm3": solid_volume,
         "material_volumes_mm3": volumes,
+        "native_material_partition": partition.diagnostics,
         "rim_clipped_volume_mm3": clipped_volume,
         "rim_guard_arc_segments_per_quadrant": guard_segments,
         "rim_guard_conservative_radius_mm": guard_radius,
@@ -340,6 +344,7 @@ def build_relief(
         comparison_svg,
         curves,
         proxy_tolerance,
+        material_partition=material_partition.seal_partition(solid, partition),
     )
 
 
