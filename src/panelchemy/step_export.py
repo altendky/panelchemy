@@ -7,6 +7,7 @@ from typing import Protocol, cast
 
 from OCP.BRep import BRep_Builder
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.collections import Sequence_TCollection_AsciiString, Sequence_TDF_Label
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.Interface import Interface_Static
@@ -27,12 +28,13 @@ from OCP.XCAFDoc import (
     XCAFDoc_ShapeTool,
 )
 
-from panelchemy import material_partition, occt
+from panelchemy import material_partition, occt, step_topology
 from panelchemy.construction import ConstructionProfile
 from panelchemy.export import (
     _STEP_LOCK,  # pyright: ignore[reportPrivateUsage]
     ExportBundle,
     ExportError,
+    StepTopologyError,
     _bounds,  # pyright: ignore[reportPrivateUsage]
     _step,  # pyright: ignore[reportPrivateUsage]
 )
@@ -104,13 +106,18 @@ def _name(label: TDF_Label) -> str:
 
 def _check_shape(original: TopoDS_Shape, restored: TopoDS_Shape) -> dict[str, object]:
     cells = _solids(restored)
-    if (
-        not cells
-        or not occt.valid(restored)
-        or any(not occt.valid(cell) or occt.volume(cell) <= 0 for cell in cells)
-        or len(cells) != len(_solids(original))
-    ):
+    if not cells or len(cells) != len(_solids(original)):
+        raise ExportError("STEP roundtrip changed the number of material solids")
+    checker = BRepCheck_Analyzer(restored)
+    if not checker.IsValid():
+        points = step_topology.open_wire_contact_points(restored, checker)
+        if points:
+            raise StepTopologyError(
+                "STEP roundtrip has open wires at coincident endpoints", points
+            )
         raise ExportError("STEP roundtrip changed or invalidated material solids")
+    if any(not checker.IsValid(cell) or occt.volume(cell) <= 0 for cell in cells):
+        raise ExportError("STEP roundtrip invalidated a material solid")
     before, after = occt.volume(original), occt.volume(restored)
     if not isfinite(after) or not isclose(before, after, rel_tol=1e-8, abs_tol=1e-7):
         raise ExportError("STEP roundtrip changed material volume")
@@ -198,7 +205,14 @@ def _read_assembly(
                 )
             ):
                 raise ExportError("STEP roundtrip changed material colors")
-        report = _check_shape(materials[name], restored)
+        try:
+            report = _check_shape(materials[name], restored)
+        except StepTopologyError as error:
+            raise StepTopologyError(
+                f"{name}: {error}", error.contact_points, name
+            ) from error
+        except ExportError as error:
+            raise ExportError(f"{name}: {error}") from error
         report["color_rgb"] = list(rgb)
         report["placement"] = "identity; original model coordinates"
         reports[name] = report
@@ -214,7 +228,7 @@ def _read_assembly(
     }
 
 
-def _multipart(
+def _multipart_once(
     materials: dict[str, TopoDS_Shape], palette: Palette
 ) -> tuple[bytes, dict[str, object]]:
     document = TDocStd_Document(TCollection_ExtendedString("BinXCAF"))
@@ -227,7 +241,8 @@ def _multipart(
             continue
         # A single part definition can contain disconnected islands. They remain
         # grouped by band rather than becoming one top-level part per island.
-        label = shapes.AddShape(materials[name], False)
+        prepared = BRepBuilderAPI_Copy(materials[name], True, False).Shape()
+        label = shapes.AddShape(prepared, False)
         _ = TDataStd_Name.Set_s(label, TCollection_ExtendedString(name))
         rgb = palette[_NAMES.index(name)]
         color = Quantity_Color(
@@ -259,6 +274,40 @@ def _multipart(
                 raise ExportError("OCCT could not restore the STEP output unit")
     data = stream.getvalue()
     return data, _read_assembly(data, materials, palette)
+
+
+def _multipart(
+    materials: dict[str, TopoDS_Shape], palette: Palette
+) -> tuple[bytes, dict[str, object]]:
+    """Correct only a material/contact implicated by an actual STEP failure."""
+    working = dict(materials)
+    preparations: list[dict[str, object]] = []
+    for attempt in range(9):
+        try:
+            data, report = _multipart_once(working, palette)
+        except StepTopologyError as error:
+            if attempt == 8:
+                raise ExportError(
+                    "multipart STEP contact correction exceeded its retry bound"
+                ) from error
+            name = error.material
+            if name is None or name not in working:
+                raise ExportError(
+                    "STEP failure could not be bound to a material"
+                ) from error
+            corrected, preparation = step_topology.normalize_step_topology(
+                working[name], contact_points=error.contact_points
+            )
+            if not preparation["splits"]:
+                raise ExportError(
+                    f"{name}: STEP open-wire failure has no certified inner-hole contact correction"
+                ) from error
+            working[name] = corrected
+            preparations.append({"material": name, **preparation})
+        else:
+            report["native_topology_preparation"] = preparations
+            return data, report
+    raise AssertionError("unreachable multipart STEP retry state")
 
 
 def export_step(model: StepModel, *, palette: Palette | None = None) -> ExportBundle:

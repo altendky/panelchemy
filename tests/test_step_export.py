@@ -17,7 +17,7 @@ from PIL import Image
 from shapely.geometry import Polygon, box
 
 from panelchemy import export as mesh_export
-from panelchemy import occt, step_export
+from panelchemy import occt, step_export, step_topology
 from panelchemy.construction import ConstructionProfile
 from panelchemy.export import ExportError
 from panelchemy.relief import ReliefModel, build_relief
@@ -92,6 +92,33 @@ def test_custom_materials_are_checked_against_source() -> None:
     model.materials["white"] = model.materials["black"]
     with pytest.raises(ExportError, match="material boundary"):
         _ = export_step(model)
+
+
+def test_valid_step_contacts_do_not_trigger_unneeded_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    labels = np.zeros((16, 22), dtype=np.uint8)
+    labels[3:13, 3:19] = 2
+    labels[6:8, 7:9] = 0
+    labels[8:10, 9:11] = 0  # Two counter boundaries meet at one native vertex.
+    palette = np.asarray(SeparationConfig().palette, dtype=np.uint8)
+    model = build_relief(
+        separate(
+            Image.fromarray(palette[labels]),
+            silhouette=np.ones(labels.shape, dtype=np.bool_),
+        ),
+        ConstructionProfile(long_edge_mm=22, taper_angle_deg=10),
+    )
+
+    def unnecessary(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("A successful ordinary STEP must retain its original topology")
+
+    monkeypatch.setattr(step_topology, "normalize_step_topology", unnecessary)
+    bundle = export_step(model)
+    fused = cast("dict[str, object]", bundle.validation["step"])
+    multipart = cast("dict[str, object]", bundle.validation["multipart_step"])
+    assert fused["native_topology_preparation"] == []
+    assert multipart["native_topology_preparation"] == []
 
 
 def test_changed_retained_materials_are_rejected() -> None:

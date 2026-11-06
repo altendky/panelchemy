@@ -23,6 +23,15 @@ is moved onto the build plate independently. STEP reimport verifies names,
 colors, solid counts, native validity, volumes, bounds and component placements.
 Source CAD and retained material-partition proofs are checked before export.
 
+Two hole loops can share a vertex in valid OCCT geometry, while STEP requires
+separate boundary connectivity. Export first attempts ordinary STEP. If readback
+exposes open wires at coincident endpoints, it matches those points to source
+hole contacts and partitions only the affected planar faces with exact native
+section edges. This preserves their geometric domains and adds internal face
+seams. Every correction is followed by complete STEP readback validation.
+The preparation report records the partitions and preservation checks; the
+caller's CAD remains unchanged.
+
 The reusable `panelchemy.step_export.export_step(model, palette=...)` API returns
 both files and validation metadata without constructing a mesh. The manifest
 keeps `mesh_validated` false for this mode. CAD colors and assembly grouping are
