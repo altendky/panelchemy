@@ -19,8 +19,10 @@
   recessed surfaces with a base underneath, rather than through-holes.
 - Expanding lower footprints can meet across gaps or approach the protected rim.
   Make those interactions inspectable and account for meaningful changes.
-- Minimum-feature enforcement, small-island removal, and similar cleanup are
-  outside the current scope. Consider them separately if needed later.
+- Use the [artwork preparation guide](artwork-guide.md) to target 1 mm minimum
+  feature bodies, gaps, and recesses while retaining sharp terminal points.
+  Small-feature cleanup is now a requested direction; automatic enforcement and
+  its exact geometry policy remain unimplemented.
 - Optional contour approximation is explicitly selected in millimeters and off
   by default. Retain every island and counter, validate the boundary deviation,
   and provide original/selected outlines. Tapering preserves the resulting

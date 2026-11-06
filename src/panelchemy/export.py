@@ -18,13 +18,17 @@ from typing import Protocol, Self, cast
 from OCP.Bnd import Bnd_Box
 from OCP.BOPAlgo import BOPAlgo_Builder
 from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.collections import List_TopoDS_Shape, Sequence_TCollection_AsciiString
+from OCP.GeomAbs import GeomAbs_Plane
 from OCP.IFSelect import IFSelect_RetDone
+from OCP.IMeshTools import IMeshTools_Parameters
 from OCP.Interface import Interface_Static
 from OCP.Poly import Poly_Triangulation
+from OCP.Precision import Precision
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Reader, STEPControl_Writer
 from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED, TopAbs_SOLID
 from OCP.TopExp import TopExp_Explorer
@@ -34,7 +38,7 @@ from shapely import STRtree, union_all
 from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon, box
 from shapely.geometry.base import BaseGeometry
 
-from panelchemy import occt
+from panelchemy import material_partition, occt
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours
 
@@ -56,6 +60,7 @@ class _Relief(Protocol):
     contours: PanelContours
     solid: TopoDS_Shape
     materials: dict[str, TopoDS_Shape]
+    footprint_proxy_tolerance_mm: float
 
 
 @dataclass
@@ -64,6 +69,8 @@ class _CopiedRelief:
     contours: PanelContours
     solid: TopoDS_Shape
     materials: dict[str, TopoDS_Shape]
+    footprint_proxy_tolerance_mm: float
+    shared_partition: TopoDS_Shape | None = None
 
 
 def _positive_number(value: object, name: str) -> None:
@@ -514,6 +521,27 @@ def _conform_meshes(
     return output, report
 
 
+def _meshing_parameters(config: ExportConfig) -> IMeshTools_Parameters:
+    """Resolve curved trims more finely while retaining interior mesh limits."""
+    parameters = IMeshTools_Parameters()
+    parameters.Deflection = min(
+        config.linear_deflection_mm,
+        max(Precision.Confusion_s(), config.linear_deflection_mm * 0.05),
+    )
+    parameters.DeflectionInterior = config.linear_deflection_mm
+    parameters.Angle = config.angular_deflection_rad
+    # Preserve the interior angle and minimum-size guard derived by OCCT's
+    # scalar constructor; only the boundary deflection is tightened.
+    parameters.AngleInterior = config.angular_deflection_rad * 2
+    parameters.MinSize = max(
+        Precision.Confusion_s(),
+        IMeshTools_Parameters.RelMinSize_s() * config.linear_deflection_mm,
+    )
+    parameters.Relative = False
+    parameters.InParallel = False
+    return parameters
+
+
 def _partition(
     model: _Relief, config: ExportConfig
 ) -> tuple[dict[str, _Mesh], dict[str, object]]:
@@ -523,37 +551,45 @@ def _partition(
         or "black" not in model.materials
     ):
         raise ExportError("expected nonempty black/orange/white material solids")
-    compound = TopoDS_Compound()
-    builder = BRep_Builder()
-    builder.MakeCompound(compound)
-    for name in _NAMES:
-        if name in model.materials:
-            _ = builder.Add(compound, model.materials[name])
-    copied = BRepBuilderAPI_Copy(compound, True, False).Shape()
-    arguments = List_TopoDS_Shape()
-    children = TopoDS_Iterator(copied)
-    while children.More():
-        _ = arguments.Append(children.Value())
-        children.Next()
-    if len(model.materials) == 1:
-        partition = copied
+    if isinstance(model, _CopiedRelief) and model.shared_partition is not None:
+        partition = model.shared_partition
+        partition_method = "retained-native-partition"
     else:
-        operation = BOPAlgo_Builder()
-        operation.SetArguments(arguments)
-        operation.SetNonDestructive(True)
-        operation.Perform()
-        if operation.HasErrors():
-            raise ExportError("OCCT could not create shared material interfaces")
-        partition = operation.Shape()
+        # Custom models without a retained proof keep their supplied materials
+        # as the construction inputs; no geometry is replaced from model.solid.
+        try:
+            material_partition.validate_materials(model.materials, model.profile)
+        except occt.KernelError as error:
+            raise ExportError(str(error)) from error
+        compound = TopoDS_Compound()
+        builder = BRep_Builder()
+        builder.MakeCompound(compound)
+        for name in _NAMES:
+            if name in model.materials:
+                _ = builder.Add(compound, model.materials[name])
+        copied = BRepBuilderAPI_Copy(compound, True, False).Shape()
+        if not occt.valid(copied):
+            raise ExportError("copied material CAD is invalid")
+        arguments = List_TopoDS_Shape()
+        children = TopoDS_Iterator(copied)
+        while children.More():
+            _ = arguments.Append(children.Value())
+            children.Next()
+        if len(model.materials) == 1:
+            partition = copied
+            partition_method = "legacy-single-material"
+        else:
+            operation = BOPAlgo_Builder()
+            operation.SetArguments(arguments)
+            operation.SetNonDestructive(True)
+            operation.Perform()
+            if operation.HasErrors():
+                raise ExportError("OCCT could not create shared material interfaces")
+            partition = operation.Shape()
+            partition_method = "legacy-general-fuse"
     if not occt.valid(partition):
         raise ExportError("shared material partition is invalid")
-    mesher = BRepMesh_IncrementalMesh(
-        partition,
-        config.linear_deflection_mm,
-        False,
-        config.angular_deflection_rad,
-        False,
-    )
+    mesher = BRepMesh_IncrementalMesh(partition, _meshing_parameters(config))
     if not mesher.IsDone() or mesher.GetStatusFlags() != 0:
         raise ExportError(f"OCCT meshing failed (status {mesher.GetStatusFlags()})")
     bands = {
@@ -631,6 +667,16 @@ def _partition(
     if sum(occt.volume(shape) for shape in model.materials.values()) <= 0:
         raise ExportError("material CAD has no positive volume")
     return {name: _compact(points, triangles) for name, triangles in faces.items()}, {
+        "partition_method": partition_method,
+        "meshing_parameters": {
+            "boundary_linear_deflection_mm": mesher.Parameters().Deflection,
+            "interior_linear_deflection_mm": mesher.Parameters().DeflectionInterior,
+            "boundary_angular_deflection_rad": mesher.Parameters().Angle,
+            "interior_angular_deflection_rad": mesher.Parameters().AngleInterior,
+            "minimum_mesh_edge_mm": mesher.Parameters().MinSize,
+            "relative": mesher.Parameters().Relative,
+            "parallel": mesher.Parameters().InParallel,
+        },
         "partition_cells": dict(cells),
         "native_triangle_count": total_triangles,
         "coordinate_decimal_places": 12,
@@ -762,8 +808,17 @@ def _triangle_intersections(
                 numeric_contacts.add((i, j))
                 continue
             na, nb = normals[i], normals[j]
-            da = [_dot(_subtract(point, b[0]), nb) for point in a]
-            db = [_dot(_subtract(point, a[0]), na) for point in b]
+            # An indexed shared vertex belongs to both exact triangle planes.
+            # A floating normal dot product can invent a tiny signed distance
+            # there, then amplify it into a spurious edge/plane crossing.
+            da = [
+                0.0 if vertex in shared else _dot(_subtract(point, b[0]), nb)
+                for vertex, point in zip(mesh.triangles[i], a, strict=True)
+            ]
+            db = [
+                0.0 if vertex in shared else _dot(_subtract(point, a[0]), na)
+                for vertex, point in zip(mesh.triangles[j], b, strict=True)
+            ]
             if (
                 all(d > epsilon for d in da)
                 or all(d < -epsilon for d in da)
@@ -1063,6 +1118,38 @@ def _combined(meshes: dict[str, _Mesh]) -> _Mesh:
     return _compact(points, boundary)
 
 
+def _normalize_material_boundaries(
+    meshes: dict[str, _Mesh],
+) -> tuple[dict[str, _Mesh], dict[str, object]]:
+    """Cancel exact opposite triangles after bridge conformance, per material.
+
+    Each removed pair is the zero oriented boundary chain at the same three
+    coordinates. No area threshold, coordinate movement or tolerance is used.
+    Same-winding duplicates and higher multiplicities retain _combined's errors.
+    """
+    normalized: dict[str, _Mesh] = {}
+    materials: dict[str, object] = {}
+    removed_pairs = 0
+    for name, mesh in meshes.items():
+        boundary = _combined({name: mesh})
+        pairs = (len(mesh.triangles) - len(boundary.triangles)) // 2
+        normalized[name] = boundary
+        removed_pairs += pairs
+        materials[name] = {
+            "input_vertices": len(mesh.points),
+            "output_vertices": len(boundary.points),
+            "input_triangles": len(mesh.triangles),
+            "output_triangles": len(boundary.triangles),
+            "exact_opposite_pairs_removed": pairs,
+            "coordinate_movement_mm": 0.0,
+        }
+    return normalized, {
+        "materials": materials,
+        "exact_opposite_pairs_removed": removed_pairs,
+        "coordinate_movement_mm": 0.0,
+    }
+
+
 def _stl(mesh: _Mesh) -> bytes:
     output = bytearray(b"Panelchemy registered millimeter mesh".ljust(80, b"\0"))
     output.extend(struct.pack("<I", len(mesh.triangles)))
@@ -1255,11 +1342,20 @@ def _check_float32(original: _Mesh, serialized: _Mesh, budget: float) -> float:
 
 
 def _footprints(
-    meshes: dict[str, _Mesh], model: _Relief, uncertainty_mm: float
+    meshes: dict[str, _Mesh],
+    model: _Relief,
+    uncertainty_mm: float,
+    linear_deflection_mm: float = 0.0,
 ) -> dict[str, object]:
     """Check planar source tops and the vertical black wall after serialization."""
     scale = max(1.0, model.profile.long_edge_mm)
     tolerance = uncertainty_mm * 4 + ulp(scale) * 64
+    # Display contours are a certified polygonal proxy of native curves. Only
+    # those feature references need a tessellation allowance; the exact panel
+    # silhouette and its vertical wall retain the coordinate-only checks.
+    proxy_tolerance = model.footprint_proxy_tolerance_mm
+    mesh_tolerance = linear_deflection_mm if proxy_tolerance > 0 else 0.0
+    curve_tolerance = proxy_tolerance + mesh_tolerance
 
     def cap(name: str, height: float) -> BaseGeometry:
         if name not in meshes:
@@ -1301,40 +1397,70 @@ def _footprints(
 
     result: dict[str, object] = {}
     for name, expected, actual in checks:
+        feature_tolerance = curve_tolerance if name == "white_top" else 0.0
+        boundary_tolerance = tolerance * 2 + feature_tolerance
         error = expected.symmetric_difference(actual).area
-        budget = expected.length * tolerance * 2 + tolerance**2 * 4
+        budget = expected.length * boundary_tolerance + boundary_tolerance**2
         if (
             topology(expected) != topology(actual)
             or error > budget
-            or expected.hausdorff_distance(actual) > tolerance * 2
+            or expected.hausdorff_distance(actual) > boundary_tolerance
         ):
+            budget_kind = "curve and coordinate" if feature_tolerance else "coordinate"
             raise ExportError(
-                f"serialized {name} footprint exceeds its coordinate error budget"
+                f"serialized {name} footprint exceeds its {budget_kind} error budget"
             )
         result[name] = {
             "symmetric_difference_mm2": error,
             "area_error_budget_mm2": budget,
-            "boundary_tolerance_mm": tolerance * 2,
+            "boundary_tolerance_mm": boundary_tolerance,
+            "coordinate_tolerance_mm": tolerance * 2,
+            "curve_proxy_tolerance_mm": proxy_tolerance if feature_tolerance else 0.0,
+            "mesh_linear_deflection_mm": mesh_tolerance if feature_tolerance else 0.0,
         }
     if "orange" in meshes:
         source = union_all([*model.contours.orange, *model.contours.white])
         top = cap("orange", model.profile.orange_top)
-        if not source.difference(top.buffer(tolerance)).is_empty:
+        if not source.difference(top.buffer(tolerance + curve_tolerance)).is_empty:
             raise ExportError(
                 "serialized orange top no longer covers the source feature tops"
             )
         result["orange_source_top_coverage"] = True
+        result["orange_source_top_coverage_tolerance_mm"] = tolerance + curve_tolerance
     black = meshes["black"]
     boundary = model.contours.silhouette.boundary
+    # Native cap vertices may differ slightly from their supporting plane even
+    # before coordinate rounding. Use that plane's existing CAD tolerance only
+    # for cap-height classification; the wall's XY boundary stays coordinate-only.
+    cap_planes: list[tuple[float, float]] = []
+    faces = TopExp_Explorer(model.materials["black"], TopAbs_FACE)
+    while faces.More():
+        face = TopoDS.Face(faces.Current())
+        surface = BRepAdaptor_Surface(face)
+        if surface.GetType() == GeomAbs_Plane:
+            plane = surface.Plane()
+            direction = plane.Axis().Direction()
+            if direction.X() == 0 and direction.Y() == 0:
+                cap_planes.append(
+                    (plane.Location().Z(), BRep_Tool.Tolerance_s(face) + tolerance)
+                )
+        faces.Next()
     for triangle in black.triangles:
         points = [black.points[index] for index in triangle]
-        if len({point[2] for point in points}) > 1 and any(
+        on_cap = any(
+            all(abs(point[2] - height) <= height_tolerance for point in points)
+            for height, height_tolerance in cap_planes
+        )
+        if not on_cap and any(
             boundary.distance(Point(point[0], point[1])) > tolerance for point in points
         ):
             raise ExportError(
                 "serialized black outer wall is not vertical on the silhouette boundary"
             )
     result["vertical_outer_wall"] = True
+    result["black_cap_height_tolerance_mm"] = max(
+        (height_tolerance for _, height_tolerance in cap_planes), default=tolerance
+    )
     return result
 
 
@@ -1366,20 +1492,47 @@ def _export_model(
 
     No minimum-feature cleanup is performed. Repeated-coordinate cone tips and
     exact-zero bridges receive reported conformance without moving coordinates.
+    Exact opposite triangle pairs cancel within each material boundary after
+    each conformance phase.
     Distinct-coordinate float32 merges or any remaining mesh defect reject the
     complete export.
     """
     config = config or ExportConfig()
+    proxy_tolerance = cast("object", model.footprint_proxy_tolerance_mm)
+    if (
+        isinstance(proxy_tolerance, bool)
+        or not isinstance(proxy_tolerance, (int, float))
+        or not isfinite(proxy_tolerance)
+        or proxy_tolerance < 0
+    ):
+        raise ExportError("footprint_proxy_tolerance_mm must be finite and nonnegative")
     # Some kernel queries populate geometry caches. Keep even those queries off
     # the caller's shapes; exact CAD snapshots must survive exporting unchanged.
+    proof: object = getattr(model, "material_partition", None)
+    shared_partition: TopoDS_Shape | None = None
+    if proof is not None:
+        if not isinstance(proof, material_partition.MaterialPartition):
+            raise ExportError("invalid retained material partition proof")
+        try:
+            shared_partition, copied_materials = (
+                material_partition.copy_verified_partition(
+                    model.solid, model.materials, model.profile, proof
+                )
+            )
+        except occt.KernelError as error:
+            raise ExportError(str(error)) from error
+    else:
+        copied_materials = {
+            name: BRepBuilderAPI_Copy(shape, True, False).Shape()
+            for name, shape in model.materials.items()
+        }
     model = _CopiedRelief(
         model.profile,
         model.contours,
         BRepBuilderAPI_Copy(model.solid, True, False).Shape(),
-        {
-            name: BRepBuilderAPI_Copy(shape, True, False).Shape()
-            for name, shape in model.materials.items()
-        },
+        copied_materials,
+        proxy_tolerance,
+        shared_partition,
     )
     if not occt.valid(model.solid) or occt.volume(model.solid) <= 0:
         raise ExportError("source relief CAD must be valid with positive volume")
@@ -1389,6 +1542,9 @@ def _export_model(
         raise ExportError("OCCT material partition or tessellation failed") from error
     meshes, native_conformance = _conform_meshes(meshes, config.max_triangles)
     native["native_conformance"] = native_conformance
+    # Exact-zero bridges must first supply their required edge subdivisions.
+    meshes, boundary_normalization = _normalize_material_boundaries(meshes)
+    native["native_boundary_normalization"] = boundary_normalization
     interfaces = _interfaces(meshes, model)
     native_meshes = {**meshes, "relief": _combined(meshes)}
     rounding_error = cast("float", native["maximum_coordinate_rounding_mm"])
@@ -1398,6 +1554,10 @@ def _export_model(
     final_parts, float_conformance = _conform_meshes(quantized, config.max_triangles)
     native["float32_quantization"] = quantization
     native["float32_conformance"] = float_conformance
+    final_parts, float_boundary_normalization = _normalize_material_boundaries(
+        final_parts
+    )
+    native["float32_boundary_normalization"] = float_boundary_normalization
     float_error = cast("float", quantization["maximum_coordinate_error_mm"])
     _ = _interfaces(final_parts, model)
     expected_meshes = {**final_parts, "relief": _combined(final_parts)}
@@ -1434,9 +1594,12 @@ def _export_model(
         if name != "relief":
             serialized_meshes[name] = roundtrip
     stl_interfaces = _interfaces(serialized_meshes, model)
-    footprints = _footprints(meshes, model, rounding_error)
+    footprints = _footprints(meshes, model, rounding_error, config.linear_deflection_mm)
     serialized_footprints = _footprints(
-        serialized_meshes, model, rounding_error + float_error
+        serialized_meshes,
+        model,
+        rounding_error + float_error,
+        config.linear_deflection_mm,
     )
     try:
         files["relief.step"], step_report = _step(model.solid)

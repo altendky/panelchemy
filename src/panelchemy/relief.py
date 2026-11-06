@@ -21,10 +21,12 @@ from shapely import union_all
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
-from panelchemy import occt
-from panelchemy.approximation import approximate
+from panelchemy import curved_occt, material_partition, occt
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours, vectorize
+from panelchemy.curves import CurveContours, fit_contours
+from panelchemy.material_partition import MaterialPartition
+from panelchemy.outline_fitting import fit_outlines
 from panelchemy.separation import (
     Mask,
     SeparationConfig,
@@ -75,6 +77,9 @@ class ReliefModel:
     sections: dict[str, Polygon | MultiPolygon]
     diagnostics: dict[str, object]
     contour_comparison_svg: str | None = None
+    curves: CurveContours | None = None
+    footprint_proxy_tolerance_mm: float = 0.0
+    material_partition: MaterialPartition | None = None
 
 
 def build_relief(
@@ -105,16 +110,34 @@ def build_relief(
     contours = vectorize(result, profile.long_edge_mm, source_budget)
     approximation_diagnostics: dict[str, object] | None = None
     comparison_svg: str | None = None
+    curves: CurveContours | None = None
+    proxy_tolerance = 0.0
+    native_edge_count = contours.vertex_count
     if profile.contour_tolerance_mm > 0:
-        approximated = approximate(
-            contours, profile.contour_tolerance_mm, palette=result.config.palette
+        if profile.contour_mode == "curves":
+            fitted = fit_outlines(
+                contours, profile.contour_tolerance_mm, palette=result.config.palette
+            )
+        else:
+            fitted = fit_contours(
+                contours,
+                profile.contour_tolerance_mm,
+                palette=result.config.palette,
+                mode=profile.contour_mode,
+            )
+        curves = fitted.contours
+        contours = fitted.proxy
+        approximation_diagnostics = fitted.diagnostics
+        comparison_svg = fitted.comparison_svg
+        proxy_tolerance = fitted.proxy_deviation_mm
+        native_edge_count = sum(
+            len(ring.spans)
+            for polygon in (curves.silhouette, *curves.orange, *curves.white)
+            for ring in (polygon.exterior, *polygon.interiors)
         )
-        contours = approximated.contours
-        approximation_diagnostics = approximated.diagnostics
-        comparison_svg = approximated.comparison_svg
-        if contours.vertex_count > max_vertices:
+        if native_edge_count > max_vertices:
             raise ValueError(
-                f"approximated contours require {contours.vertex_count:,} vertices, exceeding max_vertices={max_vertices:,}; increase the budget or review another tolerance"
+                f"approximated contours require {native_edge_count:,} native edges, exceeding max_vertices={max_vertices:,}; increase the budget or review another tolerance"
             )
     guard_segments = 32
     guard_radius = profile.rim_width_mm / cos(pi / (4 * guard_segments))
@@ -136,14 +159,68 @@ def build_relief(
         )
     modes: Counter[str] = Counter()
     roofs: list[TopoDS_Shape] = []
-    for polygons, top in (
-        (contours.orange, profile.orange_top),
-        (contours.white, profile.white_top),
+    region_diagnostics: list[dict[str, object]] = []
+    expected_white_faces: list[TopoDS_Shape] = []
+    guard_tops: dict[float, TopoDS_Shape] = {}
+    if curves is not None:
+        guard_regions = (
+            [interior] if isinstance(interior, Polygon) else list(interior.geoms)
+        )
+        guard_tops = {
+            top: occt.fuse(
+                [occt.polygon_face(polygon, top) for polygon in guard_regions]
+            )
+            for top in (profile.orange_top, profile.white_top)
+        }
+    for color, polygons, native_regions, top in (
+        (
+            "orange",
+            contours.orange,
+            curves.orange if curves is not None else None,
+            profile.orange_top,
+        ),
+        (
+            "white",
+            contours.white,
+            curves.white if curves is not None else None,
+            profile.white_top,
+        ),
     ):
-        for polygon in polygons:
-            shape, method = occt.roof(polygon, profile.black_top, top, slope)
+        for index, polygon in enumerate(polygons):
+            region_started = monotonic()
+            native_diagnostics: dict[str, object] = {}
+            if native_regions is None:
+                shape, method = occt.roof(polygon, profile.black_top, top, slope)
+                if color == "white":
+                    expected_white_faces.append(occt.polygon_face(polygon, top))
+            else:
+                region = native_regions[index]
+                selected_top = curved_occt.polygon_face(region, top)
+                if occt.area(occt.cut(selected_top, guard_tops[top])) > 1e-9:
+                    raise ValueError(
+                        "the protected rim intersects a fitted feature top; reduce rim_width_mm or revise the boundary"
+                    )
+                shape, method = curved_occt.roof(
+                    region,
+                    profile.black_top,
+                    top,
+                    slope,
+                    diagnostics=native_diagnostics,
+                )
+                if color == "white":
+                    expected_white_faces.append(selected_top)
             roofs.append(shape)
             modes[method] += 1
+            region_diagnostics.append(
+                {
+                    "color": color,
+                    "component": index,
+                    "method": method,
+                    "elapsed_seconds": monotonic() - region_started,
+                    "native_validation": native_diagnostics,
+                    **occt.topology_counts(shape),
+                }
+            )
     black = occt.prism(contours.silhouette, 0, profile.black_top)
     untrimmed = occt.fuse(roofs)
     clipping_solid = occt.prism(interior, profile.black_top, profile.white_top)
@@ -156,23 +233,22 @@ def build_relief(
         solids.Next()
     if solid_count != 1 or not occt.valid(solid):
         raise occt.KernelError("relief must be one valid connected solid")
-    materials = {"black": black}
-    for name, bottom, top in (
-        ("orange", profile.black_top, profile.orange_top),
-        ("white", profile.orange_top, profile.white_top),
-    ):
-        part = occt.common(raised, occt.prism(interior, bottom, top))
-        if occt.volume(part) > 0:
-            materials[name] = part
+    material_names = (
+        ("black", "orange", "white")
+        if contours.white
+        else ("black", "orange")
+        if contours.orange
+        else ("black",)
+    )
+    partition = material_partition.build_partition(solid, profile, material_names)
+    materials = material_partition.materials_for(partition)
     volumes = {name: occt.volume(shape) for name, shape in materials.items()}
     solid_volume = occt.volume(solid)
     if solid_volume <= 0 or not isclose(
         sum(volumes.values()), solid_volume, rel_tol=1e-8, abs_tol=1e-7
     ):
         raise occt.KernelError("material volumes do not account for the combined solid")
-    expected_top = occt.fuse(
-        [occt.polygon_face(p, profile.white_top) for p in contours.white]
-    )
+    expected_top = occt.fuse(expected_white_faces)
     actual_top = occt.cross_section(solid, profile.white_top)
     top_missing = occt.area(occt.cut(expected_top, actual_top))
     top_extra = occt.area(occt.cut(actual_top, expected_top))
@@ -218,6 +294,10 @@ def build_relief(
         )
     diagnostics: dict[str, object] = {
         "vertex_count": contours.vertex_count,
+        "native_outline_edges": native_edge_count,
+        "footprint_proxy_tolerance_mm": proxy_tolerance,
+        "regions": region_diagnostics,
+        "combined_topology": occt.topology_counts(solid),
         "source_components": {
             "orange": len(contours.orange),
             "white": len(contours.white),
@@ -226,6 +306,7 @@ def build_relief(
         "solid_count": solid_count,
         "solid_volume_mm3": solid_volume,
         "material_volumes_mm3": volumes,
+        "native_material_partition": partition.diagnostics,
         "rim_clipped_volume_mm3": clipped_volume,
         "rim_guard_arc_segments_per_quadrant": guard_segments,
         "rim_guard_conservative_radius_mm": guard_radius,
@@ -240,7 +321,9 @@ def build_relief(
         "max_vertices": max_vertices,
         "source_vertex_budget": source_budget,
         "contour_approximation": approximation_diagnostics,
-        "top_footprint_reference": "selected contours (exact unless approximation is enabled)",
+        "top_footprint_reference": f"fitted native {profile.contour_mode}"
+        if curves is not None
+        else "exact pixel contours",
         "white_top_missing_mm2": top_missing,
         "white_top_extra_mm2": top_extra,
         "white_top_area_tolerance_mm2": top_tolerance,
@@ -259,6 +342,9 @@ def build_relief(
         },
         diagnostics,
         comparison_svg,
+        curves,
+        proxy_tolerance,
+        material_partition=material_partition.seal_partition(solid, partition),
     )
 
 

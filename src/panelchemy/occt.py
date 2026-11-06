@@ -1,12 +1,12 @@
 """OpenCascade solids with preserved plateaus and outward distance tapers."""
 
 from collections.abc import Iterable, Sequence
-from math import atan2, hypot, isfinite, pi, sin
+from math import isfinite, pi, sin
 from pathlib import Path
 from typing import cast
 
 from OCP.Bnd import Bnd_Box
-from OCP.BRep import BRep_Builder
+from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAlgoAPI import (
     BRepAlgoAPI_BooleanOperation,
     BRepAlgoAPI_Common,
@@ -15,6 +15,7 @@ from OCP.BRepAlgoAPI import (
 )
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_Copy,
     BRepBuilderAPI_MakeEdge,
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakePolygon,
@@ -25,14 +26,28 @@ from OCP.BRepBuilderAPI import (
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeEvolved
-from OCP.BRepPrimAPI import BRepPrimAPI_MakeCone, BRepPrimAPI_MakePrism
-from OCP.BRepTools import BRepTools
-from OCP.collections import List_TopoDS_Shape
+from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+from OCP.BRepTools import BRepTools, BRepTools_ReShape
+from OCP.collections import (
+    IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher,
+    List_TopoDS_Shape,
+)
 from OCP.GeomAbs import GeomAbs_Arc
-from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+from OCP.gp import gp_Pnt, gp_Trsf, gp_Vec
 from OCP.GProp import GProp_GProps
-from OCP.TopAbs import TopAbs_COMPOUND, TopAbs_EDGE, TopAbs_FACE
-from OCP.TopExp import TopExp_Explorer
+from OCP.TopAbs import (
+    TopAbs_COMPOUND,
+    TopAbs_COMPSOLID,
+    TopAbs_EDGE,
+    TopAbs_FACE,
+    TopAbs_INTERNAL,
+    TopAbs_SHELL,
+    TopAbs_SOLID,
+    TopAbs_VERTEX,
+    TopAbs_WIRE,
+)
+from OCP.TopExp import TopExp, TopExp_Explorer
+from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import (
     TopoDS,
     TopoDS_Compound,
@@ -71,14 +86,31 @@ def valid(shape: TopoDS_Shape) -> bool:
     return not shape.IsNull() and BRepCheck_Analyzer(shape).IsValid()
 
 
+def topology_counts(shape: TopoDS_Shape) -> dict[str, int]:
+    """Count unique native topology, rather than repeated face-edge uses."""
+    counts: dict[str, int] = {}
+    for name, kind in (
+        ("solids", TopAbs_SOLID),
+        ("faces", TopAbs_FACE),
+        ("edges", TopAbs_EDGE),
+        ("vertices", TopAbs_VERTEX),
+    ):
+        shapes = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+        TopExp.MapShapes_s(shape, kind, shapes)
+        counts[name] = shapes.Extent()
+    return counts
+
+
 def volume(shape: TopoDS_Shape) -> float:
     """Compute signed closed-solid volume from the exact surfaces."""
     if _is_empty(shape):
         return 0.0
     properties = GProp_GProps()
-    BRepGProp.VolumeProperties_s(shape, properties, OnlyClosed=True)
+    # Curved faces need adaptive integration: the fixed-order overload can
+    # disagree across otherwise identical material partitions.
+    error = BRepGProp.VolumeProperties_s(shape, properties, Eps=1e-11, OnlyClosed=True)
     result = properties.Mass()
-    if not isfinite(result):
+    if not isfinite(result) or not isfinite(error):
         raise KernelError("OpenCascade returned a non-finite volume")
     return result
 
@@ -88,11 +120,163 @@ def area(shape: TopoDS_Shape) -> float:
     if _is_empty(shape):
         return 0.0
     properties = GProp_GProps()
-    BRepGProp.SurfaceProperties_s(shape, properties)
+    error = BRepGProp.SurfaceProperties_s(shape, properties, Eps=1e-11)
     result = properties.Mass()
-    if not isfinite(result):
+    if not isfinite(result) or not isfinite(error):
         raise KernelError("OpenCascade returned a non-finite area")
     return result
+
+
+def _is_open_internal_wire(wire: TopoDS_Wire) -> bool:
+    """Recognize an acyclic INTERNAL annotation graph, independent of its flag.
+
+    Native wire closure checks ignore INTERNAL edges. Check their vertex graph
+    instead, so a closed INTERNAL loop with an unset Closed flag is retained.
+    Branches and disconnected trees cannot enclose a counter and are allowed.
+    """
+    if wire.Closed():
+        return False
+    vertices: list[TopoDS_Vertex] = []
+    parents: list[int] = []
+    edges = TopExp_Explorer(wire, TopAbs_EDGE)
+    while edges.More():
+        edge = TopoDS.Edge(edges.Current())
+        if edge.Orientation() != TopAbs_INTERNAL:
+            return False
+        ends: list[int] = []
+        for vertex in (TopExp.FirstVertex_s(edge), TopExp.LastVertex_s(edge)):
+            if vertex.IsNull():
+                return False
+            index = next(
+                (i for i, existing in enumerate(vertices) if vertex.IsSame(existing)),
+                len(vertices),
+            )
+            if index == len(vertices):
+                vertices.append(vertex)
+                parents.append(index)
+            ends.append(index)
+        roots: list[int] = []
+        for index in ends:
+            while parents[index] != index:
+                index = parents[index]
+            roots.append(index)
+        # This also rejects self-loops, parallel-edge cycles and repeated uses
+        # of an edge. One cyclic component retains the entire wire.
+        if roots[0] == roots[1]:
+            return False
+        parents[roots[0]] = roots[1]
+        edges.Next()
+    return bool(vertices)
+
+
+def _open_internal_wires(shape: TopoDS_Shape) -> list[TopoDS_Wire]:
+    wires: list[TopoDS_Wire] = []
+    faces = TopExp_Explorer(shape, TopAbs_FACE)
+    while faces.More():
+        face_wires = TopExp_Explorer(faces.Current(), TopAbs_WIRE)
+        while face_wires.More():
+            wire = TopoDS.Wire(face_wires.Current())
+            if _is_open_internal_wire(wire):
+                wires.append(wire)
+            face_wires.Next()
+        faces.Next()
+    return wires
+
+
+def _annotation_boundary_unchanged(
+    before: TopoDS_Shape,
+    after: TopoDS_Shape,
+    removed: Sequence[TopoDS_Wire],
+) -> bool:
+    """Certify exact physical boundary identity after annotation removal.
+
+    ReShape can replace containing faces, shells and solids. Their ordered
+    membership, locations and orientations must remain; only recognized open
+    INTERNAL face-wire occurrences may disappear. Retained wire identities keep
+    all native edges and pcurves, and face supports remain the same native object.
+    """
+    if before.IsEqual(after):
+        return True
+    if (
+        before.ShapeType() != after.ShapeType()
+        or before.Orientation() != after.Orientation()
+        or not before.Location().IsEqual(after.Location())
+        or before.Closed() != after.Closed()
+        or before.ShapeType()
+        not in (
+            TopAbs_COMPOUND,
+            TopAbs_COMPSOLID,
+            TopAbs_SOLID,
+            TopAbs_SHELL,
+            TopAbs_FACE,
+        )
+    ):
+        return False
+    is_face = before.ShapeType() == TopAbs_FACE
+    if is_face:
+        old, new = TopoDS.Face(before), TopoDS.Face(after)
+        old_location, new_location = TopLoc_Location(), TopLoc_Location()
+        old_surface = BRep_Tool.Surface_s(old, old_location)
+        new_surface = BRep_Tool.Surface_s(new, new_location)
+        if (
+            old_surface is not new_surface
+            or not old_location.IsEqual(new_location)
+            or BRep_Tool.Tolerance_s(old) != BRep_Tool.Tolerance_s(new)
+            or BRep_Tool.NaturalRestriction_s(old)
+            != BRep_Tool.NaturalRestriction_s(new)
+        ):
+            return False
+    old_children, new_children = TopoDS_Iterator(before), TopoDS_Iterator(after)
+    while old_children.More():
+        child = old_children.Value()
+        if child.ShapeType() == TopAbs_WIRE and any(
+            child.IsSame(wire) for wire in removed
+        ):
+            # A globally shared wire may only be removed where it is the same
+            # recognized face annotation, never from another topology context.
+            if not is_face or not _is_open_internal_wire(TopoDS.Wire(child)):
+                return False
+        else:
+            if not new_children.More() or not _annotation_boundary_unchanged(
+                child, new_children.Value(), removed
+            ):
+                return False
+            new_children.Next()
+        old_children.Next()
+    return not new_children.More()
+
+
+def _without_open_internal_wires(shape: TopoDS_Shape) -> TopoDS_Shape:
+    """Remove non-boundary Boolean annotations that the native mesher rejects.
+
+    Closed loops and every boundary edge remain. These open INTERNAL wires
+    delimit no surface area; removing them does not simplify artwork or impose
+    a minimum feature size. Verify exact boundary identity on the working copy,
+    plus native validity and area. Curved volume integration may change slightly
+    when INTERNAL integration annotations disappear despite identical boundaries.
+    """
+    if not _open_internal_wires(shape):
+        return shape
+    copied = BRepBuilderAPI_Copy(shape, True, False).Shape()
+    reshape = BRepTools_ReShape()
+    removed = _open_internal_wires(copied)
+    for wire in removed:
+        reshape.Remove(wire)
+    cleaned = reshape.Apply(copied)
+    if not valid(cleaned):
+        raise KernelError(
+            "removing internal annotation wires produced invalid geometry"
+        )
+    boundary_unchanged = _annotation_boundary_unchanged(copied, cleaned, removed)
+    if not boundary_unchanged:
+        raise KernelError("removing internal annotation wires changed CAD boundaries")
+    for measure in (area, volume):
+        before, after = measure(shape), measure(cleaned)
+        if abs(before - after) > max(1e-10, abs(before) * 1e-10):
+            if measure is volume and boundary_unchanged:
+                continue
+            raise KernelError("removing internal annotation wires changed CAD geometry")
+    return cleaned
 
 
 def _normalized(polygon: Polygon) -> Polygon:
@@ -138,23 +322,6 @@ def _rings(polygon: Polygon) -> list[list[Point2]]:
         _points(polygon.exterior.coords),
         *[_points(ring.coords) for ring in polygon.interiors],
     ]
-
-
-def _wire(points: Sequence[gp_Pnt]) -> TopoDS_Wire:
-    builder = BRepBuilderAPI_MakePolygon()
-    for point in points:
-        builder.Add(point)
-    builder.Close()
-    if not builder.IsDone():
-        raise KernelError("OpenCascade could not construct a closed wire")
-    return builder.Wire()
-
-
-def _face(points: Sequence[gp_Pnt]) -> TopoDS_Face:
-    builder = BRepBuilderAPI_MakeFace(_wire(points))
-    if not builder.IsDone():
-        raise KernelError("OpenCascade could not construct a planar face")
-    return builder.Face()
 
 
 def _shared_polygon_face(rings: Sequence[Sequence[Point2]], z: float) -> TopoDS_Face:
@@ -337,8 +504,25 @@ def _boolean(
     except Exception as error:
         raise KernelError(f"OpenCascade {name} failed") from error
     if not valid(result):
-        raise KernelError(f"OpenCascade {name} returned invalid geometry")
-    return result
+        # A Boolean can reconnect UV wires incorrectly even for valid inputs.
+        # Repair only a single solid with an exact physical-boundary certificate;
+        # planar errors, extra fragments and broader geometry changes still fail.
+        solids = TopExp_Explorer(result, TopAbs_SOLID)
+        if not solids.More():
+            raise KernelError(f"OpenCascade {name} returned invalid geometry")
+        solid = solids.Current()
+        solids.Next()
+        if solids.More() or topology_counts(solid) != topology_counts(result):
+            raise KernelError(f"OpenCascade {name} returned invalid geometry")
+        from panelchemy.curved_occt import _repair_cell  # pyright: ignore[reportPrivateUsage]
+
+        try:
+            result = _repair_cell(solid)
+        except KernelError as error:
+            raise KernelError(
+                f"OpenCascade {name} returned invalid geometry; {error}"
+            ) from error
+    return _without_open_internal_wires(result)
 
 
 def fuse(shapes: Sequence[TopoDS_Shape]) -> TopoDS_Shape:
@@ -484,41 +668,6 @@ def _check_fast_sections(
         previous, previous_z = actual, z
 
 
-def _exact_roof(
-    polygon: Polygon, z0: float, z1: float, run_per_height: float
-) -> TopoDS_Shape:
-    height = z1 - z0
-    run = run_per_height * height
-    parts = [prism(polygon, z0, z1)]
-    for ring in _rings(polygon):
-        for index, (x, y) in enumerate(ring):
-            following = ring[(index + 1) % len(ring)]
-            dx, dy = following[0] - x, following[1] - y
-            length = hypot(dx, dy)
-            nx, ny = dy / length, -dx / length
-            triangle = _face(
-                [
-                    gp_Pnt(x, y, z0),
-                    gp_Pnt(x + nx * run, y + ny * run, z0),
-                    gp_Pnt(x, y, z1),
-                ]
-            )
-            parts.append(BRepPrimAPI_MakePrism(triangle, gp_Vec(dx, dy, 0)).Shape())
-            previous = ring[index - 1]
-            px, py = x - previous[0], y - previous[1]
-            previous_length = hypot(px, py)
-            turn = px * dy - py * dx
-            if turn > 0:
-                angle = atan2(turn, px * dx + py * dy)
-                axes = gp_Ax2(
-                    gp_Pnt(x, y, z0),
-                    gp_Dir(0, 0, 1),
-                    gp_Dir(py / previous_length, -px / previous_length, 0),
-                )
-                parts.append(BRepPrimAPI_MakeCone(axes, run, 0, height, angle).Shape())
-    return fuse(parts)
-
-
 def roof(
     polygon: Polygon,
     z0: float,
@@ -529,9 +678,9 @@ def roof(
     """Preserve the top polygon and expand down with a Euclidean-distance taper.
 
     Cross-sections at z are the polygon buffered by run_per_height * (z1-z).
-    The evolved sweep is fast but can fail at offset topology changes. The exact
-    fallback unions outward edge wedges and convex corner cone sectors. Both
-    paths verify the original top footprint, including counters, before return.
+    The evolved sweep is fast but can fail at offset topology changes. The
+    regional builder supplies a native draft-surface alternative, with no
+    per-edge closed-solid union. Both preserve the original top and counters.
     """
     if not isfinite(z0) or not isfinite(z1) or z1 <= z0:
         raise KernelError("roof heights must be finite and strictly increasing")
@@ -554,14 +703,18 @@ def roof(
             pass
         else:
             return result, "evolved"
+    from panelchemy.curved_occt import roof as regional_roof
+    from panelchemy.curves import polygon_lines
+
     try:
-        result = _exact_roof(polygon, z0, z1, run_per_height)
-        _check_roof(result, polygon, z0, z1)
+        result, method = regional_roof(
+            polygon_lines(polygon), z0, z1, run_per_height, prefer_fast=False
+        )
     except Exception as error:
         raise KernelError(
             "OpenCascade could not construct a verified outward taper"
         ) from error
-    return result, "exact"
+    return result, method
 
 
 def write_brep(shape: TopoDS_Shape, path: Path) -> None:

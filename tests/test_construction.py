@@ -25,6 +25,15 @@ def test_taper_is_configurable_from_vertical_including_no_taper() -> None:
     assert ConstructionProfile.from_mapping(angled.as_dict()) == angled
 
 
+def test_contour_mode_roundtrips_and_defaults_to_curves() -> None:
+    assert ConstructionProfile().contour_mode == "curves"
+    lines = ConstructionProfile.from_mapping(
+        {"contour_mode": "lines", "contour_tolerance_mm": 0.2}
+    )
+    assert lines.contour_mode == "lines"
+    assert ConstructionProfile.from_mapping(lines.as_dict()) == lines
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -38,6 +47,9 @@ def test_taper_is_configurable_from_vertical_including_no_taper() -> None:
         {"long_edge_mm": float("inf")},
         {"long_edge_mm": 10**1000},
         {"old_name": 2},
+        {"contour_mode": "unknown"},
+        {"contour_mode": True},
+        {"contour_mode": 1},
         {"contour_tolerance_mm": -0.1},
         {"contour_tolerance_mm": True},
         {"contour_tolerance_mm": float("nan")},
