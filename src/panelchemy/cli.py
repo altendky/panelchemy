@@ -42,6 +42,12 @@ def main() -> None:
         _ = relief.add_argument("--silhouette-mask", type=Path)
         _ = relief.add_argument("--max-vertices", type=int, default=25_000)
         if name == "export":
+            _ = relief.add_argument(
+                "--format",
+                choices=("all", "step"),
+                default="all",
+                help="step writes fused and colored multipart STEP without meshing",
+            )
             _ = relief.add_argument("--mesh-deflection-mm", type=float, default=0.02)
             _ = relief.add_argument(
                 "--mesh-angle-deg", type=float, default=degrees(0.2)
@@ -70,7 +76,11 @@ def main() -> None:
             config_path = cast("Path | None", args.config)
             profile_path = cast("Path | None", args.profile)
             export_config = None
-            if cast("str", args.command) == "export":
+            step_only = (
+                cast("str", args.command) == "export"
+                and cast("str", args.format) == "step"
+            )
+            if cast("str", args.command) == "export" and not step_only:
                 from panelchemy.export import ExportConfig
 
                 export_config = ExportConfig(
@@ -89,6 +99,7 @@ def main() -> None:
                 ),
                 max_vertices=cast("int", args.max_vertices),
                 export_config=export_config,
+                step_only=step_only,
             )
             print(json.dumps(manifest, indent=2, sort_keys=True))
             return

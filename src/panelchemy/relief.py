@@ -45,6 +45,7 @@ EXPORT_NAMES = (
     "white.stl",
     "relief.step",
 )
+STEP_EXPORT_NAMES = ("relief.step", "relief-multipart.step")
 
 
 def _polygonal(geometry: BaseGeometry) -> Polygon | MultiPolygon:
@@ -428,8 +429,11 @@ def process_relief_file(
     protected_paths: tuple[Path, ...] = (),
     max_vertices: int = 25_000,
     export_config: "ExportConfig | None" = None,
+    step_only: bool = False,
 ) -> dict[str, object]:
     """Stage checked CAD and optional validated exports with shared provenance."""
+    if step_only and export_config is not None:
+        raise ValueError("STEP-only export cannot also request mesh export")
     names = [
         "relief.brep",
         "black.brep",
@@ -440,6 +444,7 @@ def process_relief_file(
         "manifest.json",
         "contours.svg",
         *EXPORT_NAMES,
+        *STEP_EXPORT_NAMES,
     ]
     protected = {path.resolve() for path in (source, *protected_paths)}
     if silhouette_path:
@@ -473,7 +478,16 @@ def process_relief_file(
         for name, shape in model.materials.items():
             occt.write_brep(shape, stage / f"{name}.brep")
         export_report: dict[str, object] | None = None
-        if export_config is not None:
+        if step_only:
+            from panelchemy.step_export import export_step
+
+            bundle = export_step(model, palette=result.config.palette)
+            for name, content in bundle.files.items():
+                if name not in STEP_EXPORT_NAMES:
+                    raise ValueError(f"unexpected export artifact: {name}")
+                _ = (stage / name).write_bytes(content)
+            export_report = {"format": "step", "validation": bundle.validation}
+        elif export_config is not None:
             from panelchemy.export import export_model
 
             bundle = export_model(model, export_config)
@@ -510,7 +524,7 @@ def process_relief_file(
             "schema_version": 1,
             "kind": "occt-relief",
             "print_ready": False,
-            "mesh_validated": export_report is not None,
+            "mesh_validated": export_config is not None,
             "physical_print_validated": False,
             "export": export_report,
             "source": separation_manifest["source"],
@@ -552,7 +566,7 @@ def process_relief_file(
                 (output / f"{name}.brep").unlink(missing_ok=True)
         if model.contour_comparison_svg is None:
             (output / "contours.svg").unlink(missing_ok=True)
-        for name in EXPORT_NAMES:
+        for name in (*EXPORT_NAMES, *STEP_EXPORT_NAMES):
             if not (stage / name).exists():
                 (output / name).unlink(missing_ok=True)
         _ = (output / "manifest.json").write_text(

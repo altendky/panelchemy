@@ -21,6 +21,7 @@ from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.collections import List_TopoDS_Shape, Sequence_TCollection_AsciiString
 from OCP.GeomAbs import GeomAbs_Plane
@@ -38,7 +39,7 @@ from shapely import STRtree, union_all
 from shapely.geometry import LineString, MultiPoint, MultiPolygon, Point, Polygon, box
 from shapely.geometry.base import BaseGeometry
 
-from panelchemy import material_partition, occt
+from panelchemy import material_partition, occt, step_topology
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours
 
@@ -51,6 +52,23 @@ _STEP_LOCK = Lock()
 
 class ExportError(ValueError):
     """An export could not preserve a valid, registered printable model."""
+
+
+class StepTopologyError(ExportError):
+    """An imported STEP has open wires at coincident native endpoints."""
+
+    contact_points: tuple[Coordinate, ...]
+    material: str | None
+
+    def __init__(
+        self,
+        message: str,
+        contact_points: tuple[Coordinate, ...],
+        material: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.contact_points = contact_points
+        self.material = material
 
 
 class _Relief(Protocol):
@@ -1194,7 +1212,7 @@ def _read_stl(data: bytes) -> _Mesh:
     return _Mesh(points, triangles)
 
 
-def _step(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
+def _step_once(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
     copied = BRepBuilderAPI_Copy(shape, True, False).Shape()
     stream = BytesIO()
     # This binding does not expose DESTEP_Parameters. OCCT's transfer consults
@@ -1242,11 +1260,17 @@ def _step(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
     if reader.TransferRoots() < 1:
         raise ExportError("serialized STEP cannot transfer its CAD roots")
     roundtrip = reader.OneShape()
+    checker = BRepCheck_Analyzer(roundtrip)
+    if not checker.IsValid():
+        points = step_topology.open_wire_contact_points(roundtrip, checker)
+        if points:
+            raise StepTopologyError(
+                "STEP roundtrip has open wires at coincident endpoints", points
+            )
+        raise ExportError("STEP roundtrip invalidated the CAD solid")
     original, restored = occt.volume(shape), occt.volume(roundtrip)
-    if not occt.valid(roundtrip) or abs(original - restored) > max(
-        1e-7, original * 1e-8
-    ):
-        raise ExportError("STEP roundtrip changed or invalidated the CAD solid")
+    if abs(original - restored) > max(1e-7, original * 1e-8):
+        raise ExportError("STEP roundtrip changed the CAD solid volume")
     before, after = _bounds(shape), _bounds(roundtrip)
     if (
         max(
@@ -1266,6 +1290,38 @@ def _step(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
         "timestamp_may_vary": True,
         "unit_configuration": "Scoped global write.step.unit=MM, restored under a Panelchemy writer lock; unrelated OCCT global mutations require external coordination",
     }
+
+
+def _step(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
+    """Try ordinary STEP, partitioning only contacts exposed by failed readback."""
+    working = shape
+    preparations: list[dict[str, object]] = []
+    for attempt in range(9):
+        try:
+            data, report = _step_once(working)
+        except StepTopologyError as error:
+            if attempt == 8:
+                raise ExportError(
+                    "STEP contact correction exceeded its retry bound"
+                ) from error
+            try:
+                corrected, preparation = step_topology.normalize_step_topology(
+                    working, contact_points=error.contact_points
+                )
+            except occt.KernelError as failure:
+                raise ExportError(
+                    f"STEP contact correction failed: {failure}"
+                ) from failure
+            if not preparation["splits"]:
+                raise ExportError(
+                    "STEP open-wire failure has no certified inner-hole contact correction"
+                ) from error
+            working = corrected
+            preparations.append(preparation)
+        else:
+            report["native_topology_preparation"] = preparations
+            return data, report
+    raise AssertionError("unreachable STEP retry state")
 
 
 def _float32(point: Coordinate) -> Coordinate:
