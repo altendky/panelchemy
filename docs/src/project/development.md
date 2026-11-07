@@ -36,7 +36,7 @@ checkout does not retain credentials. Internal Markdown links are blocking;
 external link checks are advisory.
 
 The repository follows Scansor's public visibility, merge-commit policy,
-automatic branch deletion, and default-branch rules for signed commits, reviewed
+automatic branch deletion, and default-branch rules for signed commits,
 pull requests, required CI, and protection from deletion or force pushes.
 
 Renovate owns dependency-update proposals for active manifests. Mergify uses the
