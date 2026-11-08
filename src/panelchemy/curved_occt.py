@@ -11,10 +11,11 @@ from math import atan, atan2, cos, fsum, hypot, isfinite, pi, sqrt
 from typing import cast
 
 from OCP.Bnd import Bnd_Box
-from OCP.BOPAlgo import BOPAlgo_Builder, BOPAlgo_MakerVolume
+from OCP.BOPAlgo import BOPAlgo_Builder, BOPAlgo_GlueFull, BOPAlgo_MakerVolume
 from OCP.BOPTools import BOPTools_AlgoTools3D
 from OCP.BRep import BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Surface
+from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_Copy,
@@ -30,12 +31,15 @@ from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepFill import BRepFill_Draft, BRepFill_Modified
 from OCP.BRepGProp import BRepGProp
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakePrism
+from OCP.BRepTools import BRepTools, BRepTools_WireExplorer
 from OCP.collections import (
     Array1_gp_Pnt,
     IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher,
     List_TopoDS_Shape,
 )
 from OCP.Geom import Geom_BezierCurve, Geom_ConicalSurface, Geom_Curve, Geom_Surface
+from OCP.GeomAbs import GeomAbs_BSplineCurve, GeomAbs_Line
+from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomConvert import GeomConvert
 from OCP.GeomTools import GeomTools
 from OCP.gp import gp_Ax3, gp_Dir, gp_Pln, gp_Pnt, gp_Pnt2d, gp_Trsf, gp_Vec
@@ -43,11 +47,13 @@ from OCP.GProp import GProp_GProps
 from OCP.IntTools import IntTools_Context
 from OCP.ShapeBuild import ShapeBuild_ReShape
 from OCP.ShapeFix import ShapeFix_Shape
-from OCP.Standard import Standard_OutOfMemory
+from OCP.Standard import Standard_OutOfMemory, Standard_OutOfRange
 from OCP.TopAbs import (
     TopAbs_EDGE,
     TopAbs_FACE,
+    TopAbs_FORWARD,
     TopAbs_IN,
+    TopAbs_OUT,
     TopAbs_REVERSED,
     TopAbs_ShapeEnum,
     TopAbs_SOLID,
@@ -63,14 +69,16 @@ from OCP.TopoDS import (
     TopoDS_Vertex,
     TopoDS_Wire,
 )
+from OCP.TopTools import TopTools_FormatVersion_VERSION_3
 from shapely import STRtree
 from shapely.geometry import Polygon, box
 
-from panelchemy import occt, spatial_roof
-from panelchemy.curves import BezierSpan, CurvePolygon, CurveRing
+from panelchemy import native_curves, occt, spatial_roof
+from panelchemy.curves import BezierSpan, CurvePolygon, CurveRing, Point2
 from panelchemy.curves import polygon_lines as polygon_lines
 
 _SPATIAL_EDGE_THRESHOLD = 2048
+_EMPTY_PROTECTED: frozenset[Point2] = frozenset()
 
 
 def _ring_area(ring: CurveRing) -> float:
@@ -145,17 +153,46 @@ def _wire(
     vertices: dict[tuple[float, float], TopoDS_Vertex],
     *,
     draft_compatible: bool = False,
+    consolidate_draft: bool = False,
+    protected_points: frozenset[Point2] = _EMPTY_PROTECTED,
 ) -> TopoDS_Wire:
     builder = BRepBuilderAPI_MakeWire()
-    for span in ring.spans:
-        points = span.control_points
-        for point in (points[0], points[-1]):
+    seam = ring.spans[0].control_points[0]
+    if draft_compatible:
+        # Native draft's treatment of a counter that closes depends on the wire
+        # seam. Retain the source seam and traversal order when joining edges.
+        protected_points = protected_points | {seam}
+    if draft_compatible:
+        runs = (
+            native_curves.draft_runs(ring, protected_points)
+            if consolidate_draft
+            else tuple((span,) for span in ring.spans)
+        )
+    else:
+        runs = native_curves.smooth_runs(ring, protected_points)
+    if draft_compatible:
+        first_run = next(
+            i for i, run in enumerate(runs) if run[0].control_points[0] == seam
+        )
+        runs = (*runs[first_run:], *runs[:first_run])
+    for run in runs:
+        if not run:
+            raise occt.KernelError("a native curve run must not be empty")
+        span = run[0]
+        start, stop = run[0].control_points[0], run[-1].control_points[-1]
+        for point in (start, stop):
             if point not in vertices:
                 vertices[point] = BRepBuilderAPI_MakeVertex(gp_Pnt(*point, z)).Vertex()
-        first, last = vertices[points[0]], vertices[points[-1]]
-        if span.is_line:
+        first, last = vertices[start], vertices[stop]
+        if len(run) > 1:
+            # Each input cubic remains one exact polynomial interval inside a
+            # single B-spline edge. No pole fitting or knot removal is used.
+            curve = native_curves.composite_bspline(run, z)
+            edge = BRepBuilderAPI_MakeEdge(curve, first, last, 0.0, float(len(run)))
+        elif span.is_line:
             edge = BRepBuilderAPI_MakeEdge(first, last)
         else:
+            points = span.control_points
             poles = Array1_gp_Pnt(1, 4)
             for index, point in enumerate(points, 1):
                 poles.SetValue(index, gp_Pnt(*point, z))
@@ -179,12 +216,18 @@ def _wire(
     return builder.Wire()
 
 
-def polygon_face(region: CurvePolygon, z: float = 0) -> TopoDS_Face:
+def polygon_face(
+    region: CurvePolygon,
+    z: float = 0,
+    *,
+    protected_points: frozenset[Point2] = _EMPTY_PROTECTED,
+) -> TopoDS_Face:
     """Construct a native planar cubic/line face, including every counter."""
     if not isfinite(z):
         raise occt.KernelError("curve face height must be finite")
     exterior = _oriented(region.exterior, True)
     holes = tuple(_oriented(ring, False) for ring in region.interiors)
+    protected_points = protected_points | native_curves.protected_vertices([region])
     if all(span.is_line for ring in (exterior, *holes) for span in ring.spans):
         # The polygon adapter nodes mid-edge counter contacts before native
         # construction. This delegation retains exactly the same segments.
@@ -195,10 +238,12 @@ def polygon_face(region: CurvePolygon, z: float = 0) -> TopoDS_Face:
         return occt.polygon_face(polygon, z)
     vertices: dict[tuple[float, float], TopoDS_Vertex] = {}
     builder = BRepBuilderAPI_MakeFace(
-        gp_Pln(gp_Pnt(0, 0, z), gp_Dir(0, 0, 1)), _wire(exterior, z, vertices), True
+        gp_Pln(gp_Pnt(0, 0, z), gp_Dir(0, 0, 1)),
+        _wire(exterior, z, vertices, protected_points=protected_points),
+        True,
     )
     for ring in holes:
-        builder.Add(_wire(ring, z, vertices))
+        builder.Add(_wire(ring, z, vertices, protected_points=protected_points))
     if not builder.IsDone():
         raise occt.KernelError(
             "OpenCascade could not construct the fitted regional face"
@@ -217,7 +262,7 @@ def polygon_face(region: CurvePolygon, z: float = 0) -> TopoDS_Face:
 def _check_roof(
     shape: TopoDS_Shape, region: CurvePolygon, z0: float, z1: float
 ) -> None:
-    if not occt.valid(shape) or occt.volume(shape) <= 0:
+    if not occt.valid(shape):
         raise occt.KernelError("regional curve taper is not a valid positive solid")
     low, high = _bounds(shape)
     if abs(low[2] - z0) > 1e-6 or abs(high[2] - z1) > 1e-6:
@@ -231,6 +276,8 @@ def _check_roof(
         raise occt.KernelError(
             f"regional taper changed its fitted top (missing {missing:.9g}, extra {extra:.9g} square millimeters)"
         )
+    if occt.volume(shape) <= 0:
+        raise occt.KernelError("regional curve taper is not a valid positive solid")
 
 
 def _bounds(
@@ -249,6 +296,8 @@ def _bounds(
 def _flat_ring(ring: CurveRing, tolerance: float) -> list[tuple[float, float]]:
     """Certified chords for validation only; these never construct native CAD."""
     points: list[tuple[float, float]] = []
+    # Scale reference work with input complexity without changing its accuracy.
+    point_limit = min(1_000_000, max(100_000, 512 * len(ring.spans)))
     pending = [(span.control_points, span.is_line, 0) for span in reversed(ring.spans)]
     while pending:
         p, line, depth = pending.pop()
@@ -262,7 +311,7 @@ def _flat_ring(ring: CurveRing, tolerance: float) -> list[tuple[float, float]]:
         if line or flat:
             points.append(p[0])
             continue
-        if depth >= 30 or len(points) + len(pending) > 100_000:
+        if depth >= 30 or len(points) + len(pending) > point_limit:
             raise occt.KernelError(
                 "curve validation subdivision exceeded its resource limit"
             )
@@ -326,12 +375,22 @@ def _check_sections(
 
 def _interior_point(solid: TopoDS_Shape) -> gp_Pnt:
     """Accept a point only after the native solid classifier proves it is IN."""
-    properties = GProp_GProps()
-    _ = BRepGProp.VolumeProperties_s(solid, properties, 1e-11)
-    center = properties.CentreOfMass()
+    low, high = _bounds(solid)
+    if not all(isfinite(value) for point in (low, high) for value in point):
+        raise occt.KernelError("native cell bounds must be finite")
+    center = gp_Pnt(*(a / 2 + b / 2 for a, b in zip(low, high, strict=True)))
     classifier = BRepClass3d_SolidClassifier(solid, center, 1e-8)
     if classifier.State() == TopAbs_IN:
         return center
+    properties = GProp_GProps()
+    # Mass is only a point-finding heuristic here. Its accuracy cannot
+    # authorize a cell; the native IN classification below is the proof.
+    BRepGProp.VolumeProperties_s(solid, properties, OnlyClosed=True)
+    center = properties.CentreOfMass()
+    if all(isfinite(value) for value in center.Coord()):
+        classifier.Perform(center, 1e-8)
+        if classifier.State() == TopAbs_IN:
+            return center
     context = IntTools_Context()
     faces = TopExp_Explorer(solid, TopAbs_FACE)
     while faces.More():
@@ -355,6 +414,19 @@ def _interior_point(solid: TopoDS_Shape) -> gp_Pnt:
     raise occt.KernelError(
         "could not prove an interior point for a regional draft cell"
     )
+
+
+def _cell_interior(solid: TopoDS_Shape) -> gp_Pnt:
+    """Prove a regular cell is bounded and nonempty, without mass integration."""
+    if solid.IsNull() or solid.ShapeType() != TopAbs_SOLID or not occt.valid(solid):
+        raise occt.KernelError("native regional draft produced an invalid solid cell")
+    classifier = BRepClass3d_SolidClassifier(solid)
+    classifier.PerformInfinitePoint(1e-8)
+    if classifier.State() != TopAbs_OUT:
+        raise occt.KernelError("native regional draft produced an unbounded solid cell")
+    # A valid bounded regular solid with a proven interior has positive volume.
+    # Final quantitative mass and STEP checks still use accurate integration.
+    return _interior_point(solid)
 
 
 def _line_wall_sheets(
@@ -386,8 +458,156 @@ def _line_wall_sheets(
     return sheets
 
 
+def _draft_direction(
+    draft: BRepFill_Draft, wire: TopoDS_Wire, *, internal: bool
+) -> bool:
+    """Check the generated wall sense without assuming its surface UV axes."""
+    directions: set[bool] = set()
+    edges = BRepTools_WireExplorer(wire)
+    while edges.More():
+        edge = edges.Current()
+        curve = BRepAdaptor_Curve(edge)
+        point, tangent = gp_Pnt(), gp_Vec()
+        curve.D1((curve.FirstParameter() + curve.LastParameter()) / 2, point, tangent)
+        if edge.Orientation() == TopAbs_REVERSED:
+            tangent.Reverse()
+        if tangent.SquareMagnitude() == 0:
+            raise occt.KernelError("native draft has a stationary generator")
+        tangent.Normalize()
+        right = gp_Vec(tangent.Y(), -tangent.X(), 0)
+        generated = [
+            face
+            for shape in draft.Generated(edge)
+            for face in _entities(shape, TopAbs_FACE)
+        ]
+        if not generated:
+            raise occt.KernelError("native draft lost a source generator")
+        for generated_face in generated:
+            face = TopoDS.Face(generated_face)
+            surface = BRep_Tool.Surface_s(face)
+            projection = GeomAPI_ProjectPointOnSurf(point, surface)
+            if projection.NbPoints() == 0 or projection.LowerDistance() > max(
+                BRep_Tool.Tolerance_s(edge), BRep_Tool.Tolerance_s(face)
+            ):
+                raise occt.KernelError(
+                    "native draft cannot locate its source generator"
+                )
+            u, v = projection.LowerDistanceParameters()
+            position, du, dv = gp_Pnt(), gp_Vec(), gp_Vec()
+            surface.D1(u, v, position, du, dv)
+            # The surface normal and source tangent determine the ruling at
+            # its top, independently of parameter direction and face winding.
+            ruling = du.Crossed(dv).Crossed(tangent)
+            if ruling.Z() > 0:
+                ruling.Reverse()
+            run = ruling.Dot(right)
+            if ruling.Z() == 0 or not isfinite(run) or run == 0:
+                raise occt.KernelError("native draft has an ambiguous taper direction")
+            directions.add((run < 0) == internal)
+        edges.Next()
+    if len(directions) != 1:
+        raise occt.KernelError("native draft has inconsistent taper directions")
+    return directions.pop()
+
+
+class _DraftArrayFailure(occt.KernelError):
+    """Both native draft flags failed before producing inspectable walls."""
+
+
+def _verified_draft(
+    wire: TopoDS_Wire,
+    z0: float,
+    z1: float,
+    slope: float,
+    internal: bool,
+    diagnostics: dict[str, object] | None = None,
+) -> BRepFill_Draft:
+    """Choose only a verified native sense; distinguish the known array failure."""
+    failures: list[Standard_OutOfRange] = []
+    for native_internal in (internal, not internal):
+        try:
+            candidate = BRepFill_Draft(wire, gp_Dir(0, 0, -1), atan(slope))
+            candidate.SetDraft(native_internal)
+            candidate.SetOptions(BRepFill_Modified, 1e-8)
+            candidate.Perform((z1 - z0) / cos(atan(slope)))
+        except Standard_OutOfRange as error:
+            if str(error) != "NCollection_Array1::Value" or _memory_failure(error):
+                raise
+            failures.append(error)
+            continue
+        if candidate.IsDone() and _draft_direction(candidate, wire, internal=internal):
+            if native_internal != internal and diagnostics is not None:
+                diagnostics["corrected_draft_directions"] = (
+                    cast("int", diagnostics.get("corrected_draft_directions", 0)) + 1
+                )
+            return candidate
+    if len(failures) == 2:
+        raise _DraftArrayFailure(
+            "native draft hit NCollection_Array1::Value for both flags"
+        ) from failures[-1]
+    raise occt.KernelError("native draft could not verify the requested direction")
+
+
+def _independent_drafts(
+    edge: TopoDS_Edge,
+    z0: float,
+    z1: float,
+    slope: float,
+    internal: bool,
+    diagnostics: dict[str, object] | None,
+) -> list[BRepFill_Draft]:
+    try:
+        return [
+            _verified_draft(
+                BRepBuilderAPI_MakeWire(edge).Wire(),
+                z0,
+                z1,
+                slope,
+                internal,
+                diagnostics,
+            )
+        ]
+    except _DraftArrayFailure:
+        adapter = BRepAdaptor_Curve(edge)
+        if adapter.GetType() != GeomAbs_BSplineCurve:
+            raise
+        curve = adapter.BSpline()
+        low, high = adapter.FirstParameter(), adapter.LastParameter()
+        drafts: list[BRepFill_Draft] = []
+        for i in range(4):
+            # Trim parameter intervals on the SAME native curve. No control
+            # poles, fitted outlines or approximation tolerances change.
+            part = BRepBuilderAPI_MakeEdge(
+                curve, low + (high - low) * i / 4, low + (high - low) * (i + 1) / 4
+            ).Edge()
+            part.Orientation(edge.Orientation())
+            drafts.append(
+                _verified_draft(
+                    BRepBuilderAPI_MakeWire(part).Wire(),
+                    z0,
+                    z1,
+                    slope,
+                    internal,
+                    diagnostics,
+                )
+            )
+        if diagnostics is not None:
+            diagnostics["subdivided_draft_generators"] = (
+                cast("int", diagnostics.get("subdivided_draft_generators", 0)) + 1
+            )
+        return drafts
+
+
 def _unjoined_sheets(
-    ring: CurveRing, z0: float, z1: float, slope: float, internal: bool
+    ring: CurveRing,
+    z0: float,
+    z1: float,
+    slope: float,
+    internal: bool,
+    *,
+    protected_points: frozenset[Point2] = _EMPTY_PROTECTED,
+    consolidate_draft: bool = False,
+    diagnostics: dict[str, object] | None = None,
 ) -> list[TopoDS_Shape]:
     """Sweep native walls; round only convex material corners separately."""
     angle_tolerance = 1e-8
@@ -398,23 +618,65 @@ def _unjoined_sheets(
     else:
         # The public MakeDraft wrapper maps Transformed back to Right. The
         # direct API preserves the genuinely unjoined curved wall surfaces.
-        draft = BRepFill_Draft(
-            _wire(_oriented(ring, True), z1, {}, draft_compatible=True),
-            gp_Dir(0, 0, -1),
-            atan(slope),
+        wire = _wire(
+            _oriented(ring, True),
+            z1,
+            {},
+            draft_compatible=True,
+            consolidate_draft=consolidate_draft,
+            protected_points=protected_points,
         )
-        draft.SetDraft(internal)
-        draft.SetOptions(BRepFill_Modified, angle_tolerance)
-        draft.Perform((z1 - z0) / cos(atan(slope)))
-        if not draft.IsDone():
-            raise occt.KernelError("native unjoined draft sweep did not complete")
         sheets = []
-        faces = TopExp_Explorer(draft.Shell(), TopAbs_FACE)
-        while faces.More():
-            if not occt.valid(faces.Current()):
-                raise occt.KernelError("native unjoined draft returned an invalid wall")
-            sheets.append(faces.Current())
-            faces.Next()
+
+        def append_faces(draft: BRepFill_Draft) -> None:
+            faces = TopExp_Explorer(draft.Shell(), TopAbs_FACE)
+            while faces.More():
+                if not occt.valid(faces.Current()):
+                    raise occt.KernelError(
+                        "native unjoined draft returned an invalid wall"
+                    )
+                sheets.append(faces.Current())
+                faces.Next()
+
+        try:
+            draft = _verified_draft(wire, z0, z1, slope, internal, diagnostics)
+        except _DraftArrayFailure:
+            # These are open native wall sweeps, not per-edge closed solids.
+            # Ring-level corner patches below still resolve the same joins.
+            if diagnostics is not None:
+                diagnostics["per_edge_draft_rings"] = (
+                    cast("int", diagnostics.get("per_edge_draft_rings", 0)) + 1
+                )
+            edges = BRepTools_WireExplorer(wire)
+            generator = 0
+            while edges.More():
+                edge = edges.Current()
+                try:
+                    if BRepAdaptor_Curve(edge).GetType() == GeomAbs_Line:
+                        first = BRep_Tool.Pnt_s(TopExp.FirstVertex_s(edge, True))
+                        last = BRep_Tool.Pnt_s(TopExp.LastVertex_s(edge, True))
+                        a, b = (first.X(), first.Y()), (last.X(), last.Y())
+                        if internal:
+                            a, b = b, a
+                        line = BezierSpan((a, a, b, b), True)
+                        sheets.extend(
+                            _line_wall_sheets(CurveRing((line,)), z0, z1, slope)
+                        )
+                    else:
+                        for draft in _independent_drafts(
+                            edge, z0, z1, slope, internal, diagnostics
+                        ):
+                            append_faces(draft)
+                except Exception as error:
+                    if _memory_failure(error):
+                        raise
+                    raise occt.KernelError(
+                        f"native independent draft generator {generator} failed: {error}"
+                    ) from error
+                generator += 1
+                edges.Next()
+        else:
+            append_faces(draft)
     for index, span in enumerate(material.spans):
         previous = material.spans[index - 1]
         a, b = previous.control_points, span.control_points
@@ -889,6 +1151,7 @@ def _preimprint_sheets(
             builder = BOPAlgo_Builder()
             builder.SetArguments(shapes)
             builder.SetNonDestructive(True)
+            builder.SetUseOBB(True)
             builder.SetToFillHistory(True)
             builder.Perform()
             if builder.HasErrors():
@@ -929,6 +1192,95 @@ def _preimprint_sheets(
     return result
 
 
+def _memory_failure(error: BaseException | None) -> bool:
+    """Boolean adapters can wrap resource failures in their kernel exception."""
+    while error is not None:
+        if isinstance(error, (MemoryError, Standard_OutOfMemory)):
+            return True
+        error = error.__cause__
+    return False
+
+
+def _fuse_draft_cells(
+    cells: Sequence[TopoDS_Shape], diagnostics: dict[str, object] | None = None
+) -> TopoDS_Shape:
+    """Fuse sibling cells from one arrangement, reusing its shared interfaces."""
+
+    def physical_bytes(cell: TopoDS_Shape) -> bytes:
+        stream = BytesIO()
+        BRepTools.Write_s(cell, stream, False, False, TopTools_FormatVersion_VERSION_3)
+        return stream.getvalue()
+
+    before = [physical_bytes(cell) for cell in cells]
+    result = None
+    try:
+        result = occt.fuse(cells)
+    except occt.KernelError as error:
+        if len(cells) < 2 or _memory_failure(error):
+            raise
+        if diagnostics is not None:
+            diagnostics["partition_union_failure"] = str(error)
+    if before != [physical_bytes(cell) for cell in cells]:
+        raise occt.KernelError(
+            "native partition union changed input geometry or precision"
+        )
+    if result is not None:
+        return result
+    if len(cells) * (len(cells) - 1) // 2 > 16384:
+        raise occt.KernelError("native partition glue exceeds 16,384 cell pairs")
+    if any(
+        cell.ShapeType() != TopAbs_SOLID
+        or not occt.valid(cell)
+        or occt.volume(cell) <= 0
+        for cell in cells
+    ):
+        raise occt.KernelError("native partition glue requires valid positive solids")
+
+    faces = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+    owners: dict[int, list[tuple[int, TopoDS_Shape]]] = {}
+    for index, cell in enumerate(cells):
+        for face in _entities(cell, TopAbs_FACE):
+            owners.setdefault(faces.Add(face), []).append((index, face))
+    adjacent = [set[int]() for _ in cells]
+    for uses in owners.values():
+        if len(uses) == 1:
+            continue
+        if len(uses) != 2 or {face.Orientation() for _, face in uses} != {
+            TopAbs_FORWARD,
+            TopAbs_REVERSED,
+        }:
+            raise occt.KernelError(
+                "native partition faces lack opposite sibling owners"
+            )
+        a, b = uses[0][0], uses[1][0]
+        adjacent[a].add(b)
+        adjacent[b].add(a)
+    reached, pending = {0}, [0]
+    while pending:
+        for neighbor in adjacent[pending.pop()] - reached:
+            reached.add(neighbor)
+            pending.append(neighbor)
+    if len(reached) != len(cells):
+        raise occt.KernelError("native partition glue lacks connected shared faces")
+
+    for index, cell in enumerate(cells):
+        for previous in cells[:index]:
+            if occt.volume(occt.common(previous, cell)) != 0:
+                raise occt.KernelError("native partition glue cells overlap in volume")
+    operation = BRepAlgoAPI_Fuse()
+    operation.SetGlue(BOPAlgo_GlueFull)
+    result = occt._boolean(  # pyright: ignore[reportPrivateUsage]
+        operation, cells[:1], cells[1:], "native partition glue"
+    )
+    if before != [physical_bytes(cell) for cell in cells]:
+        raise occt.KernelError(
+            "native partition glue changed input geometry or precision"
+        )
+    if diagnostics is not None:
+        diagnostics["glued_draft_cells"] = len(cells)
+    return result
+
+
 def _surface_region(
     region: CurvePolygon,
     z0: float,
@@ -937,9 +1289,16 @@ def _surface_region(
     *,
     diagnostics: dict[str, object] | None = None,
     preimprint: bool = False,
+    protected_points: frozenset[Point2] = _EMPTY_PROTECTED,
+    consolidate_draft: bool = False,
 ) -> TopoDS_Shape:
     """Intersect native walls, repair singular boundaries, select material cells."""
-    source = polygon_face(region, z1)
+    protected_points = protected_points | native_curves.protected_vertices([region])
+    source = polygon_face(region, z1, protected_points=protected_points)
+    if diagnostics is not None:
+        diagnostics["input_native_edges"] = len(_entities(source, TopAbs_EDGE))
+        diagnostics["corrected_draft_directions"] = 0
+        diagnostics["per_edge_draft_rings"] = 0
     low, high = _bounds(source)
     run = slope * (z1 - z0)
     margin = max(1e-3, run * 0.01)
@@ -956,7 +1315,20 @@ def _surface_region(
         (region.exterior, False),
         *((ring, True) for ring in region.interiors),
     ):
-        sheets.extend(_unjoined_sheets(ring, z0 - margin, z1, slope, internal))
+        sheets.extend(
+            _unjoined_sheets(
+                ring,
+                z0 - margin,
+                z1,
+                slope,
+                internal,
+                protected_points=protected_points,
+                consolidate_draft=consolidate_draft,
+                diagnostics=diagnostics,
+            )
+        )
+    if diagnostics is not None:
+        diagnostics["native_draft_wall_faces"] = len(sheets)
     if preimprint:
         sheets = _preimprint_sheets(sheets, diagnostics)
     for sheet in sheets:
@@ -966,16 +1338,13 @@ def _surface_region(
     maker.SetIntersect(True)
     maker.SetAvoidInternalShapes(True)
     maker.SetNonDestructive(True)
+    maker.SetUseOBB(True)
     maker.Perform()
     if maker.HasErrors():
         raise occt.KernelError("native regional surface arrangement failed")
     selected: list[TopoDS_Shape] = []
     for cell in _resolve_draft_cells(maker.Shape(), source, z1, slope, diagnostics):
-        if not occt.valid(cell) or occt.volume(cell) <= 0:
-            raise occt.KernelError(
-                "native regional draft produced invalid cells; cannot certify this surface arrangement"
-            )
-        point = _interior_point(cell)
+        point = _cell_interior(cell)
         projection = BRepBuilderAPI_MakeVertex(
             gp_Pnt(point.X(), point.Y(), z1)
         ).Vertex()
@@ -991,7 +1360,9 @@ def _surface_region(
         diagnostics["selected_draft_cells"] = len(selected)
     if not selected:
         raise occt.KernelError("native regional draft did not enclose source material")
-    return occt.fuse(selected)
+    return (
+        _fuse_draft_cells(selected, diagnostics) if preimprint else occt.fuse(selected)
+    )
 
 
 def roof(
@@ -1002,11 +1373,16 @@ def roof(
     prefer_fast: bool = True,
     *,
     diagnostics: dict[str, object] | None = None,
+    protected_points: frozenset[Point2] = _EMPTY_PROTECTED,
+    consolidate_draft: bool = False,
 ) -> tuple[TopoDS_Shape, str]:
     """Build a regional solid from intersecting native taper boundary surfaces.
 
     ``prefer_fast`` remains accepted for the polygon adapter's existing callers;
     positive fitted tapers use the same native wall arrangement in either mode.
+    ``consolidate_draft`` is experimental: native approximation of composite
+    profiles can fail the unchanged top-preservation checks. Planar faces and
+    zero-taper extrusions always use exact smooth-run consolidation.
     """
     _ = prefer_fast
     if (
@@ -1025,13 +1401,16 @@ def roof(
     if diagnostics is not None:
         diagnostics.update(
             input_native_edges=native_edges,
+            input_outline_spans=native_edges,
             counter_count=len(region.interiors),
             taper_run_per_height=run_per_height,
+            consolidated_draft=consolidate_draft,
         )
     if run_per_height == 0:
-        shape = BRepPrimAPI_MakePrism(
-            polygon_face(region, z0), gp_Vec(0, 0, z1 - z0)
-        ).Shape()
+        source = polygon_face(region, z0, protected_points=protected_points)
+        if diagnostics is not None:
+            diagnostics["input_native_edges"] = len(_entities(source, TopAbs_EDGE))
+        shape = BRepPrimAPI_MakePrism(source, gp_Vec(0, 0, z1 - z0)).Shape()
         _check_roof(shape, region, z0, z1)
         return shape, "prism"
     if native_edges > _SPATIAL_EDGE_THRESHOLD and all(
@@ -1082,40 +1461,46 @@ def roof(
                 f"OpenCascade could not construct a verified spatial regional taper: {error}"
             ) from error
     try:
-        shape = _surface_region(region, z0, z1, run_per_height, diagnostics=diagnostics)
+        shape = _surface_region(
+            region,
+            z0,
+            z1,
+            run_per_height,
+            diagnostics=diagnostics,
+            protected_points=protected_points,
+            consolidate_draft=consolidate_draft,
+        )
         _check_roof(shape, region, z0, z1)
         _check_sections(shape, region, z0, z1, run_per_height)
         return shape, "surface"
     except (MemoryError, Standard_OutOfMemory):
         raise
     except Exception as error:
+        if _memory_failure(error):
+            raise
         if diagnostics is not None:
             diagnostics["surface_failure"] = str(error)
-        if all(
-            span.is_line
-            for ring in (region.exterior, *region.interiors)
-            for span in ring.spans
-        ):
-            try:
-                shape = _surface_region(
-                    region,
-                    z0,
-                    z1,
-                    run_per_height,
-                    diagnostics=diagnostics,
-                    preimprint=True,
-                )
-                _check_roof(shape, region, z0, z1)
-                _check_sections(shape, region, z0, z1, run_per_height)
-                return shape, "surface-preimprint"
-            except (MemoryError, Standard_OutOfMemory):
+        try:
+            shape = _surface_region(
+                region,
+                z0,
+                z1,
+                run_per_height,
+                diagnostics=diagnostics,
+                preimprint=True,
+                protected_points=protected_points,
+                consolidate_draft=consolidate_draft,
+            )
+            _check_roof(shape, region, z0, z1)
+            _check_sections(shape, region, z0, z1, run_per_height)
+            return shape, "surface-preimprint"
+        except (MemoryError, Standard_OutOfMemory):
+            raise
+        except Exception as preimprint_error:
+            if _memory_failure(preimprint_error):
                 raise
-            except Exception as preimprint_error:
-                if diagnostics is not None:
-                    diagnostics["preimprint_failure"] = str(preimprint_error)
-                raise occt.KernelError(
-                    f"OpenCascade could not construct a verified native regional taper: {error}; native pair preimprint: {preimprint_error}"
-                ) from preimprint_error
-        raise occt.KernelError(
-            f"OpenCascade could not construct a verified native regional taper: {error}"
-        ) from error
+            if diagnostics is not None:
+                diagnostics["preimprint_failure"] = str(preimprint_error)
+            raise occt.KernelError(
+                f"OpenCascade could not construct a verified native regional taper: {error}; native pair preimprint: {preimprint_error}"
+            ) from preimprint_error

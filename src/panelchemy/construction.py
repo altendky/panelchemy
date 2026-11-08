@@ -1,9 +1,10 @@
-"""Configurable physical construction; nozzle metadata never removes features."""
+"""Configurable construction and nozzle-derived tracing guidance."""
 
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
-from math import isclose, isfinite, radians, tan
+from fractions import Fraction
+from math import ceil, isclose, isfinite, radians, tan
 from pathlib import Path
 from typing import Literal, Self, cast
 
@@ -44,6 +45,8 @@ class ConstructionProfile:
     rim_width_mm: float = 0.2
     contour_tolerance_mm: float = 0.0
     contour_mode: ContourMode = "curves"
+    corner_softening_mm: float = 0.0
+    span_simplification_mm: float = 0.0
 
     def __post_init__(self) -> None:
         for field in fields(self):
@@ -56,9 +59,13 @@ class ConstructionProfile:
                     raise ValueError(
                         "taper_angle_deg must be at least 0 and less than 90"
                     )
-            elif field.name == "contour_tolerance_mm":
+            elif field.name in {
+                "contour_tolerance_mm",
+                "corner_softening_mm",
+                "span_simplification_mm",
+            }:
                 if value < 0:
-                    raise ValueError("contour_tolerance_mm must be non-negative")
+                    raise ValueError(f"{field.name} must be non-negative")
             elif value <= 0:
                 raise ValueError(f"{field.name} must be positive")
         for thickness in (
@@ -77,6 +84,16 @@ class ConstructionProfile:
                 )
         if not isfinite(self.orange_top) or not isfinite(self.white_top):
             raise ValueError("combined material heights must remain finite")
+        if not isfinite(2 * self.assumed_line_width_mm) or self.tracing_radius_mm <= 0:
+            raise ValueError(
+                "nozzle diameter must produce finite positive tracing scales"
+            )
+        if self.corner_softening_mm > self.tracing_radius_mm:
+            raise ValueError("corner_softening_mm must not exceed the tracing radius")
+        if self.span_simplification_mm > self.tracing_radius_mm:
+            raise ValueError(
+                "span_simplification_mm must not exceed the tracing radius"
+            )
 
     @property
     def black_top(self) -> float:
@@ -93,6 +110,29 @@ class ConstructionProfile:
     @property
     def taper_run_per_height(self) -> float:
         return tan(radians(self.taper_angle_deg))
+
+    @property
+    def assumed_line_width_mm(self) -> float:
+        """Planning assumption, rather than an encoded slicer setting."""
+        return 1.25 * self.nozzle_diameter_mm
+
+    @property
+    def tracing_radius_mm(self) -> float:
+        """Detail-significance scale; does not prescribe circular fillets."""
+        return self.assumed_line_width_mm / 2
+
+    @property
+    def minimum_source_long_edge_pixels(self) -> int:
+        """Four independent source samples per assumed printed line width."""
+        return ceil(
+            4 * Fraction(self.long_edge_mm) / Fraction(self.assumed_line_width_mm)
+        )
+
+    @property
+    def preferred_source_long_edge_pixels(self) -> int:
+        return ceil(
+            8 * Fraction(self.long_edge_mm) / Fraction(self.assumed_line_width_mm)
+        )
 
     def as_dict(self) -> dict[str, float | str]:
         return {
