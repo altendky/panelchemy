@@ -1,5 +1,41 @@
 # Tracing Performance
 
+## Partial Rust Proof Batches
+
+The continuous bidirectional geometric-distance certificate has a Rust kernel
+exposed through `panelchemy._native`. It retains exact rational acceptance
+checks and conservative spatial candidate selection. Serial native execution
+did not improve the measured real workload, so individual `within_paths` calls
+retain the Python implementation. The `within_paths_many` API uses a bounded
+thread pool for independent native proof jobs, with four workers by default.
+A single job retains the Python path.
+
+An evaluation of 18 saved real proof jobs measured:
+
+| Execution | Seconds |
+| --- | ---: |
+| Python, serial | 32.77 |
+| Rust, serial | 34.02 |
+| Rust, four threads | 20.24 |
+
+All 18 Boolean proof results matched. The threaded batch was about 1.62 times
+faster than serial Python in this trial; the serial native path was slower.
+These timings concern isolated proof jobs, not a complete conversion or model
+export, and do not establish an end-to-end speedup.
+
+Contact refinement batches only uncached, independent baseline ring proofs
+during preparation, before its candidate-search deadline starts. Input
+validation, source-distance tolerances, proof resource bounds, and subsequent
+shared palette/topology checks remain unchanged. The Python implementation
+remains a differential-test oracle and handles inputs outside the lossless
+native numeric interface. The extension remains required; native import or
+execution errors do not silently select the reference implementation.
+
+This moves one proof workload into native parallel execution. Spline
+optimization, curvature search, global palette/topology verification, and CAD
+construction remain separate. The historical benchmarks below describe their
+recorded versions, rather than this batch implementation.
+
 ## Measurements
 
 The November 2026 investigation used the 250 mm evaluation Lynx, a 0.2 mm

@@ -30,8 +30,33 @@ dev = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.13,<0.14"]
-build-backend = "uv_build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+manifest-path = "rust/Cargo.toml"
+module-name = "panelchemy._native"
+python-source = "src"
+bindings = "pyo3"
+profile = "release"
+locked = true
+include = [
+  { path = "rust/Cargo.toml", format = "sdist" },
+  { path = "rust/Cargo.lock", format = "sdist" },
+  { path = "rust/src/**/*.rs", format = "sdist" },
+]
+
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "src/panelchemy/**/*.py" },
+  { file = "src/panelchemy/**/*.pyi" },
+  { file = "src/panelchemy/py.typed" },
+  { file = "src/panelchemy/web/**/*" },
+  { file = "rust/Cargo.toml" },
+  { file = "rust/Cargo.lock" },
+  { file = "rust/src/**/*.rs" },
+]
 
 [tool.pytest.ini_options]
 addopts = "-ra"

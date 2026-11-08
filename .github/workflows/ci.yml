@@ -70,7 +70,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
         with:
-          install_args: python uv
+          install_args: python rust uv
       - run: uv sync --locked --python "$PYTHON_VERSION"
       - run: uv run --locked --python "$PYTHON_VERSION" ruff format --check src scripts tests
       - run: uv run --locked --python "$PYTHON_VERSION" ruff check src scripts tests
@@ -92,21 +92,40 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
         with:
-          install_args: python uv
+          install_args: python rust uv
       - name: Build distributions
         run: uv build --python "$PYTHON_VERSION"
+      - name: Check Rust sources in source distribution
+        run: >-
+          uv run --isolated --no-project --python "$PYTHON_VERSION" python -c
+          "from pathlib import Path; import tarfile; names = tarfile.open(next(Path('dist').glob('*.tar.gz'))).getnames(); assert all(any(name.endswith('/' + expected) for name in names) for expected in ('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/src/lib.rs'))"
       - name: Test conversion behavior
         run: uv run --locked --python "$PYTHON_VERSION" pytest --cov=panelchemy --cov-report=term-missing
       - name: Check installed wheel entry point
         run: |
           uv run --isolated --no-project --python "$PYTHON_VERSION" --with dist/*.whl panelchemy --version
           uv run --isolated --no-project --python "$PYTHON_VERSION" --with dist/*.whl python -m panelchemy --help
+          uv run --isolated --no-project --python "$PYTHON_VERSION" --with dist/*.whl python -c "from importlib.machinery import EXTENSION_SUFFIXES; from panelchemy import _native; assert any(_native.__file__.endswith(suffix) for suffix in EXTENSION_SUFFIXES)"
           uv run --isolated --no-project --python "$PYTHON_VERSION" --with dist/*.whl python -c "from importlib.resources import files; root = files('panelchemy').joinpath('web'); assert all(root.joinpath(name).read_bytes() for name in ('index.html', 'app.js', 'style.css'))"
+
+  rust:
+    name: Rust format, lint, and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
+        with:
+          install_args: python rust
+      - run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path rust/Cargo.toml --all-targets --locked --release -- -D warnings
+      - run: cargo test --manifest-path rust/Cargo.toml --locked --release
 
   all:
     name: all
     if: ${{ !cancelled() }}
-    needs: [python-versions, mise, pre-commit, python, build, browser]
+    needs: [python-versions, mise, pre-commit, python, build, rust, browser]
     runs-on: ubuntu-latest
     steps:
       - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # release/v1
@@ -125,7 +144,7 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5
         with:
-          install_args: node python uv
+          install_args: node python rust uv
       - run: uv sync --locked
       - run: npm ci
         working-directory: browser-tests

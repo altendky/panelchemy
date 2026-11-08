@@ -4,6 +4,7 @@
 # pyright: reportPrivateUsage=false
 
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from itertools import pairwise
 from math import inf, isfinite, nextafter
@@ -13,6 +14,7 @@ from shapely import STRtree
 from shapely.geometry import box
 
 from panelchemy import curves as c
+from panelchemy._native import within_paths as _native_within_paths
 
 type _Point = c.RationalPoint
 type _Segment = tuple[_Point, _Point]
@@ -20,6 +22,7 @@ _MAX_DEPTH = 24
 _MAX_NODES = 100_000
 _INDEX_MIN_SEGMENTS = 32
 _PROXY_REFINEMENTS = 3
+type DistanceJob = tuple[Sequence[Sequence[c.Point2]], Sequence[c.BezierSpan], float]
 
 
 @final
@@ -237,17 +240,11 @@ def within_distance(
     return within_paths((source_points,), spans, tolerance_mm)
 
 
-def within_paths(
+def _validate_paths(
     source_paths: Sequence[Sequence[c.Point2]],
     spans: Sequence[c.BezierSpan],
     tolerance_mm: float,
-) -> bool:
-    """Certify bidirectional Hausdorff distance without matching parameters.
-
-    Paths remain disconnected; no artificial segment joins their endpoints.
-    False includes inconclusive bounds or exhausted resources. Topology and
-    exact joins are checked by the caller. No sampled estimate authorizes a fit.
-    """
+) -> None:
     if (
         isinstance(tolerance_mm, bool)
         or not isfinite(tolerance_mm)
@@ -270,6 +267,88 @@ def within_paths(
         raise ValueError(
             "distance certification requires finite planar paths and nonnegative tolerance"
         )
+
+
+def within_paths(
+    source_paths: Sequence[Sequence[c.Point2]],
+    spans: Sequence[c.BezierSpan],
+    tolerance_mm: float,
+) -> bool:
+    """Certify one job with the faster serial Python rational implementation."""
+    return _within_paths_python(source_paths, spans, tolerance_mm)
+
+
+def within_paths_many(jobs: Sequence[DistanceJob], *, workers: int = 4) -> list[bool]:
+    """Certify independent jobs in stable order, each with its own proof budget.
+
+    Native computations release the interpreter lock. Isolated checks retain
+    the faster serial reference; a batch amortizes executor overhead. No shared
+    geometry is edited here, and every result needs the caller's topology gate.
+    """
+    count = cast("object", workers)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        raise ValueError("certificate workers must be a positive integer")
+    if len(jobs) < 2 or count == 1:
+        return [within_paths(*job) for job in jobs]
+
+    def certify(job: DistanceJob) -> bool:
+        return _within_paths_native(*job)
+
+    with ThreadPoolExecutor(max_workers=min(count, len(jobs))) as executor:
+        return list(executor.map(certify, jobs))
+
+
+def _within_paths_native(
+    source_paths: Sequence[Sequence[c.Point2]],
+    spans: Sequence[c.BezierSpan],
+    tolerance_mm: float,
+) -> bool:
+    """Certify continuous bidirectional distance in the Rust computation core.
+
+    Disconnected paths, exact line handles, proxy headroom, and shared resource
+    limits retain the reference algorithm's semantics. Non-binary64 values use
+    the Python rational implementation to preserve their exact numeric value.
+    False includes inconclusive proofs; topology remains a separate check.
+    """
+    _validate_paths(source_paths, spans, tolerance_mm)
+    values = (
+        tolerance_mm,
+        *(v for path in source_paths for point in path for v in point),
+        *(v for span in spans for point in span.control_points for v in point),
+    )
+    if (
+        any(float(value) != value for value in values)
+        or _MAX_DEPTH < 0
+        or _PROXY_REFINEMENTS < 0
+    ):
+        return _within_paths_python(source_paths, spans, tolerance_mm)
+    return _native_within_paths(
+        [[(float(x), float(y)) for x, y in path] for path in source_paths],
+        [
+            (
+                cast(
+                    "c.Controls",
+                    tuple((float(x), float(y)) for x, y in span.control_points),
+                ),
+                bool(span.is_line),
+            )
+            for span in spans
+        ],
+        float(tolerance_mm),
+        max(0, _MAX_NODES),
+        _MAX_DEPTH,
+        _PROXY_REFINEMENTS,
+        max(0, _INDEX_MIN_SEGMENTS),
+    )
+
+
+def _within_paths_python(
+    source_paths: Sequence[Sequence[c.Point2]],
+    spans: Sequence[c.BezierSpan],
+    tolerance_mm: float,
+) -> bool:
+    """Exact Python reference, also preserving non-binary64 input values."""
+    _validate_paths(source_paths, spans, tolerance_mm)
     segments = tuple(
         segment
         for path in source_paths

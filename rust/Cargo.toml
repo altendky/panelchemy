@@ -1,0 +1,22 @@
+[package]
+name = "panelchemy-native"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+description = "Exact source-distance certification for Panelchemy"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+num-bigint = "0.4.6"
+num-rational = "0.4.2"
+num-traits = "0.2.19"
+pyo3 = { version = "0.30.1", features = ["abi3-py312", "extension-module"] }
+rstar = "0.14.0"
+
+[lints.rust]
+unsafe_code = "forbid"

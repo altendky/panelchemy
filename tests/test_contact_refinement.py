@@ -490,6 +490,88 @@ def test_source_cache_tracks_original_group_and_exact_selected_coefficients(
     assert calls == 6
 
 
+def test_baseline_batch_caches_true_and_false_deduplicates_and_preserves_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, contours, _ = example()
+    paths = tuple(tuple(path) for path in cr._paths([source.white[0]]))
+    spans = contours.white[0].exterior.spans
+    first: geometric_distance.DistanceJob = paths, spans, 0.2
+    second: geometric_distance.DistanceJob = paths, spans, 0.1
+    third: geometric_distance.DistanceJob = paths, spans, 0.3
+    calls: list[list[geometric_distance.DistanceJob]] = []
+
+    def certify(jobs: Sequence[geometric_distance.DistanceJob]) -> list[bool]:
+        calls.append(list(jobs))
+        return [job[2] < 0.2 for job in jobs]
+
+    def unexpected_single(*_args: object) -> bool:
+        raise AssertionError("cached baseline proofs must be shared with candidates")
+
+    monkeypatch.setattr(geometric_distance, "within_paths_many", certify)
+    monkeypatch.setattr(geometric_distance, "within_paths", unexpected_single)
+    cache: dict[cr._DistanceKey, bool] = {}
+    assert cr._source_certificates([first, second, first], cache) == [
+        False,
+        True,
+        False,
+    ]
+    assert calls == [[first, second]] and len(cache) == 2
+    assert cr._source_certificates([second, first, second], cache) == [
+        True,
+        False,
+        True,
+    ]
+    assert not cr._source_certificate(paths, spans, 0.2, cache)
+    assert cr._source_certificate(paths, spans, 0.1, cache)
+    assert cr._source_certificates([], cache) == []
+    assert calls == [[first, second]]
+    assert cr._source_certificates([second, third, first, third], cache) == [
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert calls == [[first, second], [third]] and len(cache) == 3
+
+
+def test_baseline_batch_invalidates_each_exact_source_or_curve_key_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, contours, _ = example()
+    paths = tuple(tuple(path) for path in cr._paths(source.white))
+    spans = contours.white[0].exterior.spans
+    first = spans[0]
+    moved = replace(
+        first,
+        control_points=cast(
+            "c.Controls", tuple((x + 0.1, y) for x, y in first.control_points)
+        ),
+    )
+    jobs: list[geometric_distance.DistanceJob] = [
+        (paths, spans, 0.2),
+        (tuple(reversed(paths)), spans, 0.2),
+        ((tuple(reversed(paths[0])), *paths[1:]), spans, 0.2),
+        (paths[:1], spans, 0.2),
+        (paths, tuple(reversed(spans)), 0.2),
+        (paths, (replace(first, is_line=not first.is_line), *spans[1:]), 0.2),
+        (paths, (moved, *spans[1:]), 0.2),
+        (paths, spans, 0.1),
+    ]
+    calls: list[list[geometric_distance.DistanceJob]] = []
+
+    def certify(selected: Sequence[geometric_distance.DistanceJob]) -> list[bool]:
+        calls.append(list(selected))
+        return [True] * len(selected)
+
+    monkeypatch.setattr(geometric_distance, "within_paths_many", certify)
+    cache: dict[cr._DistanceKey, bool] = {}
+    assert all(cr._source_certificates(jobs, cache))
+    assert calls == [jobs] and len(cache) == len(jobs)
+    assert all(cr._source_certificates(jobs, cache))
+    assert calls == [jobs]
+
+
 def test_identical_holeless_pair_and_union_reuse_a_failed_exact_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -531,7 +613,11 @@ def test_baseline_preparation_has_explicit_time_accounting_outside_search(
         elapsed += 50.0
         return True
 
+    def certificates(jobs: Sequence[geometric_distance.DistanceJob]) -> list[bool]:
+        return [certificate() for _ in jobs]
+
     monkeypatch.setattr(cr, "_source_certificate", certificate)
+    monkeypatch.setattr(geometric_distance, "within_paths_many", certificates)
     monkeypatch.setattr(cr, "monotonic", lambda: elapsed)
     _, _, report = refine(source, contours, proxy)
     assert report["changed"] is True

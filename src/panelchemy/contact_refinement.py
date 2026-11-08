@@ -54,23 +54,48 @@ def _paths(polygons: Sequence[Polygon]) -> list[list[c.Point2]]:
     ]
 
 
+def _distance_key(
+    paths: Sequence[_Path],
+    spans: Sequence[c.BezierSpan],
+    tolerance: float,
+) -> _DistanceKey:
+    # This cache lives for one refine call. Both original paths and selected
+    # coefficients are part of the key, so an accepted edit cannot reuse an
+    # older proof for the changed ring or its enlarged original source group.
+    return (
+        tuple(paths),
+        tuple((s.is_line, s.control_points) for s in spans),
+        tolerance,
+    )
+
+
 def _source_certificate(
     paths: Sequence[_Path],
     spans: Sequence[c.BezierSpan],
     tolerance: float,
     cache: dict[_DistanceKey, bool],
 ) -> bool:
-    # This cache lives for one refine call. Both original paths and selected
-    # coefficients are part of the key, so an accepted edit cannot reuse an
-    # older proof for the changed ring or its enlarged original source group.
-    key = (
-        tuple(paths),
-        tuple((s.is_line, s.control_points) for s in spans),
-        tolerance,
-    )
+    key = _distance_key(paths, spans, tolerance)
     if key not in cache:
         cache[key] = geometric_distance.within_paths(paths, spans, tolerance)
     return cache[key]
+
+
+def _source_certificates(
+    jobs: Sequence[geometric_distance.DistanceJob], cache: dict[_DistanceKey, bool]
+) -> list[bool]:
+    keys = [
+        _distance_key(tuple(tuple(path) for path in paths), spans, tolerance)
+        for paths, spans, tolerance in jobs
+    ]
+    missing: dict[_DistanceKey, geometric_distance.DistanceJob] = {}
+    for key, job in zip(keys, jobs, strict=True):
+        if key not in cache:
+            _ = missing.setdefault(key, job)
+    if missing:
+        results = geometric_distance.within_paths_many(list(missing.values()))
+        cache.update(zip(missing, results, strict=True))
+    return [cache[key] for key in keys]
 
 
 def _ordered_reference(
@@ -495,10 +520,13 @@ def refine(
                 for ring in (original.exterior, *original.interiors)
             ]
         paths = source_groups[source_key]
-        baseline = [
-            _source_certificate(group, ring.spans, tolerance_mm, certificates)
-            for group, ring in zip(paths, parent_rings, strict=True)
-        ]
+        baseline = _source_certificates(
+            [
+                (group, ring.spans, tolerance_mm)
+                for group, ring in zip(paths, parent_rings, strict=True)
+            ],
+            certificates,
+        )
         tip_paths = tuple(
             tuple(path)
             for path in _paths([_source(source, contact.color)[i] for i in members])
