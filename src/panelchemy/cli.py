@@ -1,4 +1,4 @@
-"""Local command-line adapter for separation, relief, and model export."""
+"""Local command-line adapter for artwork previews, relief, and model export."""
 
 import json
 from argparse import ArgumentParser
@@ -26,6 +26,28 @@ def main() -> None:
     _ = separation.add_argument("--output", type=Path, required=True)
     _ = separation.add_argument("--config", type=Path)
     _ = separation.add_argument("--silhouette-mask", type=Path)
+    cleanup = commands.add_parser("cleanup", help="preview optional raster cleanup")
+    _ = cleanup.add_argument("input", type=Path)
+    _ = cleanup.add_argument("--output", type=Path, required=True)
+    _ = cleanup.add_argument("--config", type=Path)
+    _ = cleanup.add_argument("--profile", type=Path)
+    _ = cleanup.add_argument("--silhouette-mask", type=Path)
+    _ = cleanup.add_argument(
+        "--minimum-width-mm",
+        type=float,
+        help="cleanup scale; defaults to the profile setting or assumed line width",
+    )
+    stroke_preview = commands.add_parser(
+        "stroke-preview", help="inspect bounded stroke-growth proposals without CAD"
+    )
+    _ = stroke_preview.add_argument("input", type=Path)
+    _ = stroke_preview.add_argument("--output", type=Path, required=True)
+    _ = stroke_preview.add_argument("--config", type=Path)
+    _ = stroke_preview.add_argument("--profile", type=Path)
+    _ = stroke_preview.add_argument("--silhouette-mask", type=Path)
+    _ = stroke_preview.add_argument("--target-width-mm", type=float)
+    _ = stroke_preview.add_argument("--max-growth-mm", type=float)
+    _ = stroke_preview.add_argument("--compact-cleanup-mm", type=float)
     local_server = commands.add_parser("serve", help="open the local browser workflow")
     _ = local_server.add_argument("--port", type=int, default=8765)
     _ = local_server.add_argument("--max-pixels", type=int, default=4_000_000)
@@ -68,6 +90,66 @@ def main() -> None:
                     max_request_bytes=cast("int", args.max_request_mib) * 1024 * 1024,
                 ),
             )
+            return
+        if cast("str", args.command) == "stroke-preview":
+            from panelchemy.construction import load_profile
+            from panelchemy.stroke_retention_artifacts import (
+                process_stroke_preview_file,
+            )
+
+            config_path = cast("Path | None", args.config)
+            profile_path = cast("Path | None", args.profile)
+            profile = load_profile(profile_path)
+            target_width = cast("float | None", args.target_width_mm)
+            max_growth = cast("float | None", args.max_growth_mm)
+            compact_cleanup = cast("float | None", args.compact_cleanup_mm)
+            manifest = process_stroke_preview_file(
+                cast("Path", args.input),
+                cast("Path", args.output),
+                load_config(config_path),
+                long_edge_mm=profile.long_edge_mm,
+                target_width_mm=profile.assumed_line_width_mm
+                if target_width is None
+                else target_width,
+                max_growth_mm=profile.tracing_radius_mm
+                if max_growth is None
+                else max_growth,
+                compact_cleanup_mm=profile.raster_cleanup_mm
+                if compact_cleanup is None
+                else compact_cleanup,
+                silhouette_path=cast("Path | None", args.silhouette_mask),
+                protected_paths=tuple(
+                    p for p in (config_path, profile_path) if p is not None
+                ),
+            )
+            print(json.dumps(manifest, indent=2, sort_keys=True))
+            return
+        if cast("str", args.command) == "cleanup":
+            from panelchemy.construction import load_profile
+            from panelchemy.raster_cleanup_artifacts import process_cleanup_file
+
+            config_path = cast("Path | None", args.config)
+            profile_path = cast("Path | None", args.profile)
+            profile = load_profile(profile_path)
+            minimum_width = cast("float | None", args.minimum_width_mm)
+            if minimum_width is None:
+                minimum_width = (
+                    profile.raster_cleanup_mm
+                    if profile.raster_cleanup_mm > 0
+                    else profile.assumed_line_width_mm
+                )
+            manifest = process_cleanup_file(
+                cast("Path", args.input),
+                cast("Path", args.output),
+                load_config(config_path),
+                long_edge_mm=profile.long_edge_mm,
+                minimum_width_mm=minimum_width,
+                silhouette_path=cast("Path | None", args.silhouette_mask),
+                protected_paths=tuple(
+                    p for p in (config_path, profile_path) if p is not None
+                ),
+            )
+            print(json.dumps(manifest, indent=2, sort_keys=True))
             return
         if cast("str", args.command) in {"relief", "export"}:
             from panelchemy.construction import load_profile

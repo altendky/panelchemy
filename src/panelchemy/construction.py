@@ -47,6 +47,7 @@ class ConstructionProfile:
     contour_mode: ContourMode = "curves"
     corner_softening_mm: float = 0.0
     span_simplification_mm: float = 0.0
+    raster_cleanup_mm: float = 0.0
 
     def __post_init__(self) -> None:
         for field in fields(self):
@@ -63,6 +64,7 @@ class ConstructionProfile:
                 "contour_tolerance_mm",
                 "corner_softening_mm",
                 "span_simplification_mm",
+                "raster_cleanup_mm",
             }:
                 if value < 0:
                     raise ValueError(f"{field.name} must be non-negative")

@@ -28,6 +28,22 @@ holes. The wider 1 mm design targets still need to come from the artwork.
 Contour approximation controls outline accuracy; its tolerance is a separate
 setting and does not impose a minimum feature size.
 
+An optional [raster cleanup preview](separation.md#optional-raster-cleanup)
+also removes eligible compact specks, fills small enclosed counters, and
+resolves eligible point-only contacts before tracing. It is disabled for model
+conversion unless `raster_cleanup_mm` is positive in the construction profile.
+Inspect the original, cleaned, and change previews: cleanup intentionally changes
+the artwork and makes the cleaned image the new fitting reference. The configured
+fitting accuracy remains unchanged. This first pass does not enforce a general
+minimum body width or remove every narrow whisker, connection, or pointed tip.
+
+The separate [stroke growth preview](separation.md#stroke-growth-preview) can
+help inspect thin features and proposed bounded thickening. Its classifications
+describe geometry rather than artistic importance; review the decisions and
+vetoes alongside the images. Growth proposals are not automatically used for
+model conversion, and they do not replace deliberate substantial feature bodies
+in the artwork.
+
 Measure at the final physical size. Use the configured nozzle diameter to plan
 resolution: assume a printed line width of **1.25 × nozzle diameter**, and aim
 for **at least four independent source pixels per line width**, preferably eight.

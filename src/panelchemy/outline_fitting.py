@@ -2485,45 +2485,71 @@ def fit_outlines(
     certificates: dict[
         int, tuple[list[c._Piece], list[tuple[float, float]], set[int]]
     ] = {}
+    solve_attempts: Counter[int] = Counter()
+
+    def refine(index: int, interval: int, exhausted: bool) -> None:
+        nonlocal refinement_count
+        fit = fits[index]
+        a, b = fit.intervals[interval]
+        length = sum(
+            hypot(q[0] - p[0], q[1] - p[1]) for p, q in pairwise(fit.chain.points)
+        )
+        if (b - a) * length < min(corner_scale_mm / 32, length / 128) or exhausted:
+            raise OutlineFitError(
+                f"cannot certify smooth outline chain {index}, interval {a:.6g}..{b:.6g}; no pixel-edge fallback",
+                fit,
+                interval,
+                fits,
+                uses,
+            )
+        fit.knots.append((a + b) / 2)
+        fit.knots.sort()
+        refinement_count += 1
+
     for iteration in range(14):
         unresolved: set[tuple[int, int]] = set()
-        refit = False
         for index, fit in enumerate(fits):
             if fit.chain.fixed:
                 continue
-            try:
-                # Only knots change during refinement; reuse unchanged solves.
-                if fit.intervals != list(pairwise([0.0, *fit.knots, 1.0])):
-                    fit.pieces, fit.intervals = _pieces(fit, index, tolerance_mm)
-            except SplineRefinementNeeded as error:
-                if iteration == 13:
-                    raise
-                a, b = error.interval or max(
-                    pairwise([0.0, *fit.knots, 1.0]), key=lambda p: p[1] - p[0]
-                )
-                middle = (a + b) / 2
-                if not a < middle < b:
-                    raise
-                fit.knots.append(middle)
-                fit.knots.sort()
-                refinement_count += 1
-                constraint_refinements += 1
-                refit = True
-                continue
-            cached = certificates.get(index)
-            if (
-                cached is None
-                or cached[0] is not fit.pieces
-                or cached[1] is not fit.intervals
-            ):
-                failed = _source_failures(fit, tolerance_mm)
-                failed.update(p.start for p in fit.pieces if not c._monotone(p.span))
-                certificates[index] = fit.pieces, fit.intervals, failed
-            else:
-                failed = cached[2]
-            unresolved.update((index, piece) for piece in failed)
-        if refit:
-            continue
+            # Source/direction proofs belong to one chain. Another chain's
+            # constraint retries must not consume its refinement opportunities.
+            # Count actual solves across topology rounds, keeping the same cap.
+            while True:
+                try:
+                    if fit.intervals != list(pairwise([0.0, *fit.knots, 1.0])):
+                        solve_attempts[index] += 1
+                        fit.pieces, fit.intervals = _pieces(fit, index, tolerance_mm)
+                except SplineRefinementNeeded as error:
+                    if solve_attempts[index] == 14:
+                        raise
+                    a, b = error.interval or max(
+                        pairwise([0.0, *fit.knots, 1.0]), key=lambda p: p[1] - p[0]
+                    )
+                    middle = (a + b) / 2
+                    if not a < middle < b:
+                        raise
+                    fit.knots.append(middle)
+                    fit.knots.sort()
+                    refinement_count += 1
+                    constraint_refinements += 1
+                    continue
+                cached = certificates.get(index)
+                if (
+                    cached is None
+                    or cached[0] is not fit.pieces
+                    or cached[1] is not fit.intervals
+                ):
+                    failed = _source_failures(fit, tolerance_mm)
+                    failed.update(
+                        p.start for p in fit.pieces if not c._monotone(p.span)
+                    )
+                    certificates[index] = fit.pieces, fit.intervals, failed
+                else:
+                    failed = cached[2]
+                if not failed:
+                    break
+                for interval in sorted(failed):
+                    refine(index, interval, solve_attempts[index] == 14)
         pieces = [p for fit in fits for p in fit.pieces]
         unsafe, cuts = c._unsafe_pair(pieces)
         for pair in unsafe:
@@ -2665,6 +2691,9 @@ def fit_outlines(
                     physical_corners=sum(len(f.corners) for f in fits),
                     smooth_refinements=refinement_count,
                     constraint_refinements=constraint_refinements,
+                    solver_calls=sum(solve_attempts.values()),
+                    maximum_chain_solver_calls=max(solve_attempts.values(), default=0),
+                    topology_checks=iteration + 1,
                     pixel_fallbacks=0,
                     corner_points=[
                         cast(
@@ -2707,27 +2736,5 @@ def fit_outlines(
                 for p in fits[i].pieces
             )
         for index, interval in sorted(unresolved):
-            fit = fits[index]
-            a, b = fit.intervals[interval]
-            length = float(
-                sum(
-                    hypot(q[0] - p[0], q[1] - p[1])
-                    for p, q in zip(
-                        fit.chain.points[:-1], fit.chain.points[1:], strict=True
-                    )
-                )
-            )
-            if (b - a) * length < min(
-                corner_scale_mm / 32, length / 128
-            ) or iteration == 13:
-                raise OutlineFitError(
-                    f"cannot certify smooth outline chain {index}, interval {a:.6g}..{b:.6g}; no pixel-edge fallback",
-                    fit,
-                    interval,
-                    fits,
-                    uses,
-                )
-            fit.knots.append((a + b) / 2)
-            fit.knots.sort()
-            refinement_count += 1
+            refine(index, interval, iteration == 13 or solve_attempts[index] == 14)
     raise ValueError("smooth outline fitting exceeded its refinement budget")
