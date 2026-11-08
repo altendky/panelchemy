@@ -21,11 +21,13 @@
   Make those interactions inspectable and account for meaningful changes.
 - Use the [artwork preparation guide](artwork-guide.md) to target 1 mm minimum
   feature bodies, gaps, and recesses while retaining sharp terminal points.
-  Small-feature cleanup is now a requested direction; automatic enforcement and
-  its exact geometry policy remain unimplemented.
+  Bounded point-contact cleanup may join sub-line-width fragments and fill new
+  tiny contact counters, with the original source-error bound certified.
+  General minimum-feature filtering remains future work.
 - Optional contour approximation is explicitly selected in millimeters and off
-  by default. Retain every island and counter, validate the boundary deviation,
-  and provide original/selected outlines. Tapering preserves the resulting
+  by default. Retain islands and counters apart from explicit bounded contact
+  cleanup, validate the boundary deviation, and provide original/selected
+  outlines. Tapering preserves the resulting
   selected tops; approximation is a separate, reported artwork change.
 - Use the supplied art samples to evaluate general behavior without reproducing
   their exact letters, animal anatomy, wear, or halftone rules in the converter.
@@ -39,7 +41,8 @@ The user selected configurable defaults: 250 mm on the long edge, 0.4 mm nozzle,
 0.2 mm layer height, and black/orange/white band thicknesses of 2/1/1 mm (4 mm
 total). Taper angle is also configurable, in degrees from vertical. Zero gives
 vertical internal walls; larger angles expand the lower footprint while retaining
-the original top. Nozzle size is recorded without minimum-feature enforcement.
+the original top. Nozzle size guides tracing and bounded contact cleanup; the
+broader feature-size targets remain artwork requirements.
 
 The implementation starts with a 10-degree internal taper and a 0.2 mm protected
 rim. Those are adjustable software defaults, not physically validated settings.

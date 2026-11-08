@@ -1,4 +1,4 @@
-"""Fair spline coefficients with forward derivative constraints.
+"""Fair spline coefficients with forward and movable-join constraints.
 
 Constraints use fixed source directions. The caller must still certify its
 selected curves after conversion/rounding; these optimizer checks do not replace
@@ -6,7 +6,7 @@ the continuous distance or topology proofs.
 """
 
 from itertools import pairwise
-from math import sqrt
+from math import cos, pi, sqrt
 from typing import cast
 
 import numpy as np
@@ -16,8 +16,20 @@ from scipy.optimize import LinearConstraint, minimize
 from scipy.sparse import coo_array, csr_array, hstack, vstack
 from scipy.sparse.linalg import lsqr
 
+from panelchemy.numeric_threads import single_threaded_blas
+
 type FloatArray = NDArray[np.float64]
 type FloatSparse = csr_array[np.float64, tuple[int, int]]
+
+
+class SplineRefinementNeeded(ValueError):
+    """The current basis did not produce a verified constrained candidate."""
+
+    def __init__(
+        self, message: str, interval: tuple[float, float] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.interval: tuple[float, float] | None = interval
 
 
 def _scalar(values: FloatArray, index: int) -> np.float64:
@@ -34,6 +46,7 @@ def _derivative_rows(knots: FloatArray) -> FloatSparse:
     return csr_array((values, (rows, columns)), shape=(count - 1, count))
 
 
+@single_threaded_blas
 def solve_coefficients(
     matrix: FloatSparse,
     target: FloatArray,
@@ -44,8 +57,10 @@ def solve_coefficients(
     source_points: FloatArray,
     length_mm: float,
     fairing_mm: float,
+    *,
+    fit_target_mm: float = 0.0,
 ) -> FloatArray:
-    """Solve the centered quadratic fit; do not accept failed constraints."""
+    """Solve the quadratic fit with forward and movable-join constraints."""
     count = len(knots) - 4
     if count > 512:
         raise ValueError("constrained spline fit exceeds 512 control points")
@@ -122,8 +137,51 @@ def solve_coefficients(
     lower = np.asarray(margins) - np.sum(
         cast("FloatArray", forward @ offsets) * directions_array, axis=1
     )
+    upper = np.full(len(lower), np.inf)
+    cap_parameters: FloatArray = np.array([])
+    if fit_target_mm > 0:
+        joins = np.unique(knots)
+        basis: FloatSparse = BSpline.design_matrix(joins, knots, 3)
+        moving: FloatSparse = (basis @ transform).tocsr()
+        moving.eliminate_zeros()
+        source: FloatArray = np.column_stack(
+            [
+                np.interp(joins, source_parameters, source_points[:, axis])
+                for axis in (0, 1)
+            ]
+        )
+        displacement = cast("FloatArray", basis @ offsets) - source
+        movable = np.diff(moving.indptr) > 0
+        if (
+            np.array_equal(source[:1], source[-1:])
+            and not np.any((moving[[0]] - moving[[-1]]).data)
+            and np.array_equal(displacement[:1], displacement[-1:])
+        ):
+            movable[-1] = False  # A movable closed seam is one join, not two.
+        moving, displacement = moving[movable], displacement[movable]
+        cap_parameters = joins[movable]
+        # Four two-sided linear bounds form an inscribed octagon: every join
+        # stays within the requested Euclidean target, with no nonlinear solver.
+        bound = fit_target_mm * cos(pi / 8)
+        cap_rows: list[FloatSparse] = []
+        cap_lower: list[FloatArray] = []
+        cap_upper: list[FloatArray] = []
+        for nx, ny in (
+            (1, 0),
+            (1 / sqrt(2), 1 / sqrt(2)),
+            (0, 1),
+            (-1 / sqrt(2), 1 / sqrt(2)),
+        ):
+            cap_rows.append(hstack((moving * nx, moving * ny), format="csr"))
+            delta = displacement[:, 0] * nx + displacement[:, 1] * ny
+            cap_lower.append(-bound - delta)
+            cap_upper.append(bound - delta)
+        constraints = vstack((constraints, *cap_rows), format="csr")
+        lower = np.concatenate((lower, *cap_lower))
+        upper = np.concatenate((upper, *cap_upper))
     initial = np.concatenate((coefficients[:, 0], coefficients[:, 1]))
-    if np.all(cast("FloatArray", constraints @ initial) >= lower):
+    initial_values = cast("FloatArray", constraints @ initial)
+    if np.all(initial_values >= lower) and np.all(initial_values <= upper):
         return coefficients
     # Diagonal preconditioning keeps very short knot intervals from dominating
     # the numerical scale of the quadratic optimizer.
@@ -152,22 +210,40 @@ def solve_coefficients(
         initial * np.tile(scale, 2),
         jac=gradient,
         method="SLSQP",
-        constraints=LinearConstraint(scaled_constraints, lower, np.inf),
+        constraints=LinearConstraint(scaled_constraints, lower, upper),
         options={"maxiter": 300, "ftol": 1e-11},
     )
     selected = unpack(cast("FloatArray", result.x))
-    remaining = (
-        cast(
-            "FloatArray", constraints @ np.concatenate((selected[:, 0], selected[:, 1]))
-        )
-        - lower
+    selected_values = cast(
+        "FloatArray", constraints @ np.concatenate((selected[:, 0], selected[:, 1]))
+    )
+    remaining = cast(
+        "FloatArray", np.minimum(selected_values - lower, upper - selected_values)
     )
     if (
         not result.success
         or not np.all(np.isfinite(selected))
         or float(np.min(remaining)) < -1e-8
     ):
-        raise ValueError(
-            f"constrained spline optimizer did not converge: {result.message}"
-        )
+        message = f"constrained spline optimizer did not converge: {result.message}"
+        if fit_target_mm > 0 and np.all(np.isfinite(selected_values)):
+            worst = int(np.argmin(remaining))
+            forward_count = len(forward_rows)
+            if worst < forward_count:
+                interval = intervals[worst // 3]
+            else:
+                at = float(
+                    _scalar(
+                        cap_parameters, (worst - forward_count) % len(cap_parameters)
+                    )
+                )
+                closed = np.array_equal(source_points[:1], source_points[-1:])
+                neighbors = [
+                    (a, b)
+                    for a, b in intervals
+                    if at in (a, b) or (closed and at in (0, 1) and (a == 0 or b == 1))
+                ]
+                interval = max(neighbors, key=lambda p: p[1] - p[0])
+            raise SplineRefinementNeeded(message, interval)
+        raise ValueError(message)
     return selected

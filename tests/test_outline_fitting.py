@@ -9,6 +9,7 @@ import pytest
 from shapely.geometry import Polygon, box
 from shapely.geometry.polygon import orient
 
+from panelchemy import outline_fitting
 from panelchemy.approximation import boundary_within_tolerance
 from panelchemy.contours import PanelContours, vectorize
 from panelchemy.curves import (
@@ -27,9 +28,54 @@ from panelchemy.outline_fitting import (
     fit_outlines,
 )
 from panelchemy.separation import Labels, SeparationConfig, SeparationResult
+from panelchemy.spline_solver import SplineRefinementNeeded
 
 _SIZE_MM = 12.8
 _TOLERANCE_MM = 0.2
+
+
+def test_coarse_constrained_solve_retries_with_more_basis_freedom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pieces = outline_fitting._pieces  # pyright: ignore[reportPrivateUsage]
+    failed = False
+    midpoint: float | None = None
+    calls: dict[int, int] = {}
+
+    def first_coarse_fit(fit: _Fit, index: int, tolerance: float):
+        nonlocal failed, midpoint
+        calls[index] = calls.get(index, 0) + 1
+        if not failed:
+            failed = True
+            interval = (fit.knots[0], fit.knots[1])
+            midpoint = sum(interval) / 2
+            raise SplineRefinementNeeded("coarse constrained fit", interval)
+        if index == 1:
+            assert midpoint in fit.knots
+        return pieces(fit, index, tolerance)
+
+    monkeypatch.setattr(outline_fitting, "_pieces", first_coarse_fit)
+    source = _source(white=[box(2, 2, 5, 5), box(7, 7, 10, 10)])
+    result = fit_outlines(source, _TOLERANCE_MM)
+    assert result.diagnostics["constraint_refinements"] == 1
+    assert calls[2] == 1  # The unrelated, unchanged chain is not solved again.
+    _check_geometry(source, result)
+
+
+def test_unsolved_constraints_exhaust_the_existing_refinement_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    def unsolved(_fit: _Fit, _index: int, _tolerance: float):
+        nonlocal attempts
+        attempts += 1
+        raise SplineRefinementNeeded("constraints remain unresolved")
+
+    monkeypatch.setattr(outline_fitting, "_pieces", unsolved)
+    with pytest.raises(SplineRefinementNeeded, match="constraints remain unresolved"):
+        _ = fit_outlines(_source(white=[box(2, 2, 8, 8)]), _TOLERANCE_MM)
+    assert attempts == 14
 
 
 def _source(

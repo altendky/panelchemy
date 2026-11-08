@@ -10,10 +10,20 @@ import pytest
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
 from OCP.gp import gp_Trsf, gp_Vec
 from PIL import Image
+from shapely.geometry import box
 
-from panelchemy import occt
+from panelchemy import boundary_tapers, native_curves, occt
 from panelchemy import relief as relief_module
 from panelchemy.construction import ConstructionProfile
+from panelchemy.contours import vectorize
+from panelchemy.curves import (
+    BezierSpan,
+    CurveContours,
+    CurveFitResult,
+    CurvePolygon,
+    CurveRing,
+    polygon_lines,
+)
 from panelchemy.relief import build_relief, process_relief_file
 from panelchemy.separation import SeparationConfig, SeparationResult, separate
 
@@ -114,6 +124,49 @@ def test_resource_limit_rejects_without_simplifying() -> None:
     _, result = fixture()
     with pytest.raises(ValueError, match="no features were removed"):
         _ = build_relief(result, max_vertices=4)
+
+
+@pytest.mark.parametrize("status", [None, "certified", "unresolved"])
+def test_cached_tight_curve_is_rejected_before_any_native_construction(
+    monkeypatch: pytest.MonkeyPatch, status: str | None
+) -> None:
+    _, result = fixture()
+    proxy = vectorize(result, 22, 25_000)
+    hole = CurveRing(
+        (
+            BezierSpan(((4, 4), (4, 4.2), (4.2, 4.2), (4.2, 4)), False),
+            BezierSpan(((4.2, 4), (4.2, 4), (4, 4), (4, 4)), True),
+        )
+    )
+    selected = CurveContours(
+        polygon_lines(box(0, 0, 22, 22)),
+        (),
+        (CurvePolygon(polygon_lines(box(1, 1, 9, 9)).exterior, (hole,)),),
+        1,
+        (0, 0, 22, 22),
+    )
+    diagnostics: dict[str, object] = {}
+    if status is not None:
+        diagnostics["boundary_curvature"] = {"margin_status": status}
+    cached = CurveFitResult(selected, proxy, diagnostics, "", 0.001)
+
+    def cached_fit(*_args: object, **_kwargs: object) -> CurveFitResult:
+        return cached
+
+    monkeypatch.setattr(relief_module, "fit_outlines", cached_fit)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("uncertified curves reached the native adapter")
+
+    monkeypatch.setattr(native_curves, "protected_vertices", forbidden)
+    with pytest.raises(boundary_tapers.CurvatureLimitError) as caught:
+        _ = build_relief(
+            result,
+            ConstructionProfile(long_edge_mm=22, contour_tolerance_mm=0.2),
+        )
+    assert caught.value.contours is selected
+    assert len(caught.value.failures) == 1
+    assert next(iter(caught.value.failures.values()))[0].is_line is False
 
 
 def test_geometry_provenance_and_input_protection(tmp_path: Path) -> None:

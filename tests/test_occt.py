@@ -31,7 +31,7 @@ from panelchemy.occt import (
 )
 
 
-def test_annotation_cleanup_keeps_counter_despite_volume_integration_noise(
+def test_annotation_cleanup_keeps_counter_without_redundant_mass_integration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     polygon = Polygon(
@@ -58,13 +58,11 @@ def test_annotation_cleanup_keeps_counter_despite_volume_integration_noise(
     assert _open_internal_wires(solid)
     native_volume = occt.volume
 
-    def noisy_volume(shape: TopoDS_Shape) -> float:
-        # Independent integration can vary after identical face boundaries are
-        # copied and their non-boundary annotation wires disappear.
-        return native_volume(shape) + (0.0 if shape.IsSame(solid) else 1e-7)
+    def unexpected_volume(_shape: TopoDS_Shape) -> float:
+        pytest.fail("exact oriented boundary identity already proves mass preservation")
 
     with monkeypatch.context() as patched:
-        patched.setattr(occt, "volume", noisy_volume)
+        patched.setattr(occt, "volume", unexpected_volume)
         cleaned = _without_open_internal_wires(solid)
     assert occt.valid(cleaned)
     assert not _open_internal_wires(cleaned)
