@@ -38,6 +38,31 @@ with the declared layer height. Approximate curve tracing uses nozzle size as
 physical guidance, including the bounded point-contact repair described below.
 General minimum-feature removal is not implemented.
 
+### Explicit Raster Cleanup
+
+Setting `raster_cleanup_mm` to a positive physical cutoff enables the separate
+[raster cleanup stage](separation.md#optional-raster-cleanup) before contour
+allocation and curve fitting. Its default is zero, preserving existing inputs.
+For a 0.4 mm nozzle, 0.5 mm is the assumed printed line width and a useful
+initial compact-detail cutoff. The first pass handles compact isolated regions,
+small counters, and eligible same-color diagonal attachments. It preserves
+connected terminal points and long narrow regions; it does not enforce a general
+minimum body width.
+
+Cleanup deliberately changes the artwork reference. The silhouette, its scale,
+and exterior labels remain fixed. The configured curve-fit accuracy applies
+unchanged to the cleaned reference. The original separation remains under
+`separation/`; `cleanup/` contains the original separated colors, actual cleaned
+model input, highlighted changes, a self-contained comparison page, and a report.
+The manifest records both label hashes, changed area and color transitions, and
+four-connected component/hole counts. These raster counts can differ from the
+later geometric polygon counts at diagonal contacts.
+
+The standalone `cleanup` command produces the comparison before any fitting or
+CAD is attempted, so an expensive or rejected model does not prevent inspection.
+Successful reuse of an output directory with cleanup disabled removes only its
+known stale cleanup artifacts; unrelated files and protected inputs are retained.
+
 ## Outward Tapers and Support
 
 Each source plateau retains its original top footprint. Its lower sections

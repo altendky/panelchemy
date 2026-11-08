@@ -181,12 +181,20 @@ def test_initial_proofs_reuse_only_unchanged_geometry(
     ) -> tuple[list[tuple[int, int]], list[set[Fraction]]]:
         nonlocal global_checks
         global_checks += 1
-        return unsafe(pieces)
+        pairs, cuts = unsafe(pieces)
+        if global_checks == 1:
+            first_colored = next(
+                i for i, piece in enumerate(pieces) if piece.chain != pieces[0].chain
+            )
+            # Force a global replacement after local proof succeeds. Its fixed
+            # silhouette neighbor remains unchanged, as does the other color part.
+            return [*pairs, (0, first_colored)], cuts
+        return pairs, cuts
 
     monkeypatch.setattr(fitting, "_source_failures", source_check)
     monkeypatch.setattr(c, "_unsafe_pair", global_check)
     fitted = fitting.fit_outlines(source, 0.2)
     assert len(fitted.contours.orange) == 2
-    assert sorted(len(calls) for calls in checked.values()) == [1, 2]
+    assert sorted(len(calls) for calls in checked.values()) == [1, 3]
     assert all(a is not b for calls in checked.values() for a, b in pairwise(calls))
-    assert global_checks >= 2
+    assert global_checks == 2

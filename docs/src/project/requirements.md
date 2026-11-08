@@ -23,10 +23,14 @@
   feature bodies, gaps, and recesses while retaining sharp terminal points.
   Bounded point-contact cleanup may join sub-line-width fragments and fill new
   tiny contact counters, with the original source-error bound certified.
-  General minimum-feature filtering remains future work.
+  Separate opt-in raster cleanup can remove compact regions, fill small counters,
+  and resolve eligible diagonal contacts before tracing. Its intentional changes
+  are reported against the original raster, and fitting retains its configured
+  accuracy against the cleaned reference. General minimum body-width filtering
+  remains future work.
 - Optional contour approximation is explicitly selected in millimeters and off
   by default. Retain islands and counters apart from explicit bounded contact
-  cleanup, validate the boundary deviation, and provide original/selected
+  and raster cleanup, validate the boundary deviation, and provide original/selected
   outlines. Tapering preserves the resulting
   selected tops; approximation is a separate, reported artwork change.
 - Use the supplied art samples to evaluate general behavior without reproducing

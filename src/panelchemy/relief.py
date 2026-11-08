@@ -34,6 +34,7 @@ from panelchemy.contours import PanelContours, vectorize
 from panelchemy.curves import CurveContours, Point2, fit_contours
 from panelchemy.material_partition import MaterialPartition
 from panelchemy.outline_fitting import fit_outlines
+from panelchemy.raster_cleanup import RasterCleanupResult, cleanup
 from panelchemy.separation import (
     Mask,
     SeparationConfig,
@@ -53,6 +54,13 @@ EXPORT_NAMES = (
     "relief.step",
 )
 STEP_EXPORT_NAMES = ("relief.step", "relief-multipart.step")
+CLEANUP_NAMES = (
+    "original.png",
+    "cleaned.png",
+    "changes.png",
+    "cleanup.json",
+    "review.html",
+)
 
 
 def _polygonal(geometry: BaseGeometry) -> Polygon | MultiPolygon:
@@ -88,6 +96,7 @@ class ReliefModel:
     curves: CurveContours | None = None
     footprint_proxy_tolerance_mm: float = 0.0
     material_partition: MaterialPartition | None = None
+    raster_cleanup: RasterCleanupResult | None = None
 
 
 def build_relief(
@@ -110,6 +119,12 @@ def build_relief(
         raise ValueError(
             "Review the boundary warnings and supply an explicit silhouette before building relief"
         )
+    raster_cleanup = None
+    if profile.raster_cleanup_mm > 0:
+        raster_cleanup = cleanup(
+            result, profile.long_edge_mm, profile.raster_cleanup_mm
+        )
+        result = raster_cleanup.cleaned
     # Approximation still starts from exact cells. Bound source allocation
     # separately, then enforce the configured kernel budget on the result.
     source_budget = (
@@ -373,6 +388,9 @@ def build_relief(
         "elapsed_seconds": monotonic() - started,
         "max_vertices": max_vertices,
         "source_vertex_budget": source_budget,
+        "raster_cleanup": raster_cleanup.diagnostics
+        if raster_cleanup is not None
+        else None,
         "contour_approximation": approximation_diagnostics,
         "top_footprint_reference": f"fitted native {profile.contour_mode}"
         if curves is not None
@@ -398,6 +416,7 @@ def build_relief(
         curves,
         proxy_tolerance,
         material_partition=material_partition.seal_partition(solid, partition),
+        raster_cleanup=raster_cleanup,
     )
 
 
@@ -497,6 +516,7 @@ def process_relief_file(
         "contours.svg",
         *EXPORT_NAMES,
         *STEP_EXPORT_NAMES,
+        *(f"cleanup/{name}" for name in CLEANUP_NAMES),
     ]
     protected = {path.resolve() for path in (source, *protected_paths)}
     if silhouette_path:
@@ -572,6 +592,14 @@ def process_relief_file(
         for name, content in separation_bundle.files.items():
             _ = (stage / "separation" / name).write_bytes(content)
         separation_manifest = separation_bundle.manifest
+        if model.raster_cleanup is not None:
+            from panelchemy.raster_cleanup_artifacts import cleanup_files
+
+            (stage / "cleanup").mkdir()
+            for name, content in cleanup_files(
+                model.raster_cleanup, source.name
+            ).items():
+                _ = (stage / "cleanup" / name).write_bytes(content)
         manifest: dict[str, object] = {
             "schema_version": 1,
             "kind": "occt-relief",
@@ -581,6 +609,12 @@ def process_relief_file(
             "export": export_report,
             "source": separation_manifest["source"],
             "separation": separation_manifest,
+            "fitting_reference": "cleaned-raster"
+            if model.raster_cleanup is not None
+            else "original-separated-raster",
+            "raster_cleanup": model.raster_cleanup.diagnostics
+            if model.raster_cleanup is not None
+            else None,
             "profile": model.profile.as_dict(),
             "taper_angle_reference": "degrees from vertical",
             "mm_per_pixel": model.contours.mm_per_pixel,
@@ -618,6 +652,9 @@ def process_relief_file(
                 (output / f"{name}.brep").unlink(missing_ok=True)
         if model.contour_comparison_svg is None:
             (output / "contours.svg").unlink(missing_ok=True)
+        if model.raster_cleanup is None:
+            for name in CLEANUP_NAMES:
+                (output / "cleanup" / name).unlink(missing_ok=True)
         for name in (*EXPORT_NAMES, *STEP_EXPORT_NAMES):
             if not (stage / name).exists():
                 (output / name).unlink(missing_ok=True)

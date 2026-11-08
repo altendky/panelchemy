@@ -9,6 +9,7 @@ dependencies = [
     "cadquery-ocp-novtk==8.0.1.1.0",
     "numpy>=2.3",
     "pillow>=12",
+    "scikit-image>=0.26",
     "scipy>=1.16",
     "shapely>=2.1",
     "threadpoolctl>=3.6",

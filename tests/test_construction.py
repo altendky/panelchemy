@@ -50,6 +50,15 @@ def test_bounded_span_simplification_is_explicit_and_roundtrips() -> None:
     assert ConstructionProfile.from_mapping(selected.as_dict()) == selected
 
 
+def test_raster_cleanup_is_disabled_by_default_and_roundtrips() -> None:
+    assert ConstructionProfile().raster_cleanup_mm == 0
+    selected = ConstructionProfile.from_mapping({"raster_cleanup_mm": 0.5})
+    assert selected.raster_cleanup_mm == selected.assumed_line_width_mm
+    assert ConstructionProfile.from_mapping(selected.as_dict()) == selected
+    # Cleanup is an explicit artwork edit, separate from corner rounding limits.
+    assert ConstructionProfile(raster_cleanup_mm=2).raster_cleanup_mm == 2
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -79,6 +88,11 @@ def test_bounded_span_simplification_is_explicit_and_roundtrips() -> None:
         {"span_simplification_mm": float("nan")},
         {"span_simplification_mm": float("inf")},
         {"span_simplification_mm": 0.251},
+        {"raster_cleanup_mm": -0.1},
+        {"raster_cleanup_mm": True},
+        {"raster_cleanup_mm": float("nan")},
+        {"raster_cleanup_mm": float("inf")},
+        {"raster_cleanup_mm": 10**1000},
         {"orange_thickness_mm": 1e-12},
         {"orange_thickness_mm": 200000000.02},
         {
