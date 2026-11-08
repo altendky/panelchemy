@@ -6,6 +6,9 @@
 __pycache__/
 *.py[cod]
 dist/
+/rust/target/
+/src/panelchemy/_native*.so
+/src/panelchemy/_native*.pyd
 node_modules/
 /browser-tests/test-results/
 /browser-tests/playwright-report/
