@@ -1,6 +1,8 @@
 """Curvature acceptance requires continuous exact bounds, never samples."""
 
 from fractions import Fraction
+from itertools import pairwise
+from random import Random
 from typing import cast
 
 import pytest
@@ -9,6 +11,53 @@ from panelchemy import curvature
 from panelchemy.curves import BezierSpan, Controls
 
 F = Fraction
+
+
+def _baseline_certificate(
+    span: BezierSpan, offset: float | Fraction, sign: int, fraction: float | Fraction
+) -> bool:
+    """Pre-fast-path continuous proof, used as a differential oracle."""
+    # The unchanged scalar helpers deliberately construct the full degree12
+    # bound here; this is the previous acceptance loop without new shortcuts.
+    product = curvature._product  # pyright: ignore[reportPrivateUsage]
+    elevate = curvature._elevate  # pyright: ignore[reportPrivateUsage]
+    split = curvature._split  # pyright: ignore[reportPrivateUsage]
+    p = [tuple(F(v) for v in point) for point in span.control_points]
+    if span.is_line:
+        return p[0] != p[-1]
+    v = [[3 * (b[j] - a[j]) for a, b in pairwise(p)] for j in (0, 1)]
+    a = [[2 * (b - a) for a, b in pairwise(axis)] for axis in v]
+    speed = [
+        x + y for x, y in zip(product(v[0], v[0]), product(v[1], v[1]), strict=True)
+    ]
+    cross = [
+        x - y for x, y in zip(product(v[0], a[1]), product(v[1], a[0]), strict=True)
+    ]
+    cube = product(product(speed, speed), speed)
+    square = elevate(product(cross, cross), len(cube) - 1)
+    bound = [
+        F(fraction) ** 2 * x - F(offset) ** 2 * y
+        for x, y in zip(cube, square, strict=True)
+    ]
+    pending = [(speed, cross, bound, 0)]
+    visited = 0
+    while pending:
+        s, n, b, depth = pending.pop()
+        visited += 1
+        if visited > curvature._MAX_NODES:  # pyright: ignore[reportPrivateUsage]
+            return False
+        opposite = (sign == 1 and max(n) <= 0) or (sign == -1 and min(n) >= 0)
+        if min(s) > 0 and (opposite or min(b) >= 0):
+            continue
+        if max(s) <= 0 or (min(s) > 0 and max(b) < 0 and not opposite):
+            return False
+        if depth >= curvature._MAX_DEPTH:  # pyright: ignore[reportPrivateUsage]
+            return False
+        sl, sr = split(s)
+        nl, nr = split(n)
+        bl, br = split(b)
+        pending.extend(((sl, nl, bl, depth + 1), (sr, nr, br, depth + 1)))
+    return True
 
 
 def _span(points: tuple[tuple[float | Fraction, float | Fraction], ...]) -> BezierSpan:
@@ -113,3 +162,69 @@ def test_nonfinite_controls_are_rejected_even_for_line_metadata() -> None:
             _ = curvature.within_curvature(
                 BezierSpan(span.control_points, is_line), 1, 0
             )
+
+
+def test_fast_paths_match_previous_proof_on_random_and_degenerate_cubics() -> None:
+    random = Random(20261106)
+    examples = [
+        _span(
+            tuple(
+                (random.randint(-16, 16) / 8, random.randint(-16, 16) / 8)
+                for _ in range(4)
+            )
+        )
+        for _ in range(32)
+    ]
+    examples.extend(
+        [
+            _span(((0, 0),) * 4),
+            _span(((0, 0), (0, 0), (1, 1), (2, 1))),
+            _span(((0, 0), (1, 1), (2, 1), (2, 1))),
+            _span(((0, 0), (1, 0), (-1, 0), (0, 0))),
+            _span(((0, 0), (0, 1), (1, 0), (1, 1))),
+        ]
+    )
+    for span in examples:
+        for sign in (-1, 0, 1):
+            for offset in (0, F(7, 100), F(2, 5)):
+                assert curvature.within_curvature(
+                    span, offset, sign
+                ) == _baseline_certificate(span, offset, sign, F(9, 10))
+
+
+@pytest.mark.parametrize("fraction", [F(9, 10), 0.9, F(1)])
+def test_fast_paths_match_baseline_at_exact_threshold_and_float_neighbors(
+    fraction: float | Fraction,
+) -> None:
+    span = _parabola()
+    threshold = F(fraction) / 2
+    for delta in (-F(1, 10**18), F(0), F(1, 10**18)):
+        for sign in (-1, 0, 1):
+            assert curvature.within_curvature(
+                span, threshold + delta, sign, fraction
+            ) == _baseline_certificate(span, threshold + delta, sign, fraction)
+
+
+def test_zero_node_budget_is_preserved_for_curved_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    span = _parabola()
+    monkeypatch.setattr(curvature, "_MAX_NODES", 0)
+    assert not curvature.within_curvature(span, 0, -1)
+    assert not _baseline_certificate(span, 0, -1, F(9, 10))
+
+
+@pytest.mark.parametrize("scale", [F(1, 1000), F(1000)])
+def test_scaled_translated_fast_paths_match_baseline(scale: Fraction) -> None:
+    for span in (_parabola(), _span(((0, 0), (0, 1), (1, 0), (1, 1)))):
+        transformed = _span(
+            tuple(
+                (F(x) * scale + 10000, F(y) * scale - 20000)
+                for x, y in span.control_points
+            )
+        )
+        for sign in (-1, 0, 1):
+            for offset in (F(0), F(2, 5) * scale, F(1, 2) * scale):
+                assert curvature.within_curvature(
+                    transformed, offset, sign
+                ) == _baseline_certificate(transformed, offset, sign, F(9, 10))

@@ -27,6 +27,9 @@ mise exec -- pre-commit run --all-files --show-diff-on-failure
 Run behavioral tests with `uv run --locked pytest`. CI tests conversion behavior,
 builds, and installed entry points on both interpreter versions.
 
+See [tracing performance](performance.md) for measured bottlenecks, implemented
+solver improvements, and the limits of the timing comparisons.
+
 ## CI and Repository Settings
 
 CI uses independent jobs for mise-lock validation, repository checks, and Python

@@ -210,6 +210,7 @@ dependencies = [
     { name = "pillow" },
     { name = "scipy" },
     { name = "shapely" },
+    { name = "threadpoolctl" },
 ]
 
 [package.dev-dependencies]
@@ -230,6 +231,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12" },
     { name = "scipy", specifier = ">=1.16" },
     { name = "shapely", specifier = ">=2.1" },
+    { name = "threadpoolctl", specifier = ">=3.6" },
 ]
 
 [package.metadata.requires-dev]
@@ -420,6 +422,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1c/58/ac8f7de528c125ab41a001523ada72e95e2d5f746917487e723b25e1c5c4/shapely-2.2.0-cp313-cp313-win32.whl", hash = "sha256:40871d7135cd723f965d200181aa28418e9ec029fd85bdd010488259d1c01906", size = 1616372, upload-time = "2026-10-07T09:16:43.094Z" },
     { url = "https://files.pythonhosted.org/packages/25/ed/7fcd625c9796e61d815ca9545d4e44a16f075f83869c1532206de88f23f1/shapely-2.2.0-cp313-cp313-win_amd64.whl", hash = "sha256:1eaa2cb64cdedaf65d6bc86f2819c9cd7d6d68f969aa3ebfdc93743ab581f437", size = 1790191, upload-time = "2026-10-07T09:16:44.852Z" },
     { url = "https://files.pythonhosted.org/packages/23/c9/947fcd5665e1945dd54f6e8890bc6dd04613dd169a5fbb4ba7497754b3a8/shapely-2.2.0-cp313-cp313-win_arm64.whl", hash = "sha256:f79b3b34ad2d067207f21f821489c720b14ce40f3bfda931987a193165f80133", size = 1878351, upload-time = "2026-10-07T09:16:46.656Z" },
+]
+
+[[package]]
+name = "threadpoolctl"
+version = "3.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/97/b4748951a683e369513691c8eea33d100298d556308dcb0ab66b132a67f0/threadpoolctl-3.8.0.tar.gz", hash = "sha256:01080674ad7ac6182429c918a79de92da789bb448acc02fc0b620b1abd6b6137", size = 39424, upload-time = "2026-11-05T11:08:51.112Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/1b/831f2de4840a25db1dd7b1afea433ccafe6bb10aca07e13264f2079462d0/threadpoolctl-3.8.0-py3-none-any.whl", hash = "sha256:f1b49c82704d50f13ffae019c727b0fa4f6791a58f48f06a09c45face1be66da", size = 32091, upload-time = "2026-11-05T11:08:49.773Z" },
 ]
 
 [[package]]

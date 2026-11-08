@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from fractions import Fraction
+from math import hypot, ulp
 from typing import cast
 
 import numpy as np
@@ -56,13 +57,62 @@ def exact_direction(a: c.Point2, b: c.Point2) -> tuple[Fraction, Fraction]:
     return Fraction(b[0]) - Fraction(a[0]), Fraction(b[1]) - Fraction(a[1])
 
 
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_exact_handle_can_be_shorter_than_the_inherited_coordinate_grid(
+    sign: int,
+) -> None:
+    anchor = (100.0, 200.0)
+    inherited = (100.0 + sign * 0.75, 200.0 + 17 / 32)
+    # The primitive inherited vector has gcd1 on its1/32 grid. Reusing that
+    # grid would force a roughly0.919mm handle instead of the requested0.447mm.
+    selected = reduction._handle(anchor, inherited, 0.447)  # pyright: ignore[reportPrivateUsage]
+    assert selected is not None
+    u, v = exact_direction(anchor, inherited), exact_direction(anchor, selected)
+    assert u[0] * v[1] == u[1] * v[0]
+    assert u[0] * v[0] + u[1] * v[1] > 0
+    assert hypot(*v) == pytest.approx(0.447, rel=1e-10)
+    assert hypot(*v) < hypot(*u) / 2
+
+
+@pytest.mark.parametrize(
+    "anchor,inherited,length",
+    [
+        ((0.0, 0.0), (0.0, 0.0), 1.0),
+        ((0.0, 0.0), (1.0, 1.0), 0.0),
+        ((0.0, 0.0), (1.0, 1.0), -1.0),
+        ((0.0, 0.0), (1.0, 1.0), float("nan")),
+        ((0.0, 0.0), (1.0, 1.0), float("inf")),
+        ((float("inf"), 0.0), (1.0, 1.0), 1.0),
+        ((0.0, 0.0), (float("nan"), 1.0), 1.0),
+    ],
+)
+def test_exact_handle_rejects_unavailable_or_nonfinite_rays(
+    anchor: c.Point2, inherited: c.Point2, length: float
+) -> None:
+    assert reduction._handle(anchor, inherited, length) is None  # pyright: ignore[reportPrivateUsage]
+
+
 def test_subdivided_cubic_becomes_one_actual_cubic_and_inputs_stay_unchanged() -> None:
     originals, times = split(_PARENT, 16), intervals(16)
     snapshot = tuple(span.control_points for span in originals)
     result = simplify(originals, times, 0.01)
     assert result.output_spans == 1
     assert result.accepted_merges == 15
-    assert result.spans[0].control_points == _PARENT.control_points
+    for selected, expected in zip(
+        result.spans[0].control_points, _PARENT.control_points, strict=True
+    ):
+        for actual, target in zip(selected, expected, strict=True):
+            assert actual == pytest.approx(target, rel=0, abs=ulp(target))
+    for endpoint, pole in ((0, 1), (3, 2)):
+        u = exact_direction(
+            _PARENT.control_points[endpoint], _PARENT.control_points[pole]
+        )
+        v = exact_direction(
+            result.spans[0].control_points[endpoint],
+            result.spans[0].control_points[pole],
+        )
+        assert u[0] * v[1] == u[1] * v[0]
+        assert u[0] * v[0] + u[1] * v[1] > 0
     assert result.intervals == ((0, 1),)
     assert tuple(span.control_points for span in originals) == snapshot
 

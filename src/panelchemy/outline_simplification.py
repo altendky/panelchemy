@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from math import atan2, gcd, hypot, isfinite
+from sys import float_info
 from typing import cast
 
 import numpy as np
@@ -55,15 +56,37 @@ def _smooth(a: c.BezierSpan, b: c.BezierSpan) -> bool:
 
 def _handle(anchor: c.Point2, inherited: c.Point2, length: float) -> c.Point2 | None:
     """Choose an exactly representable positive multiple of inherited direction."""
+    if (
+        not isfinite(length)
+        or length <= 0
+        or not all(isfinite(v) for v in (*anchor, *inherited))
+    ):
+        return None
     a = c._rational(anchor)
     p = c._rational(inherited)
     dx, dy = p[0] - a[0], p[1] - a[1]
     denominator = max(dx.denominator, dy.denominator)
     ix, iy = int(dx * denominator), int(dy * denominator)
     common = gcd(abs(ix), abs(iy))
-    if not common or not isfinite(length) or length <= 0:
+    if not common:
         return None
     ix, iy = ix // common, iy // common
+    # The inherited coordinates may use a much coarser dyadic grid than IEEE
+    # points near the anchor. Refine only the scalar, keeping the exact ray.
+    for _ in range(float_info.mant_dig):
+        refined = denominator * 2
+        exact = (
+            a[0] + Fraction(ix, refined),
+            a[1] + Fraction(iy, refined),
+        )
+        point = float(exact[0]), float(exact[1])
+        if (
+            point == anchor
+            or not all(isfinite(v) for v in point)
+            or c._rational(point) != exact
+        ):
+            break
+        denominator = refined
     unit = hypot(ix, iy) / denominator
     if not isfinite(unit) or unit <= 0 or not isfinite(length / unit):
         return None

@@ -8,23 +8,30 @@ fit adds smooth spline knots; it never restores individual raster edges.
 # pyright: reportPrivateUsage=false
 
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
-from math import hypot, isfinite, pi
+from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
+from time import monotonic
 from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.interpolate import BSpline, PPoly
 from scipy.sparse import csr_array
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon
 from shapely.geometry.polygon import orient
 
 from panelchemy import (
     boundary_tapers,
+    contact_refinement,
     curvature,
     curvature_fitting,
+    edge_detail,
+    fitting_feedback,
+    geometric_distance,
+    local_windows,
     outline_simplification,
     outline_softening,
 )
@@ -55,6 +62,94 @@ class _Fit:
     pieces: list[c._Piece]
     intervals: list[tuple[float, float]]
     fairing_mm: float = 0.25
+    source_corners: tuple[float, ...] = ()
+    texture_intervals: tuple[tuple[float, float], ...] = ()
+    texture_barriers: tuple[float, ...] = ()
+
+
+def _detail_guidance(
+    fits: Sequence[_Fit], source: PanelContours, line_width: float
+) -> dict[str, object]:
+    """Classify source geometry; labels choose fits, never enlarge error bounds."""
+    counts: Counter[str] = Counter()
+    regions: list[dict[str, object]] = []
+    for index, fit in enumerate(fits):
+        if fit.chain.fixed:
+            continue
+        points = fit.chain.points
+        samples = edge_detail.classify_chain(
+            points,
+            pixel_pitch_mm=source.mm_per_pixel,
+            line_width_mm=line_width,
+            protected_indices=(
+                frozenset({0, len(points) - 1})
+                if not fit.chain.free_loop
+                else frozenset()
+            ),
+        )
+        counts.update(sample.kind for sample in samples)
+        fine = {sample.index for sample in samples if sample.kind == "fine_texture"}
+        structural = {sample.index for sample in samples if sample.kind == "structural"}
+        fit.texture_barriers = tuple(
+            float(_scalar(fit.parameters, i)) for i in sorted(structural)
+        )
+        runs: list[tuple[int, int]] = []
+        start: int | None = None
+        for i in range(len(points)):
+            selected = (
+                i + 1 < len(points)
+                and (i in fine or i + 1 in fine)
+                and i not in structural
+                and i + 1 not in structural
+            )
+            if selected and start is None:
+                start = i
+            elif not selected and start is not None:
+                runs.append((start, i))
+                start = None
+        fit.texture_intervals = tuple(
+            (float(_scalar(fit.parameters, a)), float(_scalar(fit.parameters, b)))
+            for a, b in runs
+        )
+        for (a, b), interval in zip(runs, fit.texture_intervals, strict=True):
+            selected_samples = [sample for sample in samples if a <= sample.index <= b]
+            xs, ys = zip(*points[a : b + 1], strict=True)
+            regions.append(
+                dict(
+                    chain=index,
+                    source_interval=interval,
+                    first_source_vertex=a,
+                    last_source_vertex=b,
+                    bounds_mm=(min(xs), min(ys), max(xs), max(ys)),
+                    backtracks=max(sample.backtracks for sample in selected_samples),
+                    normal_reversals=max(
+                        sample.normal_reversals for sample in selected_samples
+                    ),
+                    path_excess_mm=max(
+                        sample.path_excess_mm for sample in selected_samples
+                    ),
+                    max_event_mm=max(
+                        sample.max_event_mm for sample in selected_samples
+                    ),
+                )
+            )
+    return {
+        "edge_detail": dict(
+            line_width_mm=line_width,
+            pixel_pitch_mm=source.mm_per_pixel,
+            source_vertex_classes=dict(counts),
+            fine_texture_regions=regions,
+            policy="fine texture prefers a compact smooth fit; source and taper limits remain unchanged",
+            grants_error_allowance=False,
+        )
+    }
+
+
+@dataclass
+class _RejectedFit:
+    spline: BSpline
+    fit: _Fit
+    source_failure: bool = False
 
 
 class OutlineFitError(ValueError):
@@ -402,7 +497,7 @@ def _spline_pieces(
 
 
 def _certified(fit: _Fit, piece: c._Piece, tolerance: float) -> bool:
-    """Continuous source-to-curve matching, including moved knot endpoints."""
+    """Sufficient continuous source matching at corresponding parameters."""
     from fractions import Fraction
 
     start_value, stop_value = fit.intervals[piece.start]
@@ -418,11 +513,12 @@ def _certified(fit: _Fit, piece: c._Piece, tolerance: float) -> bool:
     controls = c._controls(piece.span)
     budget = Fraction(tolerance) ** 2
     for index, (a, b) in enumerate(pairwise(times), first):
-        selected = c._restrict(
-            controls,
-            (a - start) / (stop - start),
-            (b - start) / (stop - start),
-        )
+        # The intervals are consecutive: retain the exact unconsumed suffix
+        # instead of restricting the original cubic twice for every segment.
+        if b == stop:
+            selected = controls
+        else:
+            selected, controls = c._split(controls, (b - a) / (stop - a))
         source_start = Fraction(source_parameters[index])
         source_stop = Fraction(source_parameters[index + 1])
         left = c._rational(fit.chain.points[index])
@@ -450,6 +546,51 @@ def _certified(fit: _Fit, piece: c._Piece, tolerance: float) -> bool:
     return True
 
 
+def _orientation_preserved(fit: _Fit) -> bool:
+    """Keep closed-chain material sides using exact signed boundary integrals."""
+    from fractions import Fraction
+
+    if fit.chain.points[0] != fit.chain.points[-1]:
+        return True
+    source = [c._rational(point) for point in fit.chain.points]
+    source_area = sum(a[0] * b[1] - a[1] * b[0] for a, b in pairwise(source))
+    curve_area = Fraction(0)
+    for piece in fit.pieces:
+        controls = c._controls(piece.span)
+        velocity = [
+            (3 * (b[0] - a[0]), 3 * (b[1] - a[1])) for a, b in pairwise(controls)
+        ]
+        xy = curvature._product([p[0] for p in controls], [v[1] for v in velocity])
+        yx = curvature._product([p[1] for p in controls], [v[0] for v in velocity])
+        # All degree-five Bernstein basis functions integrate to one sixth.
+        curve_area += sum(a - b for a, b in zip(xy, yx, strict=True)) / 6
+    return source_area * curve_area > 0
+
+
+def _source_failures(fit: _Fit, tolerance: float) -> set[int]:
+    """Certify geometric distance; old parameter failures only guide refinement."""
+    if (
+        not fit.pieces
+        or len(fit.pieces) != len(fit.intervals)
+        or fit.intervals[0][0] != 0
+        or fit.intervals[-1][1] != 1
+        or any(a >= b for a, b in fit.intervals)
+        or any(a[1] != b[0] for a, b in pairwise(fit.intervals))
+        or [p.start for p in fit.pieces] != list(range(len(fit.pieces)))
+    ):
+        raise ValueError("source certification requires a complete chain partition")
+    if not _orientation_preserved(fit):
+        return {piece.start for piece in fit.pieces}
+    failed = {
+        piece.start for piece in fit.pieces if not _certified(fit, piece, tolerance)
+    }
+    if failed and geometric_distance.within_distance(
+        fit.chain.points, [piece.span for piece in fit.pieces], tolerance
+    ):
+        return set()
+    return failed
+
+
 def _soften_verified(
     fits: Sequence[_Fit],
     uses: Sequence[Sequence[tuple[int, bool]]],
@@ -459,6 +600,8 @@ def _soften_verified(
     radius: float,
     original_curves: c.CurveContours,
     original_proxy: PanelContours,
+    *,
+    material_taper_runs_mm: tuple[float, float, float] | None = None,
 ) -> tuple[c.CurveContours, PanelContours, dict[str, object], list[_Fit]]:
     """Try local bridges; retain sharp geometry where any acceptance gate fails."""
     blocked: set[tuple[int, float]] = set()
@@ -474,6 +617,14 @@ def _soften_verified(
         c._relationships(polygons),
         c._relationships(source_rings),
     )
+    limits = (
+        boundary_tapers.boundaries(
+            uses, ranges, len(source.orange), material_taper_runs_mm
+        )
+        if material_taper_runs_mm is not None
+        else {}
+    )
+    curvature_blocked: set[tuple[int, float]] = set()
     for _ in range(8):
         selected_fits: list[_Fit] = []
         pieces: list[c._Piece] = []
@@ -511,20 +662,44 @@ def _soften_verified(
                     if not owners:
                         raise ValueError("unmodified outlines lost an exact join")
                     failed.update((index, t) for t in owners)
-            checked = replace(fit, pieces=selected, intervals=list(softened.intervals))
+            checked = replace(
+                fit,
+                pieces=selected,
+                intervals=list(softened.intervals),
+                corners=[t for t in fit.corners if t not in softened.applied],
+            )
             selected_fits.append(checked)
+            if _source_failures(checked, tolerance):
+                if not softened.applied:
+                    raise ValueError(
+                        "unmodified outline failed its existing certificate"
+                    )
+                failed.update((index, t) for t in softened.applied)
             for piece, owners in zip(selected, softened.dependencies, strict=True):
                 tags = {(index, t) for t in owners}
                 pieces.append(piece)
                 dependencies.append(tags)
-                if not c._monotone(piece.span) or not _certified(
-                    checked, piece, tolerance
-                ):
+                if not c._monotone(piece.span):
                     if not tags:
                         raise ValueError(
                             "unmodified outline failed its existing certificate"
                         )
                     failed.update(tags)
+                limit = limits.get(index)
+                if (
+                    tags
+                    and limit is not None
+                    and limit.offset_mm > 0
+                    and not curvature.within_curvature(
+                        piece.span, limit.offset_mm, limit.inward_sign
+                    )
+                ):
+                    # Restore the detected corner and its original incident
+                    # pieces, rather than passing a tiny rounded connector on
+                    # to the smooth curvature optimizer. Dependencies include
+                    # both corners when their trims affect the same piece.
+                    failed.update(tags)
+                    curvature_blocked.update(tags)
         if not applied:
             break
         if failed:
@@ -605,6 +780,7 @@ def _soften_verified(
                 softened_corners=len(applied),
                 softening_candidates=len(attempted),
                 softening_blocked=len(attempted - applied),
+                curvature_blocked_corners=len(curvature_blocked),
                 selected_unique_spans=len(pieces),
                 softening_support_certificate="removed tails and cubic bridge control hulls contained in corner neighborhood",
             ),
@@ -618,6 +794,7 @@ def _soften_verified(
             softened_corners=0,
             softening_candidates=len(attempted),
             softening_blocked=len(attempted),
+            curvature_blocked_corners=len(curvature_blocked),
             softening_rejection=rejection
             or "local edits could not pass the safety gates",
         ),
@@ -762,10 +939,19 @@ def _simplify_verified(
     edit_budget: float,
     original_curves: c.CurveContours,
     original_proxy: PanelContours,
+    *,
+    material_taper_runs_mm: tuple[float, float, float] | None = None,
 ) -> tuple[c.CurveContours, PanelContours, dict[str, object], list[_Fit]]:
     """Reduce actual polynomials, certifying original artwork and palette topology."""
     candidates = list(fits)
     changed: set[int] = set()
+    limits = (
+        boundary_tapers.boundaries(
+            uses, ranges, len(source.orange), material_taper_runs_mm
+        )
+        if material_taper_runs_mm is not None
+        else {}
+    )
     for index, fit in enumerate(fits):
         if fit.chain.fixed or len(fit.pieces) < 2:
             continue
@@ -777,8 +963,30 @@ def _simplify_verified(
             fit: _Fit = fit,
             index: int = index,
         ) -> bool:
+            if any(start < corner < stop for corner in fit.corners):
+                return False
+            limit = limits.get(index)
+            if (
+                limit is not None
+                and limit.offset_mm > 0
+                and not curvature.within_curvature(
+                    span, limit.offset_mm, limit.inward_sign
+                )
+            ):
+                return False
             checked = replace(fit, intervals=[(start, stop)])
-            return _certified(checked, c._Piece(index, 0, 1, span), tolerance)
+            if _certified(checked, c._Piece(index, 0, 1, span), tolerance):
+                return True
+            # A merge may slide correspondence across old knot positions.
+            # Include unchanged spans when proving reverse source coverage.
+            selected = [
+                piece.span
+                for piece, (a, b) in zip(fit.pieces, fit.intervals, strict=True)
+                if b <= start or a >= stop
+            ]
+            return geometric_distance.within_distance(
+                fit.chain.points, [*selected, span], tolerance
+            )
 
         reduced = outline_simplification.simplify(
             [piece.span for piece in fit.pieces],
@@ -787,7 +995,7 @@ def _simplify_verified(
             accept=accept,
         )
         if len(reduced.spans) < len(fit.pieces):
-            candidates[index] = replace(
+            candidate = replace(
                 fit,
                 pieces=[
                     c._Piece(index, i, i + 1, span)
@@ -795,7 +1003,11 @@ def _simplify_verified(
                 ],
                 intervals=list(reduced.intervals),
             )
-            changed.add(index)
+            # Independently approved merges can have overlapping coverage;
+            # recertify their combined replacement against the complete source.
+            if not _source_failures(candidate, tolerance):
+                candidates[index] = candidate
+                changed.add(index)
     before = sum(len(fit.pieces) for fit in fits)
     verified = _verify_refits(
         fits,
@@ -828,6 +1040,1100 @@ def _simplify_verified(
     )
 
 
+def _curvature_feedback(
+    failed: _RejectedFit,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+) -> fitting_feedback.Refinement:
+    checked = failed.fit
+    if failed.source_failure:
+        return fitting_feedback.distance_refinement(
+            checked.chain.points,
+            checked.parameters,
+            [p.span for p in checked.pieces],
+            checked.intervals,
+            tolerance,
+            fraction=curvature_fitting._SOURCE_FRACTION,
+        )
+    locations: set[float] = set()
+    # Include peaks near the search target, so a correction cannot merely
+    # move the violation onto an adjoining piece.
+    for piece, (a, b) in zip(checked.pieces, checked.intervals, strict=True):
+        locations.update(
+            a + t * (b - a)
+            for t in fitting_feedback.curvature_locations(
+                piece.span,
+                limit.offset_mm,
+                limit.inward_sign,
+                fraction=curvature_fitting._SAMPLED_FRACTION,
+            )
+        )
+    return fitting_feedback.Refinement(tuple(sorted(locations)))
+
+
+def _forward_progress(span: c.BezierSpan) -> bool:
+    """Certify positive interior progress, not just a forward control polygon."""
+    controls = c._controls(span)
+    direction = (controls[-1][0] - controls[0][0], controls[-1][1] - controls[0][1])
+    a, b, d = (
+        (b[0] - a[0]) * direction[0] + (b[1] - a[1]) * direction[1]
+        for a, b in pairwise(controls)
+    )
+    # These are quadratic Bernstein coefficients of projected velocity. A
+    # negative middle coefficient still has positive minimum iff a*d > b*b.
+    # Strictness excludes a newly admitted interior stationary point.
+    return any(direction) and a >= 0 and d >= 0 and (b >= 0 or a * d > b * b)
+
+
+def _run_corners(fit: _Fit) -> set[float]:
+    # Unsplit graph chains end at branch/ownership terminals. These positions
+    # stay pinned, but need not retain a smooth inside ray across that junction.
+    return set(fit.corners) | (
+        {0.0, 1.0} if not fit.chain.free_loop and not fit.chain.fixed else set()
+    )
+
+
+def _local_window_refit(
+    fit: _Fit,
+    index: int,
+    guide: local_windows.Guide,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+    seconds: float,
+    *,
+    compact: bool = False,
+    apex: float | None = None,
+    free_corner_rays: bool = False,
+) -> tuple[_Fit | None, dict[str, object]]:
+    if apex is not None and (compact or not isfinite(apex) or not 0 < apex < 1):
+        raise ValueError(
+            "a local apex must be interior and separate from compact fitting"
+        )
+    corners = _run_corners(fit)
+    if free_corner_rays and not (
+        guide.start_t in corners
+        and (
+            guide.end_t_original in corners
+            or (
+                guide.end_t_original == 1
+                and fit.chain.points[0] == fit.chain.points[-1]
+                and 0 in corners
+            )
+        )
+    ):
+        return None, dict(status="endpoint-not-corner")
+    start = (
+        float(_scalar(guide.endpoint_positions, (0, 0))),
+        float(_scalar(guide.endpoint_positions, (0, 1))),
+    )
+    end = (
+        float(_scalar(guide.endpoint_positions, (1, 0))),
+        float(_scalar(guide.endpoint_positions, (1, 1))),
+    )
+    conversion = _Fit(
+        c._Chain((start, end), fixed=False),
+        np.array([0.0, 1.0]),
+        [],
+        [],
+        [],
+        [],
+    )
+    accepted: list[_Fit] = []
+    rejected: list[_RejectedFit] = []
+    corner_origins: dict[float, float] = {}
+
+    def accept(spline: BSpline) -> bool:
+        rejected.clear()
+        selected = spline
+        if guide.seam is not None and guide.seam not in spline.t:
+            selected = spline.insert_knot(guide.seam)
+        try:
+            pieces, intervals = _spline_pieces(conversion, index, tolerance, selected)
+        except ValueError as error:
+            if not str(error).startswith("smooth outline chain"):
+                raise
+            return False
+        # Preserve smooth splice rays. Established corner endpoints may change
+        # their inside rays while their exact positions remain pinned.
+        for position, anchor, inherited, pole in (
+            (0, start, guide.inherited_handles[0], 1),
+            (-1, end, guide.inherited_handles[1], 2),
+        ):
+            if free_corner_rays:
+                continue
+            controls = pieces[position].span.control_points
+            length = hypot(controls[pole][0] - anchor[0], controls[pole][1] - anchor[1])
+            handle = outline_simplification._handle(anchor, inherited, length)
+            if handle is None:
+                return False
+            controls = (
+                (anchor, handle, controls[2], controls[3])
+                if position == 0
+                else (controls[0], controls[1], handle, anchor)
+            )
+            pieces[position] = replace(
+                pieces[position], span=c.BezierSpan(controls, False, tolerance)
+            )
+        local = replace(conversion, pieces=pieces, intervals=intervals)
+        if not all(
+            _forward_progress(p.span) if free_corner_rays else c._monotone(p.span)
+            for p in pieces
+        ):
+            return False
+        if not all(
+            curvature.within_curvature(p.span, limit.offset_mm, limit.inward_sign)
+            for p in pieces
+        ):
+            rejected.append(_RejectedFit(spline, local))
+            return False
+        spans, mapped = guide.splice(
+            [p.span for p in fit.pieces],
+            fit.intervals,
+            [p.span for p in pieces],
+            intervals,
+        )
+        references: dict[float, float] = {}
+        for q, original in corner_origins.items():
+            value = guide.start_t + q * (guide.end_t - guide.start_t)
+            if q == guide.seam:
+                value = 0.0
+            elif guide.seam is not None and value > 1:
+                value -= 1
+            references[value] = original
+        for i, (a, b) in enumerate(mapped):
+            replacement = references.get(a, a), references.get(b, b)
+            if replacement != mapped[i]:
+                mapped[i] = replacement
+        if any(a >= b for a, b in mapped):
+            return False
+        checked = replace(
+            fit,
+            pieces=[c._Piece(index, i, i + 1, s) for i, s in enumerate(spans)],
+            intervals=mapped,
+            corners=sorted(
+                {
+                    t
+                    for t in fit.corners
+                    if (q := guide.to_local(t)) is None or not 0 < q < 1
+                }
+                | {corner_origins[q] for q in conversion.corners}
+            ),
+        )
+        if _source_failures(checked, tolerance):
+            rejected.append(_RejectedFit(spline, checked, source_failure=True))
+            return False
+        try:
+            unsafe, _ = c._unsafe_pair(checked.pieces)
+        except ValueError as error:
+            if str(error) != "curve topology exceeds 1,000,000 candidate pairs":
+                raise
+            return False
+        if unsafe:
+            return False
+        accepted.append(checked)
+        return True
+
+    def refine(spline: BSpline) -> fitting_feedback.Refinement:
+        if not rejected or rejected[-1].spline is not spline:
+            return fitting_feedback.Refinement()
+        failed = rejected[-1]
+        hints = _curvature_feedback(failed, limit, tolerance)
+        if not failed.source_failure:
+            return hints  # Converted window intervals already use local0..1.
+        return fitting_feedback.Refinement(
+            tuple(
+                t
+                for p in hints.curve_parameters
+                if (t := guide.to_local(p)) is not None
+            ),
+            tuple(
+                t
+                for p in hints.source_parameters
+                if (t := guide.to_local(p)) is not None
+            ),
+        )
+
+    indices = guide.window.indices(len(fit.pieces))
+    breaks = np.asarray(
+        [
+            0.0,
+            *[guide.to_local(fit.intervals[i][1]) for i in indices[:-1]],
+            1.0,
+        ],
+        dtype=np.float64,
+    )
+    if 2 * len(indices) <= curvature_fitting._MAX_SPANS:
+        breaks = np.unique(np.concatenate((breaks, (breaks[:-1] + breaks[1:]) / 2)))
+    # Existing intervals locate the small bends even beside long stretches.
+    # Reserve half the window's budget for the original uniform search.
+    deadline = monotonic() + max(0.0, seconds)
+    searches: list[dict[str, object]] = []
+    bad = [
+        i
+        for i in indices
+        if not curvature.within_curvature(
+            fit.pieces[i].span, limit.offset_mm, limit.inward_sign
+        )
+    ]
+    choices = _curvature_corner_choices(fit, limit, bad)
+    plans: list[tuple[FloatArray | None, dict[float, float]]] = []
+    for choice in choices:
+        origins: dict[float, float] = {}
+        for t in [*fit.corners, *choice]:
+            if (q := guide.to_local(t)) is not None and 0 < q < 1:
+                _ = origins.setdefault(q, t)
+        corners = sorted(origins)
+        selected_breaks = np.unique(np.concatenate((breaks, corners)))
+        if len(selected_breaks) > curvature_fitting._MAX_SPANS + 1:
+            if not corners:
+                continue
+            selected_breaks = np.asarray([0.0, *corners, 1.0])
+        if len(selected_breaks) <= curvature_fitting._MAX_SPANS + 1 and (
+            not plans or plans[-1][1] != origins
+        ):
+            plans.append((selected_breaks, origins))
+    # Offer the existing smooth family before soft-budget corner proofs can
+    # consume its reserved half. All acceptance gates remain unchanged.
+    plans.insert(0, (None, {}))
+    if compact:
+        if any((q := guide.to_local(t)) is not None and 0 < q < 1 for t in fit.corners):
+            return None, dict(status="protected-corner")
+        plans = [(np.array([0.0, 0.5, 1.0]), {})]
+    elif apex is not None:
+        if any((q := guide.to_local(t)) is not None and 0 < q < 1 for t in fit.corners):
+            return None, dict(status="protected-corner")
+        reference = guide.start_t + apex * (guide.end_t - guide.start_t)
+        if apex == guide.seam:
+            reference = 0.0
+        elif reference > 1:
+            reference -= 1
+        plans = [(np.array([0.0, apex, 1.0]), {apex: reference})]
+    for position, (selected_breaks, corner_origins) in enumerate(plans):
+        remaining = max(0.0, deadline - monotonic())
+        if remaining <= 0:
+            break
+        accepted.clear()
+        rejected.clear()
+        corners = sorted(corner_origins)
+        conversion.corners = corners
+        proposal, diagnostics = curvature_fitting.refit(
+            guide.source_points,
+            guide.parameters,
+            limit.offset_mm,
+            limit.inward_sign,
+            tolerance,
+            periodic=False,
+            accept=accept,
+            refine=refine,
+            endpoint_positions=guide.endpoint_positions,
+            tangent_directions=None if free_corner_rays else guide.tangent_directions,
+            knot_breaks=selected_breaks,
+            corner_parameters=np.asarray(corners) if corners else None,
+            c1_parameters=np.array([0.5]) if compact else None,
+            source_search_fraction=1.0 if compact else None,
+            time_budget_seconds=(
+                remaining / 2
+                if position == 0 and selected_breaks is None and len(plans) > 1
+                else remaining / (len(plans) - position)
+            ),
+        )
+        basis = (
+            "compact-c1"
+            if compact
+            else "movable-apex"
+            if apex is not None
+            else "corner-intervals"
+            if corners
+            else "approved-intervals"
+            if selected_breaks is not None
+            else "uniform"
+        )
+        searches.append(dict(basis=basis, search=diagnostics))
+        if proposal is not None and accepted:
+            return accepted[-1], dict(diagnostics, basis=basis, searches=searches)
+    return None, dict(
+        status="time-budget" if monotonic() >= deadline else "unrefined",
+        searches=searches,
+    )
+
+
+def _apex_window_refit(
+    fit: _Fit,
+    index: int,
+    guide: local_windows.Guide,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+    seconds: float,
+    bad: Sequence[int],
+) -> tuple[_Fit | None, dict[str, object]]:
+    """Try the failing group's center, then its existing curvature witnesses."""
+    deadline = monotonic() + max(0.0, seconds)
+    selected = set(guide.window.indices(len(fit.pieces)))
+    failing = [i for i in bad if i in selected]
+
+    def lift(t: float) -> float:
+        return t + int(guide.seam is not None and t < guide.start_t)
+
+    endpoints = [lift(t) for i in failing for t in fit.intervals[i]]
+    middle = (min(endpoints) + max(endpoints)) / 2
+    witnesses = {
+        lift(a + t * (b - a))
+        for i in failing
+        for a, b in [fit.intervals[i]]
+        for t in fitting_feedback.curvature_locations(
+            fit.pieces[i].span, limit.offset_mm, limit.inward_sign
+        )
+    }
+    references = [middle, *sorted(witnesses - {middle})]
+    trials: list[dict[str, object]] = []
+    for position, reference in enumerate(references):
+        apex = guide.to_local(reference - 1 if reference >= 1 else reference)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        if apex is None or not 0 < apex < 1:
+            continue
+        proposal, search = _local_window_refit(
+            fit,
+            index,
+            guide,
+            limit,
+            tolerance,
+            remaining / (len(references) - position),
+            apex=apex,
+        )
+        trials.append(dict(source_parameter=reference % 1, search=search))
+        if proposal is not None or search.get("status") == "protected-corner":
+            return proposal, dict(search, apex_trials=trials)
+    return None, dict(
+        status="time-budget" if monotonic() >= deadline else "unrefined",
+        apex_trials=trials,
+    )
+
+
+def _local_curvature_refit(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+    deadline: float,
+    *,
+    compact: bool = False,
+    texture_only: bool = False,
+    inferred_corner: bool = False,
+) -> tuple[_Fit | None, dict[str, object]]:
+    started = monotonic()
+    working = fit
+    attempts: list[dict[str, object]] = []
+    repaired = 0
+    paddings = (1, 2, 4) if compact else (0, 1, 2, 4)
+    for level, padding in enumerate(paddings):
+        # Outside intervals survive splicing exactly. Remember failed regions
+        # by their source references, rather than indices that a repair shifts.
+        deferred: set[tuple[float, float]] = set()
+        while True:
+            bad = [
+                i
+                for i, piece in enumerate(working.pieces)
+                if not curvature.within_curvature(
+                    piece.span, limit.offset_mm, limit.inward_sign
+                )
+            ]
+            if not bad:
+                return working, dict(
+                    status="accepted",
+                    windows_repaired=repaired,
+                    attempts=attempts,
+                    elapsed_seconds=monotonic() - started,
+                )
+            if texture_only and any(
+                not any(
+                    max(a, working.intervals[i][0]) < min(b, working.intervals[i][1])
+                    for a, b in working.texture_intervals
+                )
+                for i in bad
+            ):
+                break  # Other failure neighborhoods retain ordinary repair.
+            if monotonic() >= deadline:
+                break
+            pending = [i for i in bad if working.intervals[i] not in deferred]
+            if not pending:
+                break
+            plans = local_windows.windows(
+                len(working.pieces),
+                pending,
+                periodic=working.chain.free_loop,
+                neighbors=padding,
+            )
+            improved = False
+            for position, window in enumerate(plans):
+                indices = set(window.indices(len(working.pieces)))
+                deferred.update(working.intervals[i] for i in bad if i in indices)
+                if (
+                    2 * window.count >= len(working.pieces) and not inferred_corner
+                ) or (window.count == len(working.pieces) and working.chain.free_loop):
+                    # Broad ordinary groups belong to whole-chain search. The
+                    # fixed two-cubic family stays bounded even on short chains.
+                    continue
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    guide = local_windows.prepare(
+                        window,
+                        working.chain.points,
+                        working.parameters,
+                        [p.span for p in working.pieces],
+                        working.intervals,
+                        periodic=working.chain.free_loop,
+                    )
+                except ValueError as error:
+                    if str(error) != "local repair has an unavailable endpoint tangent":
+                        raise
+                    continue
+                if texture_only and any(
+                    guide.start_t < barrier + shift < guide.end_t
+                    for barrier in working.texture_barriers
+                    for shift in (0, 1)
+                ):
+                    continue
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                # Give remaining windows equal shares and leave a share for
+                # each later growth level, so a small failed fit cannot starve
+                # the larger support that may make it feasible.
+                shares = len(plans) - position + len(paddings) - level - 1
+                tick = monotonic()
+                if inferred_corner:
+                    proposal, search = _apex_window_refit(
+                        working,
+                        index,
+                        guide,
+                        limit,
+                        tolerance,
+                        remaining / shares,
+                        bad,
+                    )
+                elif compact:
+                    proposal, search = _local_window_refit(
+                        working,
+                        index,
+                        guide,
+                        limit,
+                        tolerance,
+                        remaining / shares,
+                        compact=True,
+                    )
+                else:
+                    proposal, search = _local_window_refit(
+                        working, index, guide, limit, tolerance, remaining / shares
+                    )
+                attempts.append(
+                    dict(
+                        first=window.first,
+                        count=window.count,
+                        padding=padding,
+                        source_points=len(guide.source_points),
+                        search=search,
+                        wall_seconds=monotonic() - tick,
+                    )
+                )
+                if proposal is not None:
+                    working = proposal
+                    repaired += 1
+                    improved = True
+                    break  # Recompute windows: splicing changed their indices.
+            if not improved:
+                break
+        if monotonic() >= deadline:
+            break
+    return None, dict(
+        status="time-budget" if monotonic() >= deadline else "unrefined",
+        windows_repaired=repaired,
+        attempts=attempts,
+        elapsed_seconds=monotonic() - started,
+    )
+
+
+def _compact_curvature_candidate(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+    *,
+    texture_only: bool = False,
+) -> tuple[_Fit | None, dict[str, object]]:
+    """Try a small smooth family, optionally guided by local texture labels.
+
+    Two C1 cubics let curvature change across a shared tangent without adding a
+    sharp corner. Search can approach the full source limit; the unchanged exact
+    source, radius and palette proofs remain the acceptance authority.
+    """
+    return _local_curvature_refit(
+        fit,
+        index,
+        limit,
+        tolerance,
+        monotonic() + curvature_fitting._SECONDS / 3,
+        compact=True,
+        texture_only=texture_only,
+    )
+
+
+def _apex_curvature_candidate(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+) -> tuple[_Fit | None, dict[str, object]]:
+    """Offer one inferred corner only after the ordinary smooth families fail."""
+    return _local_curvature_refit(
+        fit,
+        index,
+        limit,
+        tolerance,
+        monotonic() + curvature_fitting._SECONDS / 3,
+        inferred_corner=True,
+    )
+
+
+def _corner_run_curvature_candidate(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+) -> tuple[_Fit | None, dict[str, object]]:
+    """Refit smooth runs bounded by established corners or graph terminals."""
+    deadline = monotonic() + curvature_fitting._SECONDS / 3
+    working = fit
+    attempts: list[dict[str, object]] = []
+    repaired = 0
+    while True:
+        bad = {
+            i
+            for i, piece in enumerate(working.pieces)
+            if not curvature.within_curvature(
+                piece.span, limit.offset_mm, limit.inward_sign
+            )
+        }
+        if not bad:
+            return working, dict(
+                status="accepted", windows_repaired=repaired, attempts=attempts
+            )
+        if monotonic() >= deadline:
+            break
+        corners = _run_corners(working)
+        stops = [i for i, (a, _) in enumerate(working.intervals) if a in corners]
+        size = len(working.pieces)
+        if working.chain.free_loop:
+            if len(stops) < 2:
+                break
+            stops.append(stops[0] + size)
+        elif 1 in corners or (
+            working.chain.points[0] == working.chain.points[-1] and 0 in corners
+        ):
+            stops.append(size)
+        windows = [
+            local_windows.Window(a, b - a)
+            for a, b in pairwise(stops)
+            if bad.intersection(range(a, b))
+            or (b > size and bad.intersection(range(b - size)))
+        ]
+        improved = False
+        for position, window in enumerate(windows):
+            guide = local_windows.prepare(
+                window,
+                working.chain.points,
+                working.parameters,
+                [p.span for p in working.pieces],
+                working.intervals,
+                periodic=working.chain.free_loop,
+            )
+            searches: list[dict[str, object]] = []
+            for compact in (True, False):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                shares = (len(windows) - position) * (2 if compact else 1)
+                proposal, search = _local_window_refit(
+                    working,
+                    index,
+                    guide,
+                    limit,
+                    tolerance,
+                    remaining / shares,
+                    compact=compact,
+                    free_corner_rays=True,
+                )
+                searches.append(dict(compact=compact, search=search))
+                if proposal is not None:
+                    working = proposal
+                    repaired += 1
+                    improved = True
+                    break
+            attempts.append(
+                dict(first=window.first, count=window.count, searches=searches)
+            )
+            if improved:
+                break  # Recompute run indices after splicing.
+        if not improved:
+            break
+    return working if repaired else None, dict(
+        status="partial" if repaired else "unrefined",
+        stop_reason="time-budget" if monotonic() >= deadline else "unrefined",
+        windows_repaired=repaired,
+        attempts=attempts,
+    )
+
+
+def _polygon_curvature_candidate(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+) -> tuple[_Fit | None, dict[str, object]]:
+    """Retain exact straight sides of a simple closed source primitive."""
+    points = fit.chain.points
+    unsupported: dict[str, object] = dict(status="unsupported-source")
+    if fit.chain.fixed or len(points) < 4 or points[0] != points[-1]:
+        return None, unsupported
+    vertices = [c._rational(point) for point in points[:-1]]
+    corners: list[int] = []
+    direction = 0
+    for i, b in enumerate(vertices):
+        a, d = vertices[i - 1], vertices[(i + 1) % len(vertices)]
+        u, v = (b[0] - a[0], b[1] - a[1]), (d[0] - b[0], d[1] - b[1])
+        turn = u[0] * v[1] - u[1] * v[0]
+        if not turn:
+            if u[0] * v[0] + u[1] * v[1] <= 0:
+                return None, unsupported
+            continue
+        sign = 1 if turn > 0 else -1
+        if direction and direction != sign:
+            return None, unsupported
+        direction = sign
+        corners.append(i)
+        if len(corners) > 4:
+            return None, unsupported
+    if len(corners) < 3:
+        return None, unsupported
+    # Keep the graph pin even when it is midway along a straight source edge.
+    indices = sorted({0, *corners, len(points) - 1})
+    parameters = [float(_scalar(fit.parameters, i)) for i in indices]
+    proposal = replace(
+        fit,
+        corners=[float(_scalar(fit.parameters, i)) for i in corners],
+        knots=parameters[1:-1],
+        pieces=[
+            c._Piece(index, i, i + 1, c._line(points[a], points[b]))
+            for i, (a, b) in enumerate(pairwise(indices))
+        ],
+        intervals=list(pairwise(parameters)),
+    )
+    if (
+        _source_failures(proposal, tolerance)
+        or not all(
+            c._monotone(p.span)
+            and curvature.within_curvature(p.span, limit.offset_mm, limit.inward_sign)
+            for p in proposal.pieces
+        )
+        or c._unsafe_pair(proposal.pieces)[0]
+    ):
+        return None, dict(status="uncertified")
+    return proposal, dict(
+        status="accepted",
+        corners=len(corners),
+        source_edges=len(proposal.pieces),
+        source_displacement_mm=0.0,
+    )
+
+
+def _whole_curvature_refit(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+    seconds: float,
+) -> tuple[_Fit | None, dict[str, object]]:
+    deadline = monotonic() + max(0.0, seconds)
+    if seconds <= 0:
+        return None, dict(status="time-budget")
+    if not fit.chain.free_loop and fit.chain.points[0] == fit.chain.points[-1]:
+        # A closed chain pinned at a graph junction must keep its approved
+        # branch directions. Position alone permits a tiny self-crossing there.
+        try:
+            guide = local_windows.prepare(
+                local_windows.Window(0, len(fit.pieces)),
+                fit.chain.points,
+                fit.parameters,
+                [p.span for p in fit.pieces],
+                fit.intervals,
+            )
+        except ValueError as error:
+            if str(error) != "local repair has an unavailable endpoint tangent":
+                raise
+            return None, dict(status="unrefined", reason=str(error))
+        return _local_window_refit(
+            fit, index, guide, limit, tolerance, max(0.0, deadline - monotonic())
+        )
+    accepted: list[_Fit] = []
+    rejected: list[_RejectedFit] = []
+    selected_corners: list[float] = []
+
+    def accept(spline: BSpline) -> bool:
+        rejected.clear()
+        checked = replace(fit, corners=selected_corners.copy())
+        try:
+            checked.pieces, checked.intervals = _spline_pieces(
+                checked, index, tolerance, spline
+            )
+        except ValueError as error:
+            if not str(error).startswith("smooth outline chain"):
+                raise
+            return False
+        if not all(c._monotone(p.span) for p in checked.pieces):
+            return False
+        if not all(
+            curvature.within_curvature(p.span, limit.offset_mm, limit.inward_sign)
+            for p in checked.pieces
+        ):
+            rejected.append(_RejectedFit(spline, checked))
+            return False
+        if _source_failures(checked, tolerance):
+            rejected.append(_RejectedFit(spline, checked, source_failure=True))
+            return False
+        accepted.append(checked)
+        return True
+
+    def refine(spline: BSpline) -> fitting_feedback.Refinement:
+        if not rejected or rejected[-1].spline is not spline:
+            return fitting_feedback.Refinement()
+        return _curvature_feedback(rejected[-1], limit, tolerance)
+
+    bad = [
+        i
+        for i, p in enumerate(fit.pieces)
+        if not curvature.within_curvature(p.span, limit.offset_mm, limit.inward_sign)
+    ]
+    corners = _curvature_corner_choices(fit, limit, bad)[-1]
+    interior_corners = [t for t in corners if 0 < t < 1]
+    plans: list[tuple[FloatArray | None, list[float]]] = []
+    if corners:
+        breaks = np.unique(np.asarray([0.0, *fit.knots, *interior_corners, 1.0]))
+        if len(breaks) > curvature_fitting._MAX_SPANS + 1:
+            breaks = np.asarray([0.0, *interior_corners, 1.0])
+        if len(breaks) <= curvature_fitting._MAX_SPANS + 1:
+            plans.append((breaks, corners))
+    plans.append((None, []))
+    searches: list[dict[str, object]] = []
+    diagnostics: dict[str, object] = dict(status="unrefined")
+    for position, (breaks, selected_corners) in enumerate(plans):
+        accepted.clear()
+        rejected.clear()
+        proposal, diagnostics = curvature_fitting.refit(
+            np.asarray(fit.chain.points),
+            fit.parameters,
+            limit.offset_mm,
+            limit.inward_sign,
+            tolerance,
+            periodic=fit.chain.free_loop and breaks is None,
+            accept=accept,
+            refine=refine,
+            knot_breaks=breaks,
+            corner_parameters=np.asarray(interior_corners)
+            if selected_corners and interior_corners
+            else None,
+            time_budget_seconds=max(0.0, deadline - monotonic())
+            / (len(plans) - position),
+        )
+        searches.append(
+            dict(
+                diagnostics, basis="corner-intervals" if selected_corners else "smooth"
+            )
+        )
+        if proposal is not None and accepted:
+            return accepted[-1], dict(diagnostics, searches=searches)
+    return None, dict(diagnostics, searches=searches)
+
+
+def _pinned_circle_candidate(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+) -> _Fit | None:
+    """Try a smooth small loop without moving its shared graph junction."""
+    from fractions import Fraction
+
+    if (
+        fit.chain.free_loop
+        or len(fit.chain.points) < 4
+        or fit.chain.points[0] != fit.chain.points[-1]
+    ):
+        return None
+    polygon = Polygon(fit.chain.points)
+    radius = limit.offset_mm / curvature_fitting._SAMPLED_FRACTION * 1.01
+    if not polygon.is_valid or polygon.is_empty or not isfinite(radius) or radius <= 0:
+        return None
+    xmin, ymin, xmax, ymax = polygon.bounds
+    if max(xmax - xmin, ymax - ymin) > 2 * (radius + tolerance):
+        return None
+    pin = fit.chain.points[0]
+    dx, dy = polygon.centroid.x - pin[0], polygon.centroid.y - pin[1]
+    length = hypot(dx, dy)
+    if not isfinite(length) or length == 0:
+        return None
+    center = pin[0] + radius * dx / length, pin[1] + radius * dy / length
+    theta = atan2(pin[1] - center[1], pin[0] - center[0])
+    orientation = 1 if polygon.exterior.is_ccw else -1
+    angles = [theta + orientation * i * pi / 2 for i in range(5)]
+    anchors = [
+        (center[0] + radius * cos(a), center[1] + radius * sin(a)) for a in angles
+    ]
+    anchors[0] = anchors[-1] = pin
+    poles = [pin]
+    handle = orientation * radius * 4 * (sqrt(2) - 1) / 3
+    for i, (a, b) in enumerate(pairwise(angles)):
+        poles.extend(
+            [
+                (anchors[i][0] - handle * sin(a), anchors[i][1] + handle * cos(a)),
+                (
+                    anchors[i + 1][0] + handle * sin(b),
+                    anchors[i + 1][1] - handle * cos(b),
+                ),
+                anchors[i + 1],
+            ]
+        )
+    spline = BSpline(
+        [0.0] * 4 + [0.25] * 3 + [0.5] * 3 + [0.75] * 3 + [1.0] * 4, poles, 3
+    )
+    # Canonicalize a smooth seam, then restore the source junction exactly.
+    temporary = replace(fit, chain=replace(fit.chain, free_loop=True), corners=[])
+    try:
+        pieces, intervals = _spline_pieces(temporary, index, tolerance, spline)
+    except ValueError as error:
+        if not str(error).startswith("smooth outline chain"):
+            raise
+        return None
+    seam = pieces[0].span.control_points[0]
+    for position, pole in ((0, 1), (-1, 2)):
+        controls = list(pieces[position].span.control_points)
+        exact = tuple(
+            Fraction(pin[j]) + Fraction(controls[pole][j]) - Fraction(seam[j])
+            for j in (0, 1)
+        )
+        point = float(exact[0]), float(exact[1])
+        if c._rational(point) != exact:
+            return None
+        controls[pole], controls[0 if position == 0 else 3] = point, pin
+        pieces[position] = replace(
+            pieces[position],
+            span=c.BezierSpan(cast("c.Controls", tuple(controls)), False, tolerance),
+        )
+    proposal = replace(
+        fit, pieces=pieces, intervals=intervals, corners=[], knots=[0.25, 0.5, 0.75]
+    )
+    if (
+        not all(c._monotone(p.span) for p in pieces)
+        or not all(
+            curvature.within_curvature(p.span, limit.offset_mm, limit.inward_sign)
+            for p in pieces
+        )
+        or _source_failures(proposal, tolerance)
+        or c._unsafe_pair(pieces)[0]
+    ):
+        return None
+    return proposal
+
+
+def _curvature_candidate(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+    *,
+    local: bool = True,
+    time_budget_seconds: float | None = None,
+) -> tuple[_Fit | None, dict[str, object]]:
+    started = monotonic()
+    seconds = (
+        curvature_fitting._SECONDS
+        if time_budget_seconds is None
+        else max(0.0, min(curvature_fitting._SECONDS, time_budget_seconds))
+    )
+    deadline = started + seconds
+    if seconds == 0:
+        return None, dict(status="time-budget", total_elapsed_seconds=0.0)
+    # Certify a fallback within the same budget before the optimizer can spend
+    # it. Preferred searches retain inherited endpoint rays; this alternative
+    # may rotate them, while preserving the pin and all later topology gates.
+    circle = _pinned_circle_candidate(fit, index, limit, tolerance)
+    local_report: dict[str, object] | None = None
+    if local:
+        candidate, local_report = _local_curvature_refit(
+            fit, index, limit, tolerance, deadline
+        )
+        if candidate is not None:
+            return candidate, dict(
+                status="accepted",
+                strategy="local",
+                elapsed_seconds=monotonic() - started,
+                local_search=local_report,
+            )
+    candidate, diagnostics = _whole_curvature_refit(
+        fit, index, limit, tolerance, max(0.0, deadline - monotonic())
+    )
+    if candidate is None and circle is not None:
+        return circle, dict(
+            status="accepted",
+            strategy="pinned-circle",
+            local_search=local_report,
+            whole_search=diagnostics,
+            total_elapsed_seconds=monotonic() - started,
+        )
+    return candidate, dict(
+        diagnostics,
+        strategy="whole-chain",
+        local_search=local_report,
+        total_elapsed_seconds=monotonic() - started,
+    )
+
+
+def _curvature_corner_choices(
+    fit: _Fit,
+    limit: boundary_tapers.BoundaryTaper,
+    bad: Sequence[int],
+) -> list[list[float]]:
+    """Offer existing corners, then additional source turns near bad spans."""
+    points = np.asarray(fit.chain.points)
+    distances = np.concatenate(
+        ([0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+    )
+    intervals = [fit.intervals[i] for i in bad]
+    detected = _corners(points, distances, limit.offset_mm / 0.9, 0.0)
+    possible = {
+        *fit.source_corners,
+        *(float(_scalar(fit.parameters, i)) for i in detected),
+    }
+    added = {t for t in possible if any(a <= t <= b for a, b in intervals)} - set(
+        fit.corners
+    )
+    variants = [sorted(fit.corners)]
+    if added:
+        variants.append(sorted(set(fit.corners) | added))
+    return variants
+
+
+def _corner_curvature_candidates(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+    bad: Sequence[int],
+) -> list[tuple[_Fit, str]]:
+    """Certify a bounded corner family, awaiting full shared-palette checks.
+
+    Whole-chain alternatives may rotate graph-pin rays, like the existing
+    circle fallback. Ordinary local repairs retain their inherited rays.
+    """
+    points = np.asarray(fit.chain.points)
+    variants = _curvature_corner_choices(fit, limit, bad)
+    deadline = monotonic() + curvature_fitting._SECONDS
+    result: list[tuple[_Fit, str]] = []
+    seen: set[tuple[c.BezierSpan, ...]] = set()
+
+    def retain(proposal: _Fit, method: str) -> None:
+        spans = tuple(p.span for p in proposal.pieces)
+        if (
+            monotonic() >= deadline
+            or spans in seen
+            or not all(c._monotone(span) for span in spans)
+            or not all(
+                curvature.within_curvature(span, limit.offset_mm, limit.inward_sign)
+                for span in spans
+            )
+            or _source_failures(proposal, tolerance)
+        ):
+            return
+        if fit.chain.free_loop and 0.0 not in proposal.corners:
+            before, after = c._controls(spans[-1]), c._controls(spans[0])
+            u = (before[3][0] - before[2][0], before[3][1] - before[2][1])
+            v = (after[1][0] - after[0][0], after[1][1] - after[0][1])
+            if u[0] * v[1] != u[1] * v[0] or u[0] * v[0] + u[1] * v[1] <= 0:
+                return
+        try:
+            unsafe, _ = c._unsafe_pair(proposal.pieces)
+        except ValueError as error:
+            if str(error) != "curve topology exceeds 1,000,000 candidate pairs":
+                raise
+            return
+        if not unsafe:
+            seen.add(spans)
+            result.append((proposal, method))
+
+    # These are resource bounds on a fallback, not geometric acceptance limits.
+    maximum = 2 * curvature_fitting._MAX_SPANS
+    for corners in variants:
+        if monotonic() >= deadline:
+            break
+        nodes = sorted({0.0, 1.0, *corners})
+        knots = sorted({*fit.knots, *corners})
+        if len(nodes) - 1 > maximum:
+            continue
+        base = replace(fit, corners=corners, knots=[t for t in knots if 0 < t < 1])
+        sampled = _sample(points, fit.parameters, np.asarray(nodes))
+        anchors = [
+            (float(_scalar(sampled, (i, 0))), float(_scalar(sampled, (i, 1))))
+            for i in range(len(nodes))
+        ]
+        chords = replace(
+            base,
+            pieces=[
+                c._Piece(index, i, i + 1, c._line(a, b, tolerance))
+                for i, (a, b) in enumerate(pairwise(anchors))
+            ],
+            intervals=list(pairwise(nodes)),
+        )
+        retain(chords, "source-corner-chords")
+        if (
+            len(base.knots) + 1 > maximum
+            or len(points) > curvature_fitting._MAX_POINTS
+            or monotonic() >= deadline
+        ):
+            continue
+        try:
+            pieces, times = _pieces(base, index, tolerance)
+        except SplineRefinementNeeded:
+            continue
+        except ValueError as error:
+            if (
+                not str(error).startswith("smooth outline chain")
+                and str(error) != "spline interval has no source forward direction"
+            ):
+                raise
+            continue
+        curved = replace(base, pieces=pieces, intervals=times)
+        retain(curved, "source-corner-curves")
+        stops = set(nodes)
+        mixed = replace(
+            curved,
+            pieces=[
+                replace(
+                    p,
+                    span=c._line(
+                        p.span.control_points[0], p.span.control_points[-1], tolerance
+                    ),
+                )
+                if a in stops and b in stops
+                else p
+                for p, (a, b) in zip(pieces, times, strict=True)
+            ],
+        )
+        retain(mixed, "source-corner-mixed")
+    return result
+
+
 def _curvature_verified(
     fits: Sequence[_Fit],
     uses: Sequence[Sequence[tuple[int, bool]]],
@@ -844,66 +2150,62 @@ def _curvature_verified(
     changed: set[int] = set()
     attempted: set[int] = set()
     records: list[dict[str, object]] = []
+    pools: dict[int, list[tuple[_Fit, str]]] = {}
+    budgets: dict[int, float] = {}
+    smooth_attempted: set[int] = set()
+    preferred_candidates: dict[int, _Fit] = {}
     for index, limit in limits.items():
         fit = fits[index]
-        if limit.offset_mm == 0 or all(
-            curvature.within_curvature(p.span, limit.offset_mm, limit.inward_sign)
-            for p in fit.pieces
-        ):
+        if limit.offset_mm == 0:
+            continue
+        bad = [
+            i
+            for i, piece in enumerate(fit.pieces)
+            if not curvature.within_curvature(
+                piece.span, limit.offset_mm, limit.inward_sign
+            )
+        ]
+        if not bad:
             continue
         attempted.add(index)
-        accepted: list[_Fit] = []
-
-        def accept(
-            spline: BSpline,
-            fit: _Fit = fit,
-            index: int = index,
-            limit: boundary_tapers.BoundaryTaper = limit,
-            accepted: list[_Fit] = accepted,
-        ) -> bool:
-            checked = replace(fit, corners=[])
-            try:
-                checked.pieces, checked.intervals = _spline_pieces(
-                    checked, index, tolerance, spline
-                )
-            except ValueError as error:
-                if not str(error).startswith("smooth outline chain"):
-                    raise
-                return False
-            if not all(
-                c._monotone(p.span)
-                and _certified(checked, p, tolerance)
-                and curvature.within_curvature(
-                    p.span, limit.offset_mm, limit.inward_sign
-                )
-                for p in checked.pieces
-            ):
-                return False
-            accepted.append(checked)
-            return True
-
-        proposal, diagnostics = curvature_fitting.refit(
-            np.asarray(fit.chain.points),
-            fit.parameters,
-            limit.offset_mm,
-            limit.inward_sign,
-            tolerance,
-            periodic=fit.chain.free_loop,
-            accept=accept,
-        )
-        if proposal is not None and accepted:
-            candidates[index] = accepted[-1]
-            changed.add(index)
-        records.append(
-            dict(
-                chain=index,
-                left_material=limit.left,
-                right_material=limit.right,
-                offset_mm=limit.offset_mm,
-                inward_sign=limit.inward_sign,
-                search=diagnostics,
+        tick = monotonic()
+        pool = _corner_curvature_candidates(fit, index, limit, tolerance, bad)
+        budgets[index] = max(0.0, curvature_fitting._SECONDS - (monotonic() - tick))
+        detail_search: dict[str, object] | None = None
+        if any(
+            max(a, fit.intervals[i][0]) < min(b, fit.intervals[i][1])
+            for a, b in fit.texture_intervals
+            for i in bad
+        ):
+            preferred, detail_search = _compact_curvature_candidate(
+                fit, index, limit, tolerance, texture_only=True
             )
+            if preferred is not None:
+                preferred_candidates[index] = preferred
+                pool.insert(0, (preferred, "fine-texture-smooth"))
+        if pool:
+            proposal, method = pool.pop(0)
+            pools[index] = pool
+            diagnostics: dict[str, object] = dict(status="accepted", strategy=method)
+        else:
+            smooth_attempted.add(index)
+            proposal, diagnostics = _curvature_candidate(
+                fit, index, limit, tolerance, time_budget_seconds=budgets[index]
+            )
+        if proposal is not None:
+            candidates[index] = proposal
+            changed.add(index)
+        record: dict[str, object] = dict(
+            chain=index,
+            left_material=limit.left,
+            right_material=limit.right,
+            offset_mm=limit.offset_mm,
+            inward_sign=limit.inward_sign,
+            search=diagnostics,
         )
+        if detail_search is not None:
+            record["detail_search"] = detail_search
+        records.append(record)
     verified = _verify_refits(
         fits,
         candidates,
@@ -915,21 +2217,148 @@ def _curvature_verified(
         original_curves,
         original_proxy,
     )
+    accepted = verified.accepted.copy()
+    blocked = verified.blocked.copy()
+    # A simpler individual fit may close a gap against a different chain.
+    # Retry only the rolled-back chains with their next certified alternative;
+    # retain unrelated accepted repairs. Exhausted corner pools still get one
+    # ordinary repair attempt using the boundary's remaining search budget.
+    for _ in range(max((len(pool) for pool in pools.values()), default=0) + 1):
+        retry = {
+            i for i in verified.blocked if pools.get(i) or i not in smooth_attempted
+        }
+        if not retry:
+            break
+        next_fits = list(verified.fits)
+        proposed: set[int] = set()
+        for i in retry:
+            if pools.get(i):
+                next_fits[i], method = pools[i].pop(0)
+            else:
+                smooth_attempted.add(i)
+                proposal, search = _curvature_candidate(
+                    fits[i], i, limits[i], tolerance, time_budget_seconds=budgets[i]
+                )
+                next(r for r in records if r["chain"] == i)["fallback_search"] = search
+                if proposal is None:
+                    continue
+                next_fits[i] = proposal
+                method = "curvature-search"
+            proposed.add(i)
+            next(r for r in records if r["chain"] == i)["palette_retry_strategy"] = (
+                method
+            )
+        if not proposed:
+            break
+        verified = _verify_refits(
+            verified.fits,
+            next_fits,
+            proposed,
+            uses,
+            ranges,
+            source,
+            tolerance,
+            verified.curves,
+            verified.proxy,
+        )
+        accepted.update(verified.accepted)
+        blocked.difference_update(verified.accepted)
+        blocked.update(verified.blocked)
+    for record in records:
+        if record["chain"] in accepted:
+            record["selected_strategy"] = record.get(
+                "palette_retry_strategy",
+                cast("dict[str, object]", record["search"]).get("strategy"),
+            )
+    # Later families only touch unresolved chains. Recheck cached preferred
+    # fits against stabilized neighbors before offering one inferred corner.
+    for family, method, refit in (
+        ("compact", "compact-local-c1", _compact_curvature_candidate),
+        ("apex", "inferred-local-corner", _apex_curvature_candidate),
+        ("polygon", "source-convex-polygon", _polygon_curvature_candidate),
+        ("corner_run", "corner-delimited-run", _corner_run_curvature_candidate),
+    ):
+        next_fits = list(verified.fits)
+        next_changed: set[int] = set()
+        for index in sorted(attempted - accepted):
+            proposal = preferred_candidates.get(index) if family == "compact" else None
+            if proposal is None:
+                proposal, search = refit(
+                    verified.fits[index], index, limits[index], tolerance
+                )
+                next(r for r in records if r["chain"] == index)[family + "_search"] = (
+                    search
+                )
+            if proposal is not None:
+                next_fits[index] = proposal
+                next_changed.add(index)
+        if not next_changed:
+            continue
+        verified = _verify_refits(
+            verified.fits,
+            next_fits,
+            next_changed,
+            uses,
+            ranges,
+            source,
+            tolerance,
+            verified.curves,
+            verified.proxy,
+        )
+        accepted.update(verified.accepted)
+        blocked.difference_update(verified.accepted)
+        blocked.update(verified.blocked)
+        for index in verified.accepted:
+            next(r for r in records if r["chain"] == index)["selected_strategy"] = (
+                "fine-texture-smooth"
+                if family == "compact" and index in preferred_candidates
+                else method
+            )
+    # Palette acceptance can retain successful local runs while other spans
+    # still need contact cleanup. Report actual selected controls and intervals;
+    # neither a selected partial repair nor a rollback certifies the chain.
+    uncertified = {
+        index: bad
+        for index in sorted(attempted)
+        if (
+            bad := [
+                i
+                for i, piece in enumerate(verified.fits[index].pieces)
+                if not curvature.within_curvature(
+                    piece.span, limits[index].offset_mm, limits[index].inward_sign
+                )
+            ]
+        )
+    }
+    remaining = [
+        dict(
+            chain=index,
+            offset_mm=limits[index].offset_mm,
+            inward_sign=limits[index].inward_sign,
+            spans=[
+                dict(piece=i, interval=verified.fits[index].intervals[i]) for i in bad
+            ],
+        )
+        for index, bad in sorted(uncertified.items())
+    ]
     return (
         verified.curves,
         verified.proxy,
         {
             "boundary_curvature": {
                 "maximum_curvature_times_offset": 0.9,
+                "margin_status": "unresolved" if remaining else "certified",
+                "unresolved_boundaries": remaining,
                 "material_taper_runs_mm": material_runs,
                 "attempted_chains": len(attempted),
-                "refined_chains": len(verified.accepted),
-                "unrefined_chains": sorted(attempted - verified.accepted),
-                "topology_rejected_chains": sorted(verified.blocked),
+                "refined_chains": len(attempted - uncertified.keys()),
+                "partially_refined_chains": sorted(accepted & uncertified.keys()),
+                "unrefined_chains": sorted(uncertified),
+                "topology_rejected_chains": sorted(blocked),
                 "topology_rejection": verified.rejection,
                 "boundaries": records,
                 "policy": "retain source features when a bounded refit is unavailable; early counter closure remains permitted",
-                "certificate": "signed exact rational continuous curvature bound, original source error and complete palette topology",
+                "certificate": "continuous curvature certified for repaired local runs and fully refined chains; remaining selected spans reported as unresolved; original source error and complete palette topology certified for all selected outlines",
             },
             "selected_unique_spans": sum(len(f.pieces) for f in verified.fits),
         },
@@ -945,14 +2374,17 @@ def fit_outlines(
     corner_softening_mm: float = 0.0,
     fairing_mm: float = 0.25,
     span_simplification_mm: float = 0.0,
+    point_contact_scale_mm: float = 0.0,
+    edge_detail_scale_mm: float = 0.0,
     material_taper_runs_mm: tuple[float, float, float] | None = None,
     palette: Palette | None = None,
 ) -> c.CurveFitResult:
     """Fit shared outlines with movable smooth joins and physical-scale corners.
 
-    No source islands/counters are removed. If a smooth fit cannot satisfy the
-    requested distance and topology bounds, report it instead of restoring a
-    pixel staircase. Zero tolerance requests the existing exact representation.
+    Optional point-contact repair attaches small raster fragments after tracing,
+    retaining the original source-distance limit and other fitted curves.
+    Otherwise source islands/counters retain their original topology. Zero
+    tolerance requests the existing exact representation.
     """
     for value, name, positive in (
         (cast("object", tolerance_mm), "tolerance", False),
@@ -961,6 +2393,8 @@ def fit_outlines(
         (cast("object", corner_softening_mm), "corner softening", False),
         (cast("object", fairing_mm), "fairing scale", False),
         (cast("object", span_simplification_mm), "span simplification", False),
+        (cast("object", point_contact_scale_mm), "point-contact scale", False),
+        (cast("object", edge_detail_scale_mm), "edge-detail scale", False),
     ):
         if (
             isinstance(value, bool)
@@ -1023,7 +2457,16 @@ def fit_outlines(
             for knot in (0.25, 0.5, 0.75):
                 if not any(abs(value - knot) < 1e-10 for value in knots):
                     knots.add(knot)
-        fit = _Fit(chain, parameters, corners, sorted(knots), [], [], fairing_mm)
+        fit = _Fit(
+            chain,
+            parameters,
+            corners,
+            sorted(knots),
+            [],
+            [],
+            fairing_mm,
+            source_corners=tuple(corners),
+        )
         if chain.fixed:
             fit.pieces = [
                 c._Piece(index, i, i + 1, c._line(a, b))
@@ -1032,8 +2475,16 @@ def fit_outlines(
                 )
             ]
         fits.append(fit)
+    detail_diagnostics = (
+        _detail_guidance(fits, source, edge_detail_scale_mm)
+        if edge_detail_scale_mm > 0
+        else {}
+    )
     refinement_count = 0
     constraint_refinements = 0
+    certificates: dict[
+        int, tuple[list[c._Piece], list[tuple[float, float]], set[int]]
+    ] = {}
     for iteration in range(14):
         unresolved: set[tuple[int, int]] = set()
         refit = False
@@ -1059,11 +2510,18 @@ def fit_outlines(
                 constraint_refinements += 1
                 refit = True
                 continue
-            for piece in fit.pieces:
-                if not c._monotone(piece.span) or not _certified(
-                    fit, piece, tolerance_mm
-                ):
-                    unresolved.add((index, piece.start))
+            cached = certificates.get(index)
+            if (
+                cached is None
+                or cached[0] is not fit.pieces
+                or cached[1] is not fit.intervals
+            ):
+                failed = _source_failures(fit, tolerance_mm)
+                failed.update(p.start for p in fit.pieces if not c._monotone(p.span))
+                certificates[index] = fit.pieces, fit.intervals, failed
+            else:
+                failed = cached[2]
+            unresolved.update((index, piece) for piece in failed)
         if refit:
             continue
         pieces = [p for fit in fits for p in fit.pieces]
@@ -1130,6 +2588,7 @@ def fit_outlines(
                             corner_softening_mm,
                             curves,
                             proxy,
+                            material_taper_runs_mm=material_taper_runs_mm,
                         )
                     )
                 simplification_diagnostics: dict[str, object] = {}
@@ -1144,6 +2603,7 @@ def fit_outlines(
                             span_simplification_mm,
                             curves,
                             proxy,
+                            material_taper_runs_mm=material_taper_runs_mm,
                         )
                     )
                 curvature_diagnostics: dict[str, object] = {}
@@ -1158,6 +2618,36 @@ def fit_outlines(
                         curves,
                         proxy,
                     )
+                contact_diagnostics: dict[str, object] = {}
+                if point_contact_scale_mm > 0 and material_taper_runs_mm is not None:
+                    curves, proxy, contact_diagnostics = contact_refinement.refine(
+                        source,
+                        curves,
+                        proxy,
+                        scale_mm=point_contact_scale_mm,
+                        tolerance_mm=tolerance_mm,
+                        material_runs=material_taper_runs_mm,
+                        proxy_tolerance_mm=proxy_tolerance,
+                    )
+                    if contact_diagnostics.get("changed"):
+                        curvature_diagnostics["pre_contact_boundary_curvature"] = (
+                            curvature_diagnostics.pop("boundary_curvature", {})
+                        )
+                        try:
+                            boundary_tapers.require_curvature(
+                                curves, material_taper_runs_mm
+                            )
+                        except boundary_tapers.CurvatureLimitError as error:
+                            failures = sorted(error.failures)
+                        else:
+                            failures = []
+                        curvature_diagnostics["boundary_curvature"] = {
+                            "maximum_curvature_times_offset": 0.9,
+                            "margin_status": "unresolved" if failures else "certified",
+                            "unresolved_selected_spans": failures,
+                            "material_taper_runs_mm": material_taper_runs_mm,
+                            "scope": "after local point-contact interpretation",
+                        }
                 diagnostics: dict[str, object] = dict(
                     method="joint cubic B-spline outline fitting",
                     mode="curves",
@@ -1191,12 +2681,18 @@ def fit_outlines(
                         for f in fits
                         for t in f.corners
                     ],
-                    error_certificate="exact rational Bernstein bounds including moved spline endpoints",
+                    error_certificate="continuous bidirectional source distance with exact rational bounds",
                     topology_certificate="native-to-proxy control-hull homotopy and original palette relationships",
                 )
                 diagnostics.update(softening_diagnostics)
                 diagnostics.update(simplification_diagnostics)
                 diagnostics.update(curvature_diagnostics)
+                diagnostics.update(contact_diagnostics)
+                diagnostics.update(detail_diagnostics)
+                if contact_diagnostics.get("changed"):
+                    diagnostics["topology_certificate"] = (
+                        "native-to-proxy control-hull homotopy and interpreted palette relationships"
+                    )
                 return c.CurveFitResult(
                     curves,
                     proxy,

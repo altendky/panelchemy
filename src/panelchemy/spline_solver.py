@@ -16,6 +16,8 @@ from scipy.optimize import LinearConstraint, minimize
 from scipy.sparse import coo_array, csr_array, hstack, vstack
 from scipy.sparse.linalg import lsqr
 
+from panelchemy.numeric_threads import single_threaded_blas
+
 type FloatArray = NDArray[np.float64]
 type FloatSparse = csr_array[np.float64, tuple[int, int]]
 
@@ -44,6 +46,7 @@ def _derivative_rows(knots: FloatArray) -> FloatSparse:
     return csr_array((values, (rows, columns)), shape=(count - 1, count))
 
 
+@single_threaded_blas
 def solve_coefficients(
     matrix: FloatSparse,
     target: FloatArray,

@@ -21,9 +21,12 @@ design, use these artwork targets:
 
 Whiskers and lettering may need thicker bodies while retaining pointed ends.
 These are design targets awaiting physical evaluation, not verified print limits.
-The current converter does not automatically enforce them or delete small
-features. Contour approximation controls outline accuracy; its tolerance is a
-separate setting and does not impose a minimum feature size.
+The converter can join bounded point-connected fragments to one larger feature
+and fill tiny counters created by those contacts. It certifies these changes
+against the original outline-error limit and preserves the parent's existing
+holes. The wider 1 mm design targets still need to come from the artwork.
+Contour approximation controls outline accuracy; its tolerance is a separate
+setting and does not impose a minimum feature size.
 
 Measure at the final physical size. Use the configured nozzle diameter to plan
 resolution: assume a printed line width of **1.25 × nozzle diameter**, and aim

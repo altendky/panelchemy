@@ -267,8 +267,8 @@ def _without_open_internal_wires(shape: TopoDS_Shape) -> TopoDS_Shape:
     Closed loops and every boundary edge remain. These open INTERNAL wires
     delimit no surface area; removing them does not simplify artwork or impose
     a minimum feature size. Verify exact boundary identity on the working copy,
-    plus native validity and area. Curved volume integration may change slightly
-    when INTERNAL integration annotations disappear despite identical boundaries.
+    plus native validity and area. Exact oriented physical boundary identity
+    already preserves signed volume; no numerical mass comparison is needed.
     """
     if not _open_internal_wires(shape):
         return shape
@@ -285,12 +285,9 @@ def _without_open_internal_wires(shape: TopoDS_Shape) -> TopoDS_Shape:
     boundary_unchanged = _annotation_boundary_unchanged(copied, cleaned, removed)
     if not boundary_unchanged:
         raise KernelError("removing internal annotation wires changed CAD boundaries")
-    for measure in (area, volume):
-        before, after = measure(shape), measure(cleaned)
-        if abs(before - after) > max(1e-10, abs(before) * 1e-10):
-            if measure is volume and boundary_unchanged:
-                continue
-            raise KernelError("removing internal annotation wires changed CAD geometry")
+    before, after = area(shape), area(cleaned)
+    if abs(before - after) > max(1e-10, abs(before) * 1e-10):
+        raise KernelError("removing internal annotation wires changed CAD geometry")
     return cleaned
 
 

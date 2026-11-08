@@ -21,7 +21,14 @@ from shapely import union_all
 from shapely.geometry import MultiPolygon, Polygon
 from shapely.geometry.base import BaseGeometry
 
-from panelchemy import curved_occt, material_partition, native_curves, occt
+from panelchemy import (
+    boundary_tapers,
+    curved_occt,
+    material_partition,
+    native_curves,
+    occt,
+    planar_boundary,
+)
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours, vectorize
 from panelchemy.curves import CurveContours, Point2, fit_contours
@@ -126,6 +133,8 @@ def build_relief(
                 corner_softening_mm=profile.corner_softening_mm,
                 fairing_mm=profile.tracing_radius_mm,
                 span_simplification_mm=profile.span_simplification_mm,
+                point_contact_scale_mm=profile.assumed_line_width_mm,
+                edge_detail_scale_mm=profile.assumed_line_width_mm,
                 material_taper_runs_mm=(
                     0.0,
                     profile.orange_thickness_mm * profile.taper_run_per_height,
@@ -142,6 +151,15 @@ def build_relief(
                 mode=profile.contour_mode,
             )
         curves = fitted.contours
+        boundary_tapers.require_curvature(
+            curves,
+            (
+                0.0,
+                profile.orange_thickness_mm * profile.taper_run_per_height,
+                (profile.orange_thickness_mm + profile.white_thickness_mm)
+                * profile.taper_run_per_height,
+            ),
+        )
         contours = fitted.proxy
         approximation_diagnostics = fitted.diagnostics
         comparison_svg = fitted.comparison_svg
@@ -250,7 +268,14 @@ def build_relief(
             )
     black = occt.prism(contours.silhouette, 0, profile.black_top)
     untrimmed = occt.fuse(roofs)
-    clipping_solid = occt.prism(interior, profile.black_top, profile.white_top)
+    # This tool clips XY expansion only. Coincident end caps can make OCCT
+    # discard tiny valid top faces after a roof union inflates vertex tolerance.
+    raised_height = profile.white_top - profile.black_top
+    clipping_solid = occt.prism(
+        interior,
+        profile.black_top - raised_height,
+        profile.white_top + raised_height,
+    )
     raised = occt.common(untrimmed, clipping_solid)
     solid = occt.fuse([black, raised])
     solids = TopExp_Explorer(solid, TopAbs_SOLID)
@@ -276,7 +301,7 @@ def build_relief(
     ):
         raise occt.KernelError("material volumes do not account for the combined solid")
     expected_top = occt.fuse(expected_white_faces)
-    actual_top = occt.cross_section(solid, profile.white_top)
+    actual_top = planar_boundary.top_boundary(solid, profile.white_top)
     top_missing = occt.area(occt.cut(expected_top, actual_top))
     top_extra = occt.area(occt.cut(actual_top, expected_top))
     top_tolerance = max(1e-12, sum(p.area for p in contours.white) * 1e-8)

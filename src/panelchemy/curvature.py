@@ -101,8 +101,24 @@ def within_curvature(
     if span.is_line:
         # Line metadata uses only its endpoints, matching native construction.
         return points[0] != points[-1]
+    if _MAX_NODES < 1:
+        return False
     velocity = [[3 * (b[j] - a[j]) for a, b in pairwise(points)] for j in (0, 1)]
     acceleration = [[2 * (b - a) for a, b in pairwise(axis)] for axis in velocity]
+    margin_squared, offset_squared = margin**2, offset**2
+    # Endpoints are necessary conditions, so an exact violation can reject the
+    # span before constructing any Bernstein products. Zero speed is forbidden
+    # even when that curvature sign or a zero offset would otherwise be safe.
+    for i in (0, -1):
+        vx, vy = velocity[0][i], velocity[1][i]
+        ax, ay = acceleration[0][i], acceleration[1][i]
+        speed_squared = vx**2 + vy**2
+        signed_cross = vx * ay - vy * ax
+        if speed_squared == 0 or (
+            (direction == 0 or direction * signed_cross > 0)
+            and margin_squared * speed_squared**3 < offset_squared * signed_cross**2
+        ):
+            return False
     speed = [
         x + y
         for x, y in zip(
@@ -119,12 +135,24 @@ def within_curvature(
             strict=True,
         )
     ]
+    # Bernstein coefficient extrema enclose the entire scalar polynomial.
+    # These coarse certificates imply acceptance at the original proof's root;
+    # undecided cases retain the unchanged degree-twelve subdivision below.
+    minimum_speed = min(speed)
+    if minimum_speed > 0:
+        if (direction == 1 and max(cross) <= 0) or (
+            direction == -1 and min(cross) >= 0
+        ):
+            return True
+        maximum_cross = max(abs(value) for value in cross)
+        if margin_squared * minimum_speed**3 >= offset_squared * maximum_cross**2:
+            return True
     speed_cubed = _product(_product(speed, speed), speed)
     cross_squared = _elevate(_product(cross, cross), len(speed_cubed) - 1)
     # kappa = cross(r', r'') / |r'|^3. With positive speed the
     # squared inequality is equivalent to this degree-twelve polynomial bound.
     bound = [
-        margin**2 * s - offset**2 * n
+        margin_squared * s - offset_squared * n
         for s, n in zip(speed_cubed, cross_squared, strict=True)
     ]
     pending = [(speed, cross, bound, 0)]

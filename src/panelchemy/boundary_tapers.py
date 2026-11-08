@@ -2,7 +2,12 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import isfinite
+from fractions import Fraction
+from math import comb, isfinite
+from typing import cast
+
+from panelchemy import curvature
+from panelchemy.curves import BezierSpan, Controls, CurveContours, CurveRing
 
 
 @dataclass(frozen=True)
@@ -11,6 +16,101 @@ class BoundaryTaper:
     right: int
     offset_mm: float
     inward_sign: int
+
+
+class CurvatureLimitError(ValueError):
+    """Selected outlines cannot be certified for the requested taper.
+
+    Keep the exact geometry and failed bounds available for 2D diagnosis.
+    Neither a missing proof nor an exhausted search authorizes CAD construction.
+    """
+
+    def __init__(
+        self,
+        contours: CurveContours,
+        failures: dict[int, tuple[BezierSpan, BoundaryTaper]],
+    ) -> None:
+        self.contours: CurveContours = contours
+        self.failures: dict[int, tuple[BezierSpan, BoundaryTaper]] = failures
+        index, (_, limit) = next(iter(failures.items()))
+        super().__init__(
+            f"Minimum taper radius is not certified for {len(failures)} selected "
+            + f"boundary spans; first span {index} uses a {limit.offset_mm:.6g} mm "
+            + "boundary run with the required 0.9 curvature margin. "
+            + "Refit the unresolved outlines before CAD construction."
+        )
+
+
+def _positive_area(ring: CurveRing) -> bool:
+    """Exact orientation of the selected cubic geometry, not a sampled proxy."""
+    area = Fraction(0)
+    for span in ring.spans:
+        p = [tuple(Fraction(v) for v in point) for point in span.control_points]
+        if span.is_line:
+            area += p[0][0] * p[3][1] - p[0][1] * p[3][0]
+        else:
+            for i in range(4):
+                for j in range(3):
+                    dx, dy = (3 * (p[j + 1][a] - p[j][a]) for a in (0, 1))
+                    area += (p[i][0] * dy - p[i][1] * dx) * Fraction(
+                        comb(3, i) * comb(2, j), 6 * comb(5, i + j)
+                    )
+    if not area:
+        raise ValueError("a selected curved boundary must enclose nonzero area")
+    return area > 0
+
+
+def require_curvature(
+    contours: CurveContours, material_runs_mm: tuple[float, float, float]
+) -> None:
+    """Hard pre-CAD gate on actual selected curves and shared exposed heights.
+
+    Reconstruct exact shared-span ownership instead of trusting fitting status
+    metadata, which may describe an earlier or cached selection. Winding and
+    canonical direction do not change the required signed bound. The outer
+    silhouette is vertical; joins remain subject to native corner handling.
+    """
+    # Validate the runs even when every boundary is vertical.
+    _ = boundaries([[]], [range(1)], 0, material_runs_mm)
+    if not any(material_runs_mm):
+        return
+    selected: dict[tuple[bool, Controls], int] = {}
+    spans: list[BezierSpan] = []
+    uses: list[list[tuple[int, bool]]] = []
+    ranges: list[range] = []
+    for polygon in (contours.silhouette, *contours.orange, *contours.white):
+        first = len(uses)
+        for ring_index, ring in enumerate((polygon.exterior, *polygon.interiors)):
+            material_left = _positive_area(ring) == (ring_index == 0)
+            ring_uses: list[tuple[int, bool]] = []
+            for span in ring.spans:
+                controls = span.control_points
+                if span.is_line:
+                    # Native lines use endpoints only; unused metadata handles
+                    # must not prevent recognizing a shared straight boundary.
+                    controls = (controls[0], controls[0], controls[3], controls[3])
+                reverse = cast("Controls", tuple(reversed(controls)))
+                forward = controls <= reverse
+                key = span.is_line, controls if forward else reverse
+                index = selected.get(key)
+                if index is None:
+                    index = len(spans)
+                    selected[key] = index
+                    spans.append(BezierSpan(key[1], key[0]))
+                ring_uses.append((index, forward == material_left))
+            uses.append(ring_uses)
+        ranges.append(range(first, len(uses)))
+    limits = boundaries(uses, ranges, len(contours.orange), material_runs_mm)
+    failures = {
+        index: (spans[index], limit)
+        for index, limit in limits.items()
+        if limit.offset_mm > 0
+        and not curvature.within_curvature(
+            spans[index], limit.offset_mm, limit.inward_sign
+        )
+    }
+    if failures:
+        raise CurvatureLimitError(contours, failures)
 
 
 def boundaries(
