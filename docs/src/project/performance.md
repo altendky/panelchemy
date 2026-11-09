@@ -963,3 +963,35 @@ for an individual process, not aggregate worker memory. These are single
 shared-host measurements of this initial-pass subset; later fitting families,
 initial tracing, the contact stage and CAD were not rerun. This sample neither
 establishes a complete-conversion speedup nor accepts the evaluation panel.
+
+## Corner Repair Validation
+
+A later replay addressed the 41 genuine radius failures retained by the Torn
+contact-stage checkpoint above. Bounded corner alternatives repaired all 41
+without changing the 0.2 mm original-source limit, signed-radius margin, or
+palette relationships. Independent checks certified all 13 affected source
+rings and the complete palette's curvature. This is a planar tracing result;
+the complete contact stage has not been timed again with these repairs. A fresh
+replay of this final repair pass took 203.80 seconds, with about 513 MiB peak
+RSS. It excludes initial fitting, contact selection, and native construction.
+
+Six affected complete white components then passed stock native roof
+construction, top and taper-section checks, and BRep validity after save/reload.
+The serial probe took 193.17 seconds, with peak RSS about 789 MiB. Two roofs
+used the existing surface-intersection retry. The much larger main white
+component, full material assembly, and STEP export are outside this probe, so
+it establishes neither a complete model nor a full-conversion timing.
+
+The next full-panel attempt accepted 26 roofs, then stopped on a native planar
+face. An earlier attachment candidate left an endpoint about 1e-14 mm from a
+nonincident line. Exact checks saw a positive gap, while native vertex precision
+treated it as contact. Rejecting line contacts at coordinate-roundoff scale let
+the existing candidate pool choose another notch. That alternative passed the
+unchanged source, palette, radius, and complete native top-face checks. This
+local replay does not establish a fresh full-pipeline fit or completed STEP.
+
+The complete Torn conversion remains rejected in native volume assembly.
+The large regional arrangement loses separating walls and can combine intended
+material with empty space in one cell. This checkpoint does not resolve that
+construction failure or the remaining pixel-sized counters, and does not
+establish a completed Torn STEP export.

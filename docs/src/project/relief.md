@@ -487,6 +487,22 @@ share four seconds per unresolved chain. Successful runs are retained even if
 other spans on that chain remain unresolved, subject to complete source and
 palette verification. Later contact cleanup can build on those repairs.
 
+After contact cleanup, remaining radius failures get a bounded corner repair.
+It first tries intersecting the failed span's endpoint tangent rays. Existing
+corners may release their incident tangent directions; smooth outer joins keep
+their inherited rays. A two-span window can include a smooth neighbor when its
+outer endpoint is already a corner, but cannot erase an interior corner.
+Smooth vertices shared by other rings remain pinned too.
+Where both window ends are existing corners, a short original source arc can
+also propose two or three straight sides, simplified at 90% of the configured
+fit tolerance. These are local alternatives, not a return to pixel-cell tracing.
+
+Every candidate must pass continuous forward progress and signed curvature,
+the full original-source distance limit, and complete palette topology checks.
+Shared spans are excluded. Acceptance must remove at least one radius failure
+without adding another, so successful repairs survive later rejected trials.
+The hard pre-CAD radius gate and native taper validation still apply.
+
 Source detail is also classified at the assumed extrusion width and twice that
 width. Ordinary raster stairs make forward progress along an edge. Fine texture
 has repeated small backtracking or transverse excursions, with excess path
@@ -523,6 +539,11 @@ Both candidate families reject zero-length steps and consecutive segments that
 retrace each other within floating-point roundoff. The collinearity guard scales
 with coordinate precision, not nozzle size or the source-fit allowance, so
 resolved sharp points remain eligible and the search can try another candidate.
+The complete analytic-line pair check also rejects an endpoint that nearly
+touches another line's interior within eight coordinate ulps, excluding shared
+endpoints. Its spatial bounds include that same roundoff guard. This prevents
+selection from relying on an arithmetic-sized gap that CAD would collapse;
+it does not set a manufacturing minimum gap or relax the source-fit limit.
 
 Each accepted attachment requires the original continuous distance certificate
 against all separate raw component rings at the same configured tolerance.

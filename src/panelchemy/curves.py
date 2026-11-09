@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import lru_cache
-from math import fsum, hypot, inf, isfinite, nextafter
+from math import fsum, hypot, inf, isfinite, nextafter, ulp
 from typing import Literal, cast
 
 from shapely import STRtree, get_parts, union_all
@@ -735,17 +735,65 @@ def _disjoint(
     )
 
 
+def _roundoff_line_contact(
+    a: RationalControls,
+    b: RationalControls,
+    allowed: set[RationalPoint],
+    guard: Fraction,
+) -> bool:
+    """Reject ambiguous endpoint/interior gaps without moving either line."""
+    for endpoints, target in ((a, b), (b, a)):
+        start, end = target[0], target[-1]
+        direction = end[0] - start[0], end[1] - start[1]
+        length_squared = _squared(direction)
+        if not length_squared:
+            continue
+        for point in (endpoints[0], endpoints[-1]):
+            if point in allowed:
+                continue
+            delta = point[0] - start[0], point[1] - start[1]
+            projection = delta[0] * direction[0] + delta[1] * direction[1]
+            if 0 < projection < length_squared:
+                cross = delta[0] * direction[1] - delta[1] * direction[0]
+                if cross * cross <= guard * guard * length_squared:
+                    return True
+    return False
+
+
 def _unsafe_pair(
-    pieces: Sequence[_Piece], proof_cache: ProofCache | None = None
+    pieces: Sequence[_Piece],
+    proof_cache: ProofCache | None = None,
 ) -> tuple[list[tuple[int, int]], list[set[Fraction]]]:
+    # Match the contact constructor's arithmetic-uncertainty convention. This
+    # is a rejection guard, not clearance added to the source-fit allowance.
+    # Unused analytic-line handles must not determine world-coordinate scale.
+    guards = [
+        8
+        * max(
+            ulp(value)
+            for point in (piece.span.control_points[0], piece.span.control_points[-1])
+            for value in point
+        )
+        if piece.span.is_line
+        else 0.0
+        for piece in pieces
+    ]
     boxes = [
         box(
-            min(p[0] for p in piece.span.control_points),
-            min(p[1] for p in piece.span.control_points),
-            max(p[0] for p in piece.span.control_points),
-            max(p[1] for p in piece.span.control_points),
+            nextafter(min(p[0] for p in piece.span.control_points) - guard, -inf)
+            if guard
+            else min(p[0] for p in piece.span.control_points),
+            nextafter(min(p[1] for p in piece.span.control_points) - guard, -inf)
+            if guard
+            else min(p[1] for p in piece.span.control_points),
+            nextafter(max(p[0] for p in piece.span.control_points) + guard, inf)
+            if guard
+            else max(p[0] for p in piece.span.control_points),
+            nextafter(max(p[1] for p in piece.span.control_points) + guard, inf)
+            if guard
+            else max(p[1] for p in piece.span.control_points),
         )
-        for piece in pieces
+        for piece, guard in zip(pieces, guards, strict=True)
     ]
     tree = STRtree(boxes)
     controls = [_controls(piece.span) for piece in pieces]
@@ -757,18 +805,29 @@ def _unsafe_pair(
             if neighbor <= index:
                 continue
             checked += 1
-            if checked > 1000000:
+            if checked > 1_000_000:
                 raise ValueError("curve topology exceeds 1,000,000 candidate pairs")
-            a, b = (controls[index], controls[neighbor])
+            a, b = controls[index], controls[neighbor]
             allowed = {a[0], a[-1]} & {b[0], b[-1]}
             disjoint = (
                 _disjoint(a, b, allowed, cuts_a=cuts[index], cuts_b=cuts[neighbor])
                 if proof_cache is None
                 else proof_cache.disjoint(a, b, allowed, cuts[index], cuts[neighbor])
             )
+            # Evaluate this current guard even when the exact separation proof
+            # is cached: a positive binary-float gap can still be roundoff-sized.
+            if (
+                disjoint
+                and pieces[index].span.is_line
+                and pieces[neighbor].span.is_line
+                and _roundoff_line_contact(
+                    a, b, allowed, Fraction(max(guards[index], guards[neighbor]))
+                )
+            ):
+                disjoint = False
             if not disjoint:
                 unsafe.append((index, neighbor))
-    return (unsafe, cuts)
+    return unsafe, cuts
 
 
 def _flatten(

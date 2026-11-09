@@ -28,6 +28,7 @@ from shapely.geometry.polygon import orient
 from panelchemy import (
     boundary_tapers,
     contact_refinement,
+    corner_refinement,
     curvature,
     curvature_fitting,
     edge_detail,
@@ -1075,16 +1076,7 @@ def _curvature_feedback(
 
 def _forward_progress(span: c.BezierSpan) -> bool:
     """Certify positive interior progress, not just a forward control polygon."""
-    controls = c._controls(span)
-    direction = (controls[-1][0] - controls[0][0], controls[-1][1] - controls[0][1])
-    a, b, d = (
-        (b[0] - a[0]) * direction[0] + (b[1] - a[1]) * direction[1]
-        for a, b in pairwise(controls)
-    )
-    # These are quadratic Bernstein coefficients of projected velocity. A
-    # negative middle coefficient still has positive minimum iff a*d > b*b.
-    # Strictness excludes a newly admitted interior stationary point.
-    return any(direction) and a >= 0 and d >= 0 and (b >= 0 or a * d > b * b)
+    return corner_refinement.forward_progress(span)
 
 
 def _run_corners(fit: _Fit) -> set[float]:
@@ -2709,6 +2701,7 @@ def fit_outlines(
                         tolerance_mm=tolerance_mm,
                         material_runs=material_taper_runs_mm,
                         proxy_tolerance_mm=proxy_tolerance,
+                        repair_corners=True,
                     )
                     if contact_diagnostics.get("changed"):
                         curvature_diagnostics["pre_contact_boundary_curvature"] = (
