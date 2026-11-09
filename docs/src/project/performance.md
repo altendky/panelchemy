@@ -930,3 +930,36 @@ the original geometry. Of 57,634 hulls, the handle change reused 57,628 boxes an
 constructed six. First population incurred about 0.9 seconds extra and roughly
 22 MiB RSS. These are bounded assembly-only, shared-host measurements; no new
 complete contact-stage or conversion time is established by this experiment.
+
+### Process Workers for Independent Curvature Trials
+
+The first curvature-repair pass can now dispatch independent chains to spawned
+worker processes. Each job retains the existing corner family, optional texture
+candidate, smooth search and remaining-budget calculation. Only the chain,
+material-boundary limit, tolerance and failing-span indices are serialized;
+callbacks are created inside the child. Queue time does not consume its search
+allowance. Results return in source order, and complete panel verification,
+selective rollback and subsequent retry families remain in the coordinator.
+
+`relief` and `export` expose `--workers`; the core and file APIs accept the same
+positive integer execution setting. One worker is the default and calls the
+same trial function directly. Multiple workers use spawn rather than inheriting
+initialized numerical-library state. The existing scoped BLAS control remains
+active inside each process. Worker exceptions propagate without serial fallback.
+
+An eight-chain, evenly distributed sample from the retained current artwork
+checkpoint took 21.12 seconds to generate candidates serially and 14.16 seconds
+with four workers, including pool startup and shutdown. All controls and search
+statuses matched. Independent source/radius checks and complete palette
+verification accepted the same two repairs and rejected the same three of five
+proposals. A local repair may retain original unresolved spans; the independent
+check required that it introduce no new curvature failure.
+
+Central verification took 40.53 and 40.36 seconds respectively, making the
+sample's combined totals 61.64 and 54.51 seconds. One long search limits this
+small batch's parallel gain. Individual job payloads were about 0.9–13 KiB.
+Peak parent RSS was about 404 MiB; the child high-water report was about 400 MiB
+for an individual process, not aggregate worker memory. These are single
+shared-host measurements of this initial-pass subset; later fitting families,
+initial tracing, the contact stage and CAD were not rerun. This sample neither
+establishes a complete-conversion speedup nor accepts the evaluation panel.

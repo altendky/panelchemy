@@ -104,6 +104,7 @@ def build_relief(
     profile: ConstructionProfile | None = None,
     *,
     max_vertices: int = 25_000,
+    workers: int = 1,
 ) -> ReliefModel:
     """Preserve original plateaus; enlarge lower sections and split one solid.
 
@@ -115,6 +116,8 @@ def build_relief(
     profile = profile or ConstructionProfile()
     if type(max_vertices) is not int or max_vertices < 1:
         raise ValueError("max_vertices must be a positive integer")
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
     if result.silhouette_method != "explicit-mask" and result.warnings:
         raise ValueError(
             "Review the boundary warnings and supply an explicit silhouette before building relief"
@@ -157,6 +160,7 @@ def build_relief(
                     * profile.taper_run_per_height,
                 ),
                 palette=result.config.palette,
+                workers=workers,
             )
         else:
             fitted = fit_contours(
@@ -499,10 +503,13 @@ def process_relief_file(
     silhouette_path: Path | None = None,
     protected_paths: tuple[Path, ...] = (),
     max_vertices: int = 25_000,
+    workers: int = 1,
     export_config: "ExportConfig | None" = None,
     step_only: bool = False,
 ) -> dict[str, object]:
     """Stage checked CAD and optional validated exports with shared provenance."""
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
     if step_only and export_config is not None:
         raise ValueError("STEP-only export cannot also request mesh export")
     names = [
@@ -542,7 +549,7 @@ def process_relief_file(
             separation_config,
             silhouette=silhouette_mask,
         )
-    model = build_relief(result, profile, max_vertices=max_vertices)
+    model = build_relief(result, profile, max_vertices=max_vertices, workers=workers)
     # Staging avoids publishing BRep files if a kernel write or preview fails.
     with TemporaryDirectory(prefix="panelchemy-relief-") as staging:
         stage = Path(staging)

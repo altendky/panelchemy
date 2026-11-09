@@ -17,6 +17,23 @@ a print-ready mesh or validated physical print.
 Use [model export](export.md) for exact STEP and checked combined/material STL
 files. Slicer project packaging is separate, deferred work.
 
+## Parallel Curvature Searches
+
+Use `--workers 4` with `relief` or `export` to run independent initial curvature
+repair searches in separate processes. The default is one worker. This execution
+setting is separate from the construction profile and applies to approximate
+curve fitting; it does not parallelize every conversion stage.
+
+Each child prepares one chain with the existing source and taper checks. The
+coordinator applies results in their original order, checks the combined panel,
+and performs later retries serially. Search budgets start when a child begins
+its work, so queued jobs retain their normal allowance. Worker errors abort the
+operation rather than silently substituting a different result.
+
+The `fit_outlines`, `build_relief` and `process_relief_file` APIs accept
+`workers=4` as well. Scripts using multiple workers must protect their entry
+point with `if __name__ == "__main__":` so spawned processes can import it safely.
+
 ## Construction Profile
 
 Use `--profile settings.json` with the

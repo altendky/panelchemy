@@ -207,8 +207,9 @@ def test_source_snapshot_remains_the_provenance_input(
         profile: ConstructionProfile | None = None,
         *,
         max_vertices: int = 25_000,
+        workers: int = 1,
     ) -> relief_module.ReliefModel:
-        model = original(result, profile, max_vertices=max_vertices)
+        model = original(result, profile, max_vertices=max_vertices, workers=workers)
         Image.new("RGB", image.size, "black").save(source)
         return model
 
