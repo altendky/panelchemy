@@ -58,6 +58,34 @@ class _Join:
     counters: tuple[Polygon, ...]
 
 
+@dataclass(frozen=True)
+class _ColorPlan:
+    joins: tuple[_Join, ...]
+    skipped: tuple[tuple[tuple[int, ...], str], ...]
+    replacements: dict[tuple[int, ...], Polygon | None]
+
+
+@dataclass(frozen=True)
+class ContactPlan:
+    """Reusable discovery for one read-only source and fixed physical limits.
+
+    Scope a plan to one refinement call; do not mutate its source lists while
+    selecting contacts. Only immutable source discoveries and finalized unions
+    are reused. Selected bridge conflicts are checked afresh for every subset.
+    """
+
+    source: PanelContours
+    scale_mm: float
+    half_size_mm: float
+    orange: _ColorPlan
+    white: _ColorPlan
+
+    def select(
+        self, selected_tips: frozenset[tuple[Color, int]] | None = None
+    ) -> ContactInterpretation:
+        return _select(self, selected_tips)
+
+
 def _number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be positive and finite")
@@ -100,12 +128,14 @@ def _holes(
 ) -> tuple[list[Polygon], list[Polygon]] | None:
     """Keep every old hole once; distinguish newly enclosed contact counters."""
     holes = [Polygon(ring) for ring in merged.interiors]
+    tree = STRtree(holes)
     owned: list[int] = []
-    for original in parent.interiors:
+    for ring in parent.interiors:
+        original = Polygon(ring)
         matches = [
             i
-            for i, hole in enumerate(holes)
-            if Polygon(original).relate_pattern(hole, "T********")
+            for i in cast("list[int]", tree.query(original).tolist())
+            if original.relate_pattern(holes[i], "T********")
         ]
         if len(matches) != 1 or matches[0] in owned:
             return None
@@ -132,16 +162,15 @@ def _clear(
     )
 
 
-def _color(
+def _prepare_color(
     polygons: list[Polygon],
     foreign: list[Polygon],
     silhouette: Polygon,
     scale: float,
     half_size: float,
-    selected_tips: frozenset[int] | None,
-) -> tuple[list[Polygon], SourceGroups, list[_Join], Counter[str]]:
+) -> _ColorPlan:
     tree, other = STRtree(polygons), STRtree(foreign)
-    skipped: Counter[str] = Counter()
+    skipped: list[tuple[tuple[int, ...], str]] = []
     small = {i for i, polygon in enumerate(polygons) if _extent(polygon) <= scale}
     neighbors = {i: set(_hits(tree, polygons[i])) - {i} for i in small}
     visited: set[int] = set()
@@ -161,22 +190,20 @@ def _color(
 
     joins: list[_Join] = []
     for members in clusters:
-        if selected_tips is not None and not selected_tips.intersection(members):
-            continue
         parts = [polygons[i] for i in members]
         if any(p.interiors for p in parts):
-            skipped["tip_has_holes"] += 1
+            skipped.append((members, "tip_has_holes"))
             continue
         if _extent(union_all(parts)) > 2 * scale:
-            skipped["cluster_too_large"] += 1
+            skipped.append((members, "cluster_too_large"))
             continue
         parents = {j for i in members for j in neighbors[i] if j not in small}
         if len(parents) != 1:
-            skipped["no_unique_parent"] += 1
+            skipped.append((members, "no_unique_parent"))
             continue
         parent = parents.pop()
         if polygons[parent].area <= sum(p.area for p in parts):
-            skipped["parent_not_larger"] += 1
+            skipped.append((members, "parent_not_larger"))
             continue
         allowed = {parent, *members}
         contacts: set[Point2] = set()
@@ -194,10 +221,10 @@ def _color(
             if non_point:
                 break
         if non_point:
-            skipped["non_point_contact"] += 1
+            skipped.append((members, "non_point_contact"))
             continue
         if any(p.intersects(silhouette.boundary) or _hits(other, p) for p in parts):
-            skipped["tip_touches_other_boundary"] += 1
+            skipped.append((members, "tip_touches_other_boundary"))
             continue
 
         bridges = [
@@ -214,15 +241,15 @@ def _color(
         if not all(
             _clear(bridge, allowed, tree, other, silhouette) for bridge in bridges
         ):
-            skipped["bridge_touches_other_boundary"] += 1
+            skipped.append((members, "bridge_touches_other_boundary"))
             continue
         merged = union_all([polygons[parent], *parts, *bridges])
         if not isinstance(merged, Polygon) or not merged.is_valid:
-            skipped["invalid_merged_topology"] += 1
+            skipped.append((members, "invalid_merged_topology"))
             continue
         holes = _holes(polygons[parent], merged)
         if holes is None:
-            skipped["parent_hole_changed"] += 1
+            skipped.append((members, "parent_hole_changed"))
             continue
         _, counters = holes
         if any(
@@ -230,7 +257,7 @@ def _color(
             or not _clear(counter, allowed, tree, other, silhouette)
             for counter in counters
         ):
-            skipped["contact_counter_blocked"] += 1
+            skipped.append((members, "contact_counter_blocked"))
             continue
         point = min(parent_contacts)
         apex = max(
@@ -250,6 +277,22 @@ def _color(
             )
         )
 
+    return _ColorPlan(tuple(joins), tuple(skipped), {})
+
+
+def _select_color(
+    plan: _ColorPlan,
+    polygons: list[Polygon],
+    silhouette: Polygon,
+    selected_tips: frozenset[int] | None,
+) -> tuple[list[Polygon], SourceGroups, list[_Join], Counter[str]]:
+    def is_selected(members: tuple[int, ...]) -> bool:
+        return selected_tips is None or bool(selected_tips.intersection(members))
+
+    joins = [join for join in plan.joins if is_selected(join.members)]
+    skipped = Counter(
+        reason for members, reason in plan.skipped if is_selected(members)
+    )
     # Independent bridges must not create a new relationship between parents.
     bridges = STRtree([join.bridge for join in joins])
     conflicting: set[int] = set()
@@ -271,22 +314,28 @@ def _color(
         indices = tuple(
             sorted([parent, *(i for join in children for i in join.members)])
         )
-        pieces: list[BaseGeometry] = [
-            *(polygons[i] for i in indices),
-            *(j.bridge for j in children),
-        ]
-        ordered = sorted(pieces, key=lambda p: (p.bounds, p.wkb))
-        merged = union_all(ordered)
-        if (
-            not isinstance(merged, Polygon)
-            or not merged.is_valid
-            or not silhouette.covers(merged)
-            or (holes := _holes(polygons[parent], merged)) is None
-            or holes[1]
-        ):
+        if indices not in plan.replacements:
+            pieces: list[BaseGeometry] = [
+                *(polygons[i] for i in indices),
+                *(j.bridge for j in children),
+            ]
+            ordered = sorted(pieces, key=lambda p: (p.bounds, p.wkb))
+            merged = union_all(ordered)
+            valid = (
+                isinstance(merged, Polygon)
+                and merged.is_valid
+                and silhouette.covers(merged)
+                and (holes := _holes(polygons[parent], merged)) is not None
+                and not holes[1]
+            )
+            plan.replacements[indices] = (
+                orient(cast("Polygon", merged.normalize())) if valid else None
+            )
+        replacement = plan.replacements[indices]
+        if replacement is None:
             skipped["invalid_merged_topology"] += len(children)
             continue
-        replacements[parent] = (orient(cast("Polygon", merged.normalize())), indices)
+        replacements[parent] = (replacement, indices)
         consumed.update(i for join in children for i in join.members)
         accepted.extend(children)
     if not replacements:
@@ -326,6 +375,15 @@ def before_graph(
     Selecting any member resolves its whole group; all other parts still
     participate in neighborhood checks and remain separate source components.
     """
+    return prepare(source, scale_mm=scale_mm, tolerance_mm=tolerance_mm).select(
+        selected_tips
+    )
+
+
+def prepare(
+    source: PanelContours, *, scale_mm: float, tolerance_mm: float
+) -> ContactPlan:
+    """Validate and discover source contacts once, before selecting any subset."""
     scale = _number(scale_mm, "contact scale")
     tolerance = _number(tolerance_mm, "contact tolerance")
     pitch = _number(source.mm_per_pixel, "source pixel pitch")
@@ -347,22 +405,35 @@ def before_graph(
         if j > i
     ):
         raise ValueError("source color regions must have disjoint interiors")
-    orange, orange_sources, orange_joins, orange_skipped = _color(
-        source.orange,
-        source.white,
-        source.silhouette,
+    return ContactPlan(
+        source,
         scale,
         half_size,
+        _prepare_color(
+            source.orange, source.white, source.silhouette, scale, half_size
+        ),
+        _prepare_color(
+            source.white, source.orange, source.silhouette, scale, half_size
+        ),
+    )
+
+
+def _select(
+    plan: ContactPlan, selected_tips: frozenset[tuple[Color, int]] | None
+) -> ContactInterpretation:
+    source = plan.source
+    orange, orange_sources, orange_joins, orange_skipped = _select_color(
+        plan.orange,
+        source.orange,
+        source.silhouette,
         None
         if selected_tips is None
         else frozenset(i for color, i in selected_tips if color == "orange"),
     )
-    white, white_sources, white_joins, white_skipped = _color(
+    white, white_sources, white_joins, white_skipped = _select_color(
+        plan.white,
         source.white,
-        source.orange,
         source.silhouette,
-        scale,
-        half_size,
         None
         if selected_tips is None
         else frozenset(i for color, i in selected_tips if color == "white"),
@@ -397,8 +468,8 @@ def before_graph(
     diagnostics: dict[str, object] = {
         "contact_interpretation": {
             "method": "bounded same-color point-contact graph joins",
-            "scale_mm": scale,
-            "bridge_half_size_mm": half_size,
+            "scale_mm": plan.scale_mm,
+            "bridge_half_size_mm": plan.half_size_mm,
             "joined_tips": sum(len(join.members) for join in joins),
             "joined_groups": len(joins),
             "joins": [

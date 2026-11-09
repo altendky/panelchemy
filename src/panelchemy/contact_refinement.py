@@ -3,16 +3,19 @@
 # Exact proof primitives are shared with the ordinary outline fitter.
 # pyright: reportPrivateUsage=false
 
+from collections import Counter
 from collections.abc import Iterator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import cached_property
 from itertools import chain, pairwise
 from math import hypot, isfinite, ulp
 from time import monotonic
 from typing import cast
 
+from shapely import STRtree
 from shapely.geometry import LineString, Polygon
 
-from panelchemy import boundary_tapers, geometric_distance
+from panelchemy import boundary_tapers, corner_refinement, curvature, geometric_distance
 from panelchemy import contact_interpretation as ci
 from panelchemy import curves as c
 from panelchemy.contours import PanelContours
@@ -21,6 +24,30 @@ type _Key = tuple[bool, c.Controls]
 type _Selected = frozenset[tuple[ci.Color, int]]
 type _Path = tuple[c.Point2, ...]
 type _DistanceKey = tuple[tuple[_Path, ...], tuple[_Key, ...], float]
+_EMPTY_POINTS: frozenset[c.Point2] = frozenset()
+
+
+@dataclass(frozen=True)
+class _ReferenceTopology:
+    """Lazy, unchanged topology expectations for one proposed reference."""
+
+    reference: PanelContours
+
+    @cached_property
+    def polygons(self) -> dict[tuple[int, int], str]:
+        r = self.reference
+        return c._relationships([r.silhouette, *r.orange, *r.white])
+
+    @cached_property
+    def rings(self) -> dict[tuple[int, int], str]:
+        r = self.reference
+        return c._relationships(
+            [
+                LineString(ring.coords)
+                for polygon in (r.silhouette, *r.orange, *r.white)
+                for ring in (polygon.exterior, *polygon.interiors)
+            ]
+        )
 
 
 def _key(span: c.BezierSpan) -> _Key:
@@ -30,9 +57,13 @@ def _key(span: c.BezierSpan) -> _Key:
     return span.is_line, min(p, cast("c.Controls", tuple(reversed(p))))
 
 
-def _bad(contours: c.CurveContours, runs: tuple[float, float, float]) -> set[_Key]:
+def _bad(
+    contours: c.CurveContours,
+    runs: tuple[float, float, float],
+    proofs: boundary_tapers.ProofCache | None = None,
+) -> set[_Key]:
     try:
-        boundary_tapers.require_curvature(contours, runs)
+        boundary_tapers.require_curvature(contours, runs, proofs)
     except boundary_tapers.CurvatureLimitError as error:
         return {_key(span) for span, _ in error.failures.values()}
     return set()
@@ -59,7 +90,15 @@ def _source_certificate(
     spans: Sequence[c.BezierSpan],
     tolerance: float,
     cache: dict[_DistanceKey, bool],
+    forward: geometric_distance.ForwardProofCache | None = None,
 ) -> bool:
+    if forward is not None and (
+        forward.tolerance_mm != tolerance
+        or tuple(paths[: len(forward.base_paths)]) != forward.base_paths
+    ):
+        raise ValueError(
+            "forward proofs require their original source paths and tolerance"
+        )
     # This cache lives for one refine call. Both original paths and selected
     # coefficients are part of the key, so an accepted edit cannot reuse an
     # older proof for the changed ring or its enlarged original source group.
@@ -69,7 +108,11 @@ def _source_certificate(
         tolerance,
     )
     if key not in cache:
-        cache[key] = geometric_distance.within_paths(paths, spans, tolerance)
+        cache[key] = (
+            geometric_distance.within_paths(paths, spans, tolerance)
+            if forward is None
+            else forward.within_extra_paths(paths[len(forward.base_paths) :], spans)
+        )
     return cache[key]
 
 
@@ -92,6 +135,7 @@ def _ordered_reference(
             new = [Polygon(ring) for ring in polygon.interiors]
             if len(old) != len(new):
                 return None
+            tree = STRtree(new)
             # Match the surviving hole interiors one-to-one. This only orders
             # existing reference rings; geometry, source bounds and complete
             # topology still pass their ordinary independent proof gates.
@@ -99,7 +143,9 @@ def _ordered_reference(
             order: list[int] = []
             for ring in old:
                 matches = [
-                    i for i in unused if ring.relate_pattern(new[i], "T********")
+                    i
+                    for i in cast("list[int]", tree.query(ring).tolist())
+                    if i in unused and ring.relate_pattern(new[i], "T********")
                 ]
                 if len(matches) != 1:
                     return None
@@ -312,8 +358,14 @@ def _short_arc_candidates(
 
 
 def _assemble(
-    polygons: list[c.CurvePolygon], reference: PanelContours, tolerance: float
+    polygons: list[c.CurvePolygon],
+    reference: PanelContours,
+    tolerance: float,
+    expected: _ReferenceTopology | None = None,
+    proofs: c.ProofCache | None = None,
 ) -> tuple[c.CurveContours, PanelContours] | None:
+    if expected is None or expected.reference is not reference:
+        expected = _ReferenceTopology(reference)
     pieces: list[c._Piece] = []
     selected: dict[_Key, int] = {}
     uses: list[list[tuple[int, bool]]] = []
@@ -343,11 +395,11 @@ def _assemble(
             uses.append(owners)
         ranges.append(range(first, len(uses)))
     try:
-        unsafe, cuts = c._unsafe_pair(pieces)
+        unsafe, cuts = c._unsafe_pair(pieces, proofs)
         if unsafe:
             return None
         curves, proxy, rings, proxy_unsafe = c._assemble(
-            pieces, uses, ranges, reference, tolerance, cuts
+            pieces, uses, ranges, reference, tolerance, cuts, proofs
         )
     except ValueError as error:
         if str(error) not in {
@@ -358,29 +410,255 @@ def _assemble(
         }:
             raise
         return None
-    expected = [reference.silhouette, *reference.orange, *reference.white]
+    original_polygons = [reference.silhouette, *reference.orange, *reference.white]
     actual = [proxy.silhouette, *proxy.orange, *proxy.white]
     if (
         proxy_unsafe
         or any(
-            not p.is_valid
-            or p.area <= 0
+            not (
+                p.is_valid and p.area > 0 and reference.silhouette.covers(p)
+                if proofs is None
+                else proofs.valid_polygon(p, reference.silhouette)
+            )
             or len(p.interiors) != len(original.interiors)
-            or not reference.silhouette.covers(p)
-            for p, original in zip(actual, expected, strict=True)
+            for p, original in zip(actual, original_polygons, strict=True)
         )
-        or c._relationships(actual) != c._relationships(expected)
-        or c._relationships(rings)
-        != c._relationships(
-            [
-                LineString(r.coords)
-                for polygon in expected
-                for r in (polygon.exterior, *polygon.interiors)
-            ]
-        )
+        or c._relationships(actual, proofs) != expected.polygons
+        or c._relationships(rings, proofs) != expected.rings
     ):
         return None
     return curves, proxy
+
+
+def _corner_rings(
+    ring: c.CurveRing,
+    index: int,
+    source_paths: Sequence[_Path] = (),
+    tolerance_mm: float = 0.0,
+    *,
+    protected_points: frozenset[c.Point2] = _EMPTY_POINTS,
+) -> Iterator[c.CurveRing]:
+    """Offer one bend, then one smooth neighbor bounded by an existing corner."""
+    spans, size = ring.spans, len(ring.spans)
+    before, span, after = spans[index - 1], spans[index], spans[(index + 1) % size]
+    start_free = not corner_refinement.smooth_join(before, span)
+    end_free = not corner_refinement.smooth_join(span, after)
+    windows = [(index, 1, start_free, end_free)]
+    if size > 2:
+        if not start_free and not corner_refinement.smooth_join(
+            spans[(index - 2) % size], before
+        ):
+            windows.append(((index - 1) % size, 2, True, end_free))
+        if not end_free and not corner_refinement.smooth_join(
+            after, spans[(index + 2) % size]
+        ):
+            windows.append((index, 2, start_free, True))
+    for first, count, free_start, free_end in windows:
+        rotated = (*spans[first:], *spans[:first])
+        if count > 1 and rotated[0].control_points[-1] in protected_points:
+            continue
+        left, right = rotated[0], rotated[count - 1]
+        guide = (
+            left
+            if count == 1
+            else c.BezierSpan(
+                (
+                    left.control_points[0],
+                    left.control_points[-1 if left.is_line else 1],
+                    right.control_points[0 if right.is_line else 2],
+                    right.control_points[-1],
+                ),
+                False,
+                max(part.certified_error_mm for part in rotated[:count]),
+            )
+        )
+        for replacement in corner_refinement.corner_variants(
+            guide,
+            free_start=free_start,
+            free_end=free_end,
+            apices=tuple(part.control_points[-1] for part in rotated[: count - 1]),
+        ):
+            yield c.CurveRing((*replacement, *rotated[count:]))
+        if free_start and free_end and tolerance_mm > 0:
+            for replacement in corner_refinement.source_corners(
+                guide, source_paths, 0.9 * tolerance_mm
+            ):
+                yield c.CurveRing((*replacement, *rotated[count:]))
+
+
+def _repair_corners(
+    source: PanelContours,
+    contours: c.CurveContours,
+    proxy: PanelContours,
+    reference: ci.ContactInterpretation,
+    source_groups: dict[tuple[ci.Color, int], list[tuple[_Path, ...]]],
+    *,
+    tolerance_mm: float,
+    material_runs: tuple[float, float, float],
+    proxy_tolerance_mm: float,
+    proofs: c.ProofCache,
+    radius_proofs: boundary_tapers.ProofCache,
+) -> tuple[c.CurveContours, PanelContours, dict[str, int]]:
+    """Refine actual selected bends against their original source path groups."""
+    by_color: dict[ci.Color, dict[int, c.CurvePolygon]] = {}
+    colors: tuple[tuple[ci.Color, tuple[c.CurvePolygon, ...]], ...] = (
+        ("orange", contours.orange),
+        ("white", contours.white),
+    )
+    for color, regions in colors:
+        originals = _source(source, color)
+        by_color[color] = {
+            max(indices, key=lambda i: originals[i].area): polygon
+            for indices, polygon in zip(_groups(reference, color), regions, strict=True)
+        }
+    certificates: dict[_DistanceKey, bool] = {}
+    # Contact repairs can leave short, genuinely over-curved bends away from
+    # their splice. Offer one explicit corner per such bend, preserving outer
+    # endpoint rays. Original source paths and the selected palette still own
+    # acceptance; a failed construction never authorizes feature deletion.
+    corner_limits: dict[_Key, boundary_tapers.BoundaryTaper] = {}
+    try:
+        boundary_tapers.require_curvature(contours, material_runs, radius_proofs)
+    except boundary_tapers.CurvatureLimitError as error:
+        corner_limits = {_key(span): limit for span, limit in error.failures.values()}
+    remaining_bad = set(corner_limits)
+    ownership: Counter[_Key] = (
+        Counter(
+            _key(span)
+            for polygon in (contours.silhouette, *contours.orange, *contours.white)
+            for ring in (polygon.exterior, *polygon.interiors)
+            for span in ring.spans
+        )
+        if corner_limits
+        else Counter()
+    )
+    point_owners = Counter(
+        point
+        for polygon in (contours.silhouette, *contours.orange, *contours.white)
+        for ring in (polygon.exterior, *polygon.interiors)
+        for point in {span.control_points[0] for span in ring.spans}
+        if corner_limits
+    )
+    protected_points = frozenset(
+        point for point, owners in point_owners.items() if owners > 1
+    )
+    corner_report: dict[str, int] = dict(
+        attempted=0, repaired=0, source_rejected=0, topology_rejected=0
+    )
+    owners: list[tuple[ci.Color, int]] = [
+        (color, max(indices, key=lambda i: _source(source, color)[i].area))
+        for color in by_color
+        for indices in _groups(reference, color)
+        if corner_limits
+    ]
+    expected = _ReferenceTopology(reference.contours)
+    for color, owner in owners:
+        parent: c.CurvePolygon = by_color[color][owner]
+        for ring_index, ring in enumerate((parent.exterior, *parent.interiors)):
+            if not any(_key(span) in remaining_bad for span in ring.spans):
+                continue
+            source_key = color, owner
+            if source_key not in source_groups:
+                original = _source(source, color)[owner]
+                source_groups[source_key] = [
+                    (tuple((float(x), float(y)) for x, y in path.coords),)
+                    for path in (original.exterior, *original.interiors)
+                ]
+            original_paths = source_groups[source_key][ring_index]
+            forward = geometric_distance.ForwardProofCache(original_paths, tolerance_mm)
+            # Address original failing geometry, not indices that a repair or
+            # wrapped neighbor window can shift. Outside windows remain intact.
+            for key in [_key(span) for span in ring.spans]:
+                if key not in remaining_bad:
+                    continue
+                index = next(
+                    (i for i, span in enumerate(ring.spans) if _key(span) == key), None
+                )
+                if index is None:
+                    continue
+                corner_report["attempted"] += 1
+                span = ring.spans[index]
+                limit = corner_limits[key]
+                direction = (
+                    limit.inward_sign
+                    if span.control_points == key[1]
+                    else -limit.inward_sign
+                )
+                for candidate_ring in _corner_rings(
+                    ring,
+                    index,
+                    original_paths,
+                    tolerance_mm,
+                    protected_points=protected_points,
+                ):
+                    original_spans = set(ring.spans)
+                    candidate_spans = set(candidate_ring.spans)
+                    if any(
+                        ownership[_key(part)] > 1
+                        for part in original_spans - candidate_spans
+                    ):
+                        continue
+                    changed_spans = [
+                        part
+                        for part in candidate_ring.spans
+                        if part not in original_spans
+                    ]
+                    if not all(
+                        corner_refinement.forward_progress(part)
+                        and curvature.within_curvature(part, limit.offset_mm, direction)
+                        for part in changed_spans
+                    ):
+                        continue
+                    if not _source_certificate(
+                        original_paths,
+                        candidate_ring.spans,
+                        tolerance_mm,
+                        certificates,
+                        forward,
+                    ):
+                        corner_report["source_rejected"] += 1
+                        continue
+                    candidate: c.CurvePolygon = (
+                        replace(parent, exterior=candidate_ring)
+                        if ring_index == 0
+                        else replace(
+                            parent,
+                            interiors=(
+                                *parent.interiors[: ring_index - 1],
+                                candidate_ring,
+                                *parent.interiors[ring_index:],
+                            ),
+                        )
+                    )
+                    polygons: list[c.CurvePolygon] = [
+                        candidate
+                        if (selected_color, selected_owner) == (color, owner)
+                        else by_color[selected_color][selected_owner]
+                        for selected_color, selected_owner in owners
+                    ]
+                    checked = _assemble(
+                        [contours.silhouette, *polygons],
+                        reference.contours,
+                        proxy_tolerance_mm,
+                        expected,
+                        proofs,
+                    )
+                    failures = (
+                        _bad(checked[0], material_runs, radius_proofs)
+                        if checked is not None
+                        else remaining_bad
+                    )
+                    if checked is None or not failures < remaining_bad:
+                        corner_report["topology_rejected"] += 1
+                        continue
+                    contours, proxy = checked
+                    parent = candidate
+                    ring = candidate_ring
+                    by_color[color][owner] = parent
+                    corner_report["repaired"] += len(remaining_bad) - len(failures)
+                    remaining_bad = failures
+                    break
+    return contours, proxy, corner_report
 
 
 def refine(
@@ -392,6 +670,7 @@ def refine(
     tolerance_mm: float,
     material_runs: tuple[float, float, float],
     proxy_tolerance_mm: float,
+    repair_corners: bool = False,
 ) -> tuple[c.CurveContours, PanelContours, dict[str, object]]:
     """Interpret failing tips and explicitly authorized complex contact groups.
 
@@ -401,14 +680,16 @@ def refine(
     """
     if not isfinite(proxy_tolerance_mm) or proxy_tolerance_mm <= 0:
         raise ValueError("contact refinement requires positive proxy tolerance")
-    interpretation = ci.before_graph(
-        source, scale_mm=scale_mm, tolerance_mm=tolerance_mm
-    )
+    if type(cast("object", repair_corners)) is not bool:
+        raise ValueError("repair_corners must be a boolean")
+    plan = ci.prepare(source, scale_mm=scale_mm, tolerance_mm=tolerance_mm)
+    interpretation = plan.select()
     if len(contours.orange) != len(source.orange) or len(contours.white) != len(
         source.white
     ):
         raise ValueError("contact refinement requires original component indexing")
-    old_bad = _bad(contours, material_runs)
+    radius_proofs = boundary_tapers.ProofCache()
+    old_bad = _bad(contours, material_runs, radius_proofs)
     by_color: dict[ci.Color, dict[int, c.CurvePolygon]] = {
         "orange": dict(enumerate(contours.orange)),
         "white": dict(enumerate(contours.white)),
@@ -416,11 +697,13 @@ def refine(
     accepted: list[dict[str, object]] = []
     blocked: list[dict[str, object]] = []
     selected: _Selected = frozenset()
-    reference = ci.before_graph(
-        source, scale_mm=scale_mm, tolerance_mm=tolerance_mm, selected_tips=selected
-    )
+    reference = plan.select(selected)
     source_groups: dict[tuple[ci.Color, int], list[tuple[_Path, ...]]] = {}
+    forward_proofs: dict[
+        tuple[ci.Color, int], list[geometric_distance.ForwardProofCache]
+    ] = {}
     certificates: dict[_DistanceKey, bool] = {}
+    proofs = c.ProofCache()
     preparation_seconds = 0.0
     paired_checks = union_checks = 0
     for contact in interpretation.contacts:
@@ -457,12 +740,7 @@ def refine(
         choice: _Selected = selected | frozenset[tuple[ci.Color, int]](
             ((contact.color, contact.tip),)
         )
-        proposed_reference = ci.before_graph(
-            source,
-            scale_mm=scale_mm,
-            tolerance_mm=tolerance_mm,
-            selected_tips=choice,
-        )
+        proposed_reference = plan.select(choice)
         reference_tips: _Selected = frozenset(
             (v.color, v.tip) for v in proposed_reference.contacts
         )
@@ -483,6 +761,7 @@ def refine(
             )
             continue
         proposed_reference = replace(proposed_reference, contours=ordered)
+        expected = _ReferenceTopology(ordered)
         groups = _groups(proposed_reference, contact.color)
         group = next(indices for indices in groups if contact.parent in indices)
         originals = [_source(source, contact.color)[i] for i in group]
@@ -494,10 +773,15 @@ def refine(
                 (tuple((float(x), float(y)) for x, y in ring.coords),)
                 for ring in (original.exterior, *original.interiors)
             ]
+            forward_proofs[source_key] = [
+                geometric_distance.ForwardProofCache(group, tolerance_mm)
+                for group in source_groups[source_key]
+            ]
         paths = source_groups[source_key]
+        forward = forward_proofs[source_key]
         baseline = [
-            _source_certificate(group, ring.spans, tolerance_mm, certificates)
-            for group, ring in zip(paths, parent_rings, strict=True)
+            _source_certificate(group, ring.spans, tolerance_mm, certificates, stored)
+            for group, ring, stored in zip(paths, parent_rings, forward, strict=True)
         ]
         tip_paths = tuple(
             tuple(path)
@@ -536,7 +820,11 @@ def refine(
                 if not all(
                     ok for i, ok in enumerate(baseline) if i != ring_index
                 ) or not _source_certificate(
-                    original_paths, rings[ring_index].spans, tolerance_mm, certificates
+                    original_paths,
+                    rings[ring_index].spans,
+                    tolerance_mm,
+                    certificates,
+                    forward[ring_index],
                 ):
                     deferred.append(candidate)
                     continue
@@ -560,9 +848,16 @@ def refine(
                         else by_color[color][owner]
                     )
             checked = _assemble(
-                polygons, proposed_reference.contours, proxy_tolerance_mm
+                polygons,
+                proposed_reference.contours,
+                proxy_tolerance_mm,
+                expected,
+                proofs,
             )
-            if checked is None or not _bad(checked[0], material_runs) <= old_bad:
+            if (
+                checked is None
+                or not _bad(checked[0], material_runs, radius_proofs) <= old_bad
+            ):
                 continue
             contours, proxy = checked
             by_color[contact.color][contact.parent] = candidate
@@ -594,11 +889,28 @@ def refine(
                     else "no-certified-candidate",
                 )
             )
+    corner_report: dict[str, int] = dict(
+        attempted=0, repaired=0, source_rejected=0, topology_rejected=0
+    )
+    if repair_corners:
+        contours, proxy, corner_report = _repair_corners(
+            source,
+            contours,
+            proxy,
+            reference,
+            source_groups,
+            tolerance_mm=tolerance_mm,
+            material_runs=material_runs,
+            proxy_tolerance_mm=proxy_tolerance_mm,
+            proofs=proofs,
+            radius_proofs=radius_proofs,
+        )
     return (
         contours,
         proxy,
         {
-            "changed": bool(accepted),
+            "changed": bool(accepted) or bool(corner_report["repaired"]),
+            "corner_refinement": corner_report,
             "selected_unique_spans": len(
                 {
                     _key(span)

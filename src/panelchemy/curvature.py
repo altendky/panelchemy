@@ -74,6 +74,27 @@ def _split(a: Sequence[Fraction]) -> tuple[_Polynomial, _Polynomial]:
     return left, right[::-1]
 
 
+def _validated_inputs(
+    span: BezierSpan,
+    offset_mm: _Number,
+    inward_sign: int,
+    fraction: _Number,
+) -> tuple[Fraction, Fraction, int, tuple[tuple[Fraction, ...], ...]]:
+    """Validate every input, including unused line handles, before proof reuse."""
+    offset = _rational(offset_mm, "curvature offset")
+    margin = _rational(fraction, "curvature fraction")
+    if offset < 0 or not 0 < margin <= 1:
+        raise ValueError("curvature needs a nonnegative offset and fraction in (0, 1]")
+    direction = _signed_direction(inward_sign)
+    if len(span.control_points) != 4 or any(len(p) != 2 for p in span.control_points):
+        raise ValueError("curvature needs four planar cubic controls")
+    points = tuple(
+        tuple(_rational(v, "curvature coordinate") for v in p)
+        for p in span.control_points
+    )
+    return offset, margin, direction, points
+
+
 def within_curvature(
     span: BezierSpan,
     offset_mm: _Number,
@@ -87,17 +108,9 @@ def within_curvature(
     Bounds apply continuously, including endpoints; inconclusive bounds or
     exhausted subdivision resources return False. No sampled acceptance is used.
     """
-    offset = _rational(offset_mm, "curvature offset")
-    margin = _rational(fraction, "curvature fraction")
-    if offset < 0 or not 0 < margin <= 1:
-        raise ValueError("curvature needs a nonnegative offset and fraction in (0, 1]")
-    direction = _signed_direction(inward_sign)
-    if len(span.control_points) != 4 or any(len(p) != 2 for p in span.control_points):
-        raise ValueError("curvature needs four planar cubic controls")
-    points = [
-        tuple(_rational(v, "curvature coordinate") for v in p)
-        for p in span.control_points
-    ]
+    offset, margin, direction, points = _validated_inputs(
+        span, offset_mm, inward_sign, fraction
+    )
     if span.is_line:
         # Line metadata uses only its endpoints, matching native construction.
         return points[0] != points[-1]

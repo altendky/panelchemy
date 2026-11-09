@@ -38,7 +38,7 @@ from OCP.collections import (
     List_TopoDS_Shape,
 )
 from OCP.Geom import Geom_BezierCurve, Geom_ConicalSurface, Geom_Curve, Geom_Surface
-from OCP.GeomAbs import GeomAbs_BSplineCurve, GeomAbs_Line
+from OCP.GeomAbs import GeomAbs_BezierCurve, GeomAbs_BSplineCurve, GeomAbs_Line
 from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomConvert import GeomConvert
 from OCP.GeomTools import GeomTools
@@ -548,6 +548,64 @@ def _verified_draft(
     raise occt.KernelError("native draft could not verify the requested direction")
 
 
+def _bezier_generator(
+    edge: TopoDS_Edge, adapter: BRepAdaptor_Curve
+) -> TopoDS_Edge | None:
+    """Re-encode only an identical unit-domain cubic Bernstein polynomial."""
+    curve = adapter.BSpline()
+    low, high = adapter.FirstParameter(), adapter.LastParameter()
+    if (
+        curve.Degree() != 3
+        or curve.NbPoles() != 4
+        or curve.NbKnots() != 2
+        or curve.IsRational()
+        or curve.IsPeriodic()
+        or (curve.Knot(1), curve.Knot(2)) != (0, 1)
+        or (curve.Multiplicity(1), curve.Multiplicity(2)) != (4, 4)
+        or not 0 <= low < high <= 1
+    ):
+        return None
+    original_geometry = _geometry_bytes(curve)
+    vertices = TopExp.FirstVertex_s(edge, False), TopExp.LastVertex_s(edge, False)
+    vertex_data = [
+        (BRep_Tool.Pnt_s(vertex).Coord(), BRep_Tool.Tolerance_s(vertex))
+        for vertex in vertices
+    ]
+    points = [curve.Pole(i).Coord() for i in range(1, 5)]
+    poles = Array1_gp_Pnt(1, 4)
+    for i in range(1, 5):
+        poles.SetValue(i, curve.Pole(i))
+    bezier = Geom_BezierCurve(poles)
+    if (
+        bezier.Degree() != 3
+        or bezier.NbPoles() != 4
+        or bezier.IsRational()
+        or [bezier.Pole(i).Coord() for i in range(1, 5)] != points
+    ):
+        raise occt.KernelError("native Bezier generator changed cubic coefficients")
+    made = BRepBuilderAPI_MakeEdge(bezier, *vertices, low, high)
+    if not made.IsDone():
+        raise occt.KernelError("native Bezier generator edge construction failed")
+    selected = made.Edge()
+    selected.Orientation(edge.Orientation())
+    checked = BRepAdaptor_Curve(selected)
+    if (
+        checked.GetType() != GeomAbs_BezierCurve
+        or (checked.FirstParameter(), checked.LastParameter()) != (low, high)
+        or [checked.Bezier().Pole(i).Coord() for i in range(1, 5)] != points
+        or not TopExp.FirstVertex_s(selected, False).IsSame(vertices[0])
+        or not TopExp.LastVertex_s(selected, False).IsSame(vertices[1])
+        or [
+            (BRep_Tool.Pnt_s(vertex).Coord(), BRep_Tool.Tolerance_s(vertex))
+            for vertex in vertices
+        ]
+        != vertex_data
+        or _geometry_bytes(curve) != original_geometry
+    ):
+        raise occt.KernelError("native Bezier generator changed source geometry")
+    return selected
+
+
 def _independent_drafts(
     edge: TopoDS_Edge,
     z0: float,
@@ -571,6 +629,28 @@ def _independent_drafts(
         adapter = BRepAdaptor_Curve(edge)
         if adapter.GetType() != GeomAbs_BSplineCurve:
             raise
+        # Whole-wire draft uses B-splines for its corner machinery. A lone
+        # clamped cubic can instead retain its identical Bernstein basis as a
+        # native Bezier, avoiding another known native array failure.
+        bezier = _bezier_generator(edge, adapter)
+        if bezier is not None:
+            try:
+                draft = _verified_draft(
+                    BRepBuilderAPI_MakeWire(bezier).Wire(),
+                    z0,
+                    z1,
+                    slope,
+                    internal,
+                    diagnostics,
+                )
+            except _DraftArrayFailure:
+                pass  # Retain the unchanged native-curve quarter trims below.
+            else:
+                if diagnostics is not None:
+                    diagnostics["bezier_draft_generators"] = (
+                        cast("int", diagnostics.get("bezier_draft_generators", 0)) + 1
+                    )
+                return [draft]
         curve = adapter.BSpline()
         low, high = adapter.FirstParameter(), adapter.LastParameter()
         drafts: list[BRepFill_Draft] = []

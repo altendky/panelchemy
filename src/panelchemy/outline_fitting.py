@@ -10,9 +10,11 @@ fit adds smooth spline knots; it never restores individual raster edges.
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
+from multiprocessing import get_context
 from time import monotonic
 from typing import cast
 
@@ -26,6 +28,7 @@ from shapely.geometry.polygon import orient
 from panelchemy import (
     boundary_tapers,
     contact_refinement,
+    corner_refinement,
     curvature,
     curvature_fitting,
     edge_detail,
@@ -1073,16 +1076,7 @@ def _curvature_feedback(
 
 def _forward_progress(span: c.BezierSpan) -> bool:
     """Certify positive interior progress, not just a forward control polygon."""
-    controls = c._controls(span)
-    direction = (controls[-1][0] - controls[0][0], controls[-1][1] - controls[0][1])
-    a, b, d = (
-        (b[0] - a[0]) * direction[0] + (b[1] - a[1]) * direction[1]
-        for a, b in pairwise(controls)
-    )
-    # These are quadratic Bernstein coefficients of projected velocity. A
-    # negative middle coefficient still has positive minimum iff a*d > b*b.
-    # Strictness excludes a newly admitted interior stationary point.
-    return any(direction) and a >= 0 and d >= 0 and (b >= 0 or a * d > b * b)
+    return corner_refinement.forward_progress(span)
 
 
 def _run_corners(fit: _Fit) -> set[float]:
@@ -2134,6 +2128,74 @@ def _corner_curvature_candidates(
     return result
 
 
+type _CurvatureJob = tuple[_Fit, int, boundary_tapers.BoundaryTaper, float, list[int]]
+
+
+@dataclass
+class _CurvatureTrial:
+    proposal: _Fit | None
+    pool: list[tuple[_Fit, str]]
+    budget: float
+    smooth_attempted: bool
+    preferred: _Fit | None
+    record: dict[str, object]
+
+
+def _initial_curvature_trial(job: _CurvatureJob) -> _CurvatureTrial:
+    """Prepare one chain independently; full palette acceptance stays central."""
+    fit, index, limit, tolerance, bad = job
+    tick = monotonic()
+    pool = _corner_curvature_candidates(fit, index, limit, tolerance, bad)
+    budget = max(0.0, curvature_fitting._SECONDS - (monotonic() - tick))
+    detail_search: dict[str, object] | None = None
+    preferred: _Fit | None = None
+    if any(
+        max(a, fit.intervals[i][0]) < min(b, fit.intervals[i][1])
+        for a, b in fit.texture_intervals
+        for i in bad
+    ):
+        preferred, detail_search = _compact_curvature_candidate(
+            fit, index, limit, tolerance, texture_only=True
+        )
+        if preferred is not None:
+            pool.insert(0, (preferred, "fine-texture-smooth"))
+    smooth_attempted = not pool
+    if pool:
+        proposal, method = pool.pop(0)
+        diagnostics: dict[str, object] = dict(status="accepted", strategy=method)
+    else:
+        proposal, diagnostics = _curvature_candidate(
+            fit, index, limit, tolerance, time_budget_seconds=budget
+        )
+    record: dict[str, object] = dict(
+        chain=index,
+        left_material=limit.left,
+        right_material=limit.right,
+        offset_mm=limit.offset_mm,
+        inward_sign=limit.inward_sign,
+        search=diagnostics,
+    )
+    if detail_search is not None:
+        record["detail_search"] = detail_search
+    return _CurvatureTrial(proposal, pool, budget, smooth_attempted, preferred, record)
+
+
+def _curvature_trials(
+    jobs: Sequence[_CurvatureJob], workers: int
+) -> list[_CurvatureTrial]:
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    if workers == 1 or len(jobs) < 2:
+        return [_initial_curvature_trial(job) for job in jobs]
+    # Spawn avoids inheriting numerical-library state and the scoped BLAS lock.
+    # Only individual chains cross the boundary; callbacks are created in each
+    # child. map returns source order, independent of completion order.
+    with ProcessPoolExecutor(
+        max_workers=min(workers, len(jobs)), mp_context=get_context("spawn")
+    ) as pool:
+        return list(pool.map(_initial_curvature_trial, jobs))
+
+
 def _curvature_verified(
     fits: Sequence[_Fit],
     uses: Sequence[Sequence[tuple[int, bool]]],
@@ -2143,6 +2205,8 @@ def _curvature_verified(
     material_runs: tuple[float, float, float],
     original_curves: c.CurveContours,
     original_proxy: PanelContours,
+    *,
+    workers: int = 1,
 ) -> tuple[c.CurveContours, PanelContours, dict[str, object]]:
     """Try signed curvature refits without dropping features or weakening proofs."""
     limits = boundary_tapers.boundaries(uses, ranges, len(source.orange), material_runs)
@@ -2154,6 +2218,7 @@ def _curvature_verified(
     budgets: dict[int, float] = {}
     smooth_attempted: set[int] = set()
     preferred_candidates: dict[int, _Fit] = {}
+    jobs: list[_CurvatureJob] = []
     for index, limit in limits.items():
         fit = fits[index]
         if limit.offset_mm == 0:
@@ -2168,44 +2233,21 @@ def _curvature_verified(
         if not bad:
             continue
         attempted.add(index)
-        tick = monotonic()
-        pool = _corner_curvature_candidates(fit, index, limit, tolerance, bad)
-        budgets[index] = max(0.0, curvature_fitting._SECONDS - (monotonic() - tick))
-        detail_search: dict[str, object] | None = None
-        if any(
-            max(a, fit.intervals[i][0]) < min(b, fit.intervals[i][1])
-            for a, b in fit.texture_intervals
-            for i in bad
-        ):
-            preferred, detail_search = _compact_curvature_candidate(
-                fit, index, limit, tolerance, texture_only=True
-            )
-            if preferred is not None:
-                preferred_candidates[index] = preferred
-                pool.insert(0, (preferred, "fine-texture-smooth"))
-        if pool:
-            proposal, method = pool.pop(0)
-            pools[index] = pool
-            diagnostics: dict[str, object] = dict(status="accepted", strategy=method)
-        else:
+        jobs.append((fit, index, limit, tolerance, bad))
+    trials = _curvature_trials(jobs, workers)
+    for job, trial in zip(jobs, trials, strict=True):
+        index = job[1]
+        budgets[index] = trial.budget
+        if trial.smooth_attempted:
             smooth_attempted.add(index)
-            proposal, diagnostics = _curvature_candidate(
-                fit, index, limit, tolerance, time_budget_seconds=budgets[index]
-            )
-        if proposal is not None:
-            candidates[index] = proposal
+        else:
+            pools[index] = trial.pool
+        if trial.preferred is not None:
+            preferred_candidates[index] = trial.preferred
+        if trial.proposal is not None:
+            candidates[index] = trial.proposal
             changed.add(index)
-        record: dict[str, object] = dict(
-            chain=index,
-            left_material=limit.left,
-            right_material=limit.right,
-            offset_mm=limit.offset_mm,
-            inward_sign=limit.inward_sign,
-            search=diagnostics,
-        )
-        if detail_search is not None:
-            record["detail_search"] = detail_search
-        records.append(record)
+        records.append(trial.record)
     verified = _verify_refits(
         fits,
         candidates,
@@ -2351,6 +2393,7 @@ def _curvature_verified(
                 "unresolved_boundaries": remaining,
                 "material_taper_runs_mm": material_runs,
                 "attempted_chains": len(attempted),
+                "initial_search_workers": min(workers, len(jobs)),
                 "refined_chains": len(attempted - uncertified.keys()),
                 "partially_refined_chains": sorted(accepted & uncertified.keys()),
                 "unrefined_chains": sorted(uncertified),
@@ -2378,6 +2421,7 @@ def fit_outlines(
     edge_detail_scale_mm: float = 0.0,
     material_taper_runs_mm: tuple[float, float, float] | None = None,
     palette: Palette | None = None,
+    workers: int = 1,
 ) -> c.CurveFitResult:
     """Fit shared outlines with movable smooth joins and physical-scale corners.
 
@@ -2386,6 +2430,8 @@ def fit_outlines(
     Otherwise source islands/counters retain their original topology. Zero
     tolerance requests the existing exact representation.
     """
+    if type(workers) is not int or workers < 1:
+        raise ValueError("workers must be a positive integer")
     for value, name, positive in (
         (cast("object", tolerance_mm), "tolerance", False),
         (cast("object", corner_scale_mm), "corner scale", True),
@@ -2643,6 +2689,7 @@ def fit_outlines(
                         material_taper_runs_mm,
                         curves,
                         proxy,
+                        workers=workers,
                     )
                 contact_diagnostics: dict[str, object] = {}
                 if point_contact_scale_mm > 0 and material_taper_runs_mm is not None:
@@ -2654,6 +2701,7 @@ def fit_outlines(
                         tolerance_mm=tolerance_mm,
                         material_runs=material_taper_runs_mm,
                         proxy_tolerance_mm=proxy_tolerance,
+                        repair_corners=True,
                     )
                     if contact_diagnostics.get("changed"):
                         curvature_diagnostics["pre_contact_boundary_curvature"] = (

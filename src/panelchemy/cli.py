@@ -63,6 +63,12 @@ def main() -> None:
         _ = relief.add_argument("--profile", type=Path)
         _ = relief.add_argument("--silhouette-mask", type=Path)
         _ = relief.add_argument("--max-vertices", type=int, default=25_000)
+        _ = relief.add_argument(
+            "--workers",
+            type=int,
+            default=1,
+            help="opt in to parallel curvature fitting with this many processes (default: 1)",
+        )
         if name == "export":
             _ = relief.add_argument(
                 "--format",
@@ -180,6 +186,7 @@ def main() -> None:
                     p for p in (config_path, profile_path) if p is not None
                 ),
                 max_vertices=cast("int", args.max_vertices),
+                workers=cast("int", args.workers),
                 export_config=export_config,
                 step_only=step_only,
             )

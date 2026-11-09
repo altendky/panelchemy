@@ -9,10 +9,13 @@ from shapely import affinity, union_all
 from shapely.geometry import Point, Polygon, box
 from shapely.geometry.base import BaseGeometry
 
+from panelchemy import contact_interpretation as ci
 from panelchemy.contact_interpretation import (
+    Color,
     ContactInterpretation,
     PointContact,
     before_graph,
+    prepare,
 )
 from panelchemy.contours import PanelContours
 
@@ -388,3 +391,137 @@ def test_added_geometry_conflicts_retain_both_source_groups(cross_color: bool) -
     skipped = cast("dict[str, dict[str, int]]", detail["skipped"])
     key = "cross_color_bridge_conflict" if cross_color else "bridge_conflict"
     assert skipped["white"][key] > 0
+
+
+@pytest.mark.parametrize(
+    "tips,groups",
+    [
+        ((), ((0,), (1,), (2,))),
+        ((1,), ((2,), (0, 1))),
+        ((2,), ((0, 2), (1,))),
+        ((1, 2), ((0, 1, 2),)),
+    ],
+)
+def test_prepared_selections_keep_independent_children_and_parent_holes(
+    tips: tuple[int, ...], groups: tuple[tuple[int, ...], ...]
+) -> None:
+    holes = [box(5, 5, 5.25, 5.25), box(6, 6, 6.5, 6.5)]
+    parent = Polygon(
+        box(4, 4, 8, 8).exterior.coords, [p.exterior.coords for p in holes]
+    )
+    parts = [parent, box(8, 8, 8.2, 8.2), box(3.8, 3.8, 4, 4)]
+    original = source(parts)
+    plan = prepare(original, scale_mm=0.5, tolerance_mm=0.2)
+    selected: frozenset[tuple[Color, int]] = frozenset(("white", tip) for tip in tips)
+    result = plan.select(selected)
+    assert result.white_sources == groups
+    assert result.orange_sources == ()
+    assert {contact.tip for contact in result.contacts} == set(tips)
+    bridges = {
+        1: Polygon([(8, 8.05), (8.05, 8), (8, 7.95), (7.95, 8)]),
+        2: Polygon([(4, 4.05), (4.05, 4), (4, 3.95), (3.95, 4)]),
+    }
+    for polygon, indices in zip(result.contours.white, groups, strict=True):
+        expected = union_all(
+            [*(parts[i] for i in indices), *(bridges[i] for i in tips if i in indices)]
+        )
+        assert polygon.equals(expected)
+        if 0 in indices:
+            assert len(polygon.interiors) == 2
+            assert all(
+                any(Polygon(r).equals(hole) for r in polygon.interiors)
+                for hole in holes
+            )
+    detail = cast("dict[str, object]", result.diagnostics["contact_interpretation"])
+    assert detail["joined_tips"] == len(tips)
+    assert detail["joined_groups"] == len(tips)
+    assert detail["skipped"] == {"orange": {}, "white": {}}
+    # Selecting again must not consume a child or retain another selection.
+    assert plan.select(frozenset()).contours is original
+    again = plan.select(selected)
+    assert again.white_sources == groups
+    assert [p.wkb for p in again.contours.white] == [
+        p.wkb for p in result.contours.white
+    ]
+    assert len(plan.select().contacts) == 2
+
+
+@pytest.mark.parametrize("member", [1, 2, 3])
+def test_prepared_selection_of_any_member_selects_the_whole_contact_group(
+    member: int,
+) -> None:
+    original = chain_source()
+    plan = prepare(original, scale_mm=0.5, tolerance_mm=0.2)
+    result = plan.select(frozenset({("white", member)}))
+    assert result.white_sources == ((0, 1, 2, 3),)
+    assert len(result.contours.white) == 1
+    assert result.contacts == (
+        PointContact("white", 1, 0, (8, 8), (8.6, 8.6), (1, 2, 3), ((8, 8),)),
+    )
+    assert all(result.contours.white[0].covers(p) for p in original.white)
+    assert plan.select(frozenset()).white_sources == ((0,), (1,), (2,), (3,))
+
+
+@pytest.mark.parametrize("cross_color", [False, True])
+def test_prepared_bridge_conflicts_depend_on_the_selected_subset(
+    cross_color: bool,
+) -> None:
+    first = [box(2, 2, 4, 4), box(4, 4, 4.015, 4.015)]
+    second = [box(4.06, 4.035, 6, 6), box(4.045, 4.02, 4.06, 4.035)]
+    original = source(first, second) if cross_color else source([*first, *second])
+    plan = prepare(original, scale_mm=0.5, tolerance_mm=0.2)
+    assert not plan.select().contacts
+    result = plan.select(frozenset({("white", 1)}))
+    assert result.contacts == (PointContact("white", 1, 0, (4, 4), (4.015, 4.015)),)
+    assert any(indices == (0, 1) for indices in result.white_sources)
+    if cross_color:
+        assert result.orange_sources == ((0,), (1,))
+        assert result.contours.orange is original.orange
+    else:
+        assert {(2,), (3,)} <= set(result.white_sources)
+    # Reintroducing the conflicting selection must still roll back both joins.
+    assert not plan.select().contacts
+    assert plan.select(frozenset()).contours is original
+
+
+def test_prepared_contact_limits_do_not_share_cached_geometry_between_plans() -> None:
+    original = source([box(4, 4, 8, 8), box(8, 8, 8.2, 8.2)])
+    coarse = prepare(original, scale_mm=0.5, tolerance_mm=0.2)
+    fine = prepare(original, scale_mm=0.5, tolerance_mm=0.01)
+    first = coarse.select().contours.white[0]
+    second = fine.select().contours.white[0]
+    area = sum(p.area for p in original.white)
+    assert first.area - area == pytest.approx(0.05**2)
+    assert second.area - area == pytest.approx(0.01**2)
+    assert coarse.select().contours.white[0].wkb == first.wkb
+    assert fine.select().contours.white[0].wkb == second.wkb
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ([box(2, 2, 3, 3), box(5, 2, 6, 3)], [box(2, 2, 6, 3)]),
+        ([box(2, 2, 6, 3)], [box(2, 2, 3, 3), box(5, 2, 6, 3)]),
+        ([box(2, 2, 3, 3)], [box(3, 2, 4, 3)]),
+    ],
+)
+def test_hole_matching_rejects_shared_split_and_touch_only_matches(
+    old: list[Polygon], new: list[Polygon]
+) -> None:
+    exterior = box(0, 0, 10, 10).exterior.coords
+    parent = Polygon(exterior, [p.exterior.coords for p in old])
+    merged = Polygon(exterior, [p.exterior.coords for p in new])
+    assert ci._holes(parent, merged) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_hole_matching_keeps_original_order_and_separates_new_counters() -> None:
+    old = [box(2, 2, 3, 3), box(5, 2, 6, 3)]
+    counter = box(7, 2, 8, 3)
+    exterior = box(0, 0, 10, 10).exterior.coords
+    parent = Polygon(exterior, [p.exterior.coords for p in old])
+    merged = Polygon(exterior, [p.exterior.coords for p in [old[1], counter, old[0]]])
+    selected = ci._holes(parent, merged)  # pyright: ignore[reportPrivateUsage]
+    assert selected is not None
+    retained, counters = selected
+    assert [p.wkb for p in retained] == [p.wkb for p in old]
+    assert [p.wkb for p in counters] == [counter.wkb]

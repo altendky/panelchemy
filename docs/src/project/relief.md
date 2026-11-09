@@ -17,6 +17,23 @@ a print-ready mesh or validated physical print.
 Use [model export](export.md) for exact STEP and checked combined/material STL
 files. Slicer project packaging is separate, deferred work.
 
+## Parallel Curvature Searches
+
+Use `--workers 4` with `relief` or `export` to run independent initial curvature
+repair searches in separate processes. The default is one worker. This execution
+setting is separate from the construction profile and applies to approximate
+curve fitting; it does not parallelize every conversion stage.
+
+Each child prepares one chain with the existing source and taper checks. The
+coordinator applies results in their original order, checks the combined panel,
+and performs later retries serially. Search budgets start when a child begins
+its work, so queued jobs retain their normal allowance. Worker errors abort the
+operation rather than silently substituting a different result.
+
+The `fit_outlines`, `build_relief` and `process_relief_file` APIs accept
+`workers=4` as well. Scripts using multiple workers must protect their entry
+point with `if __name__ == "__main__":` so spawned processes can import it safely.
+
 ## Construction Profile
 
 Use `--profile settings.json` with the
@@ -157,6 +174,15 @@ direction, and the existing ring-level corner patches and intersections remain.
 Native analytic lines use the same exact planar walls. Unrelated construction
 errors, ambiguous directions, and memory failures do not authorize this retry;
 an unresolved individual generator stops conversion.
+
+An individual clamped cubic B-spline can still hit that same native array error.
+When it is exactly a nonrational, four-pole Bernstein polynomial on the unit
+domain, the adapter can retry it as a native Bézier with identical poles,
+endpoint vertices, parameter trim, and orientation. Readback checks preserve
+the source geometry and vertex precision; normal draft-direction and wall
+validity checks still apply. Unsupported forms or the same array failure retain
+the existing quarter-interval trims on the original native curve. This changes
+the native representation, without refitting the selected outline.
 
 Entirely straight regions with more than 2,048 edges use coarse, overlapping
 source pieces before native construction. Distance expansion distributes over
@@ -470,6 +496,22 @@ share four seconds per unresolved chain. Successful runs are retained even if
 other spans on that chain remain unresolved, subject to complete source and
 palette verification. Later contact cleanup can build on those repairs.
 
+After contact cleanup, remaining radius failures get a bounded corner repair.
+It first tries intersecting the failed span's endpoint tangent rays. Existing
+corners may release their incident tangent directions; smooth outer joins keep
+their inherited rays. A two-span window can include a smooth neighbor when its
+outer endpoint is already a corner, but cannot erase an interior corner.
+Smooth vertices shared by other rings remain pinned too.
+Where both window ends are existing corners, a short original source arc can
+also propose two or three straight sides, simplified at 90% of the configured
+fit tolerance. These are local alternatives, not a return to pixel-cell tracing.
+
+Every candidate must pass continuous forward progress and signed curvature,
+the full original-source distance limit, and complete palette topology checks.
+Shared spans are excluded. Acceptance must remove at least one radius failure
+without adding another, so successful repairs survive later rejected trials.
+The hard pre-CAD radius gate and native taper validation still apply.
+
 Source detail is also classified at the assumed extrusion width and twice that
 width. Ordinary raster stairs make forward progress along an edge. Fine texture
 has repeated small backtracking or transverse excursions, with excess path
@@ -506,6 +548,11 @@ Both candidate families reject zero-length steps and consecutive segments that
 retrace each other within floating-point roundoff. The collinearity guard scales
 with coordinate precision, not nozzle size or the source-fit allowance, so
 resolved sharp points remain eligible and the search can try another candidate.
+The complete analytic-line pair check also rejects an endpoint that nearly
+touches another line's interior within eight coordinate ulps, excluding shared
+endpoints. Its spatial bounds include that same roundoff guard. This prevents
+selection from relying on an arithmetic-sized gap that CAD would collapse;
+it does not set a manufacturing minimum gap or relax the source-fit limit.
 
 Each accepted attachment requires the original continuous distance certificate
 against all separate raw component rings at the same configured tolerance.
