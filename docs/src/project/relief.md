@@ -175,6 +175,15 @@ Native analytic lines use the same exact planar walls. Unrelated construction
 errors, ambiguous directions, and memory failures do not authorize this retry;
 an unresolved individual generator stops conversion.
 
+An individual clamped cubic B-spline can still hit that same native array error.
+When it is exactly a nonrational, four-pole Bernstein polynomial on the unit
+domain, the adapter can retry it as a native Bézier with identical poles,
+endpoint vertices, parameter trim, and orientation. Readback checks preserve
+the source geometry and vertex precision; normal draft-direction and wall
+validity checks still apply. Unsupported forms or the same array failure retain
+the existing quarter-interval trims on the original native curve. This changes
+the native representation, without refitting the selected outline.
+
 Entirely straight regions with more than 2,048 edges use coarse, overlapping
 source pieces before native construction. Distance expansion distributes over
 a union, so fusing their roofs preserves the intended taper. The pieces must

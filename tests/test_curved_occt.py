@@ -17,7 +17,7 @@ from OCP.BRepFill import BRepFill_Draft
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox, BRepPrimAPI_MakeTorus
 from OCP.BRepTools import BRepTools
 from OCP.collections import List_TopoDS_Shape
-from OCP.GeomAbs import GeomAbs_BSplineCurve
+from OCP.GeomAbs import GeomAbs_BezierCurve, GeomAbs_BSplineCurve
 from OCP.gp import gp_Dir, gp_Pln, gp_Pnt, gp_Vec
 from OCP.ShapeBuild import ShapeBuild_ReShape
 from OCP.Standard import Standard_OutOfMemory, Standard_OutOfRange
@@ -188,6 +188,8 @@ def test_failed_generator_uses_exact_native_parameter_trims(
         explorer = TopExp_Explorer(wire, TopAbs_EDGE)
         part = TopoDS.Edge(explorer.Current())
         curve = BRepAdaptor_Curve(part)
+        if curve.GetType() == GeomAbs_BezierCurve:
+            raise _DraftArrayFailure("force the unchanged quarter-trim fallback")
         assert part.Orientation() == edge.Orientation()
         assert _geometry_bytes(curve.BSpline()) == original_curve
         interval = curve.FirstParameter(), curve.LastParameter()
