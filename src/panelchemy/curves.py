@@ -1,8 +1,8 @@
 """Shared cubic boundaries with continuous error bounds and local refinement."""
 
 import itertools
-from collections import defaultdict
-from collections.abc import Sequence
+from collections import OrderedDict, defaultdict
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from functools import lru_cache
@@ -25,6 +25,7 @@ type RationalControls = tuple[
 type Edge = tuple[Point2, Point2]
 _HALF = Fraction(1, 2)
 _UNIT_INTERVAL = (Fraction(0), Fraction(1))
+_PROOF_CACHE_LIMIT = 100_000
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,185 @@ class _Piece:
     start: int
     stop: int
     span: BezierSpan
+
+
+type _RingPart = tuple[BezierSpan, bool, tuple[Point2, ...]]
+
+
+@dataclass(frozen=True, eq=False)
+class _AssembledRing:
+    # Identity is a safe polygon-cache key while the entry retains this object.
+    curve: CurveRing
+    proxy: LineString
+
+
+def _assemble_ring(parts: tuple[_RingPart, ...]) -> _AssembledRing:
+    spans: list[BezierSpan] = []
+    points: list[Point2] = []
+    for span, forward, vertices in parts:
+        if not forward:
+            span = BezierSpan(
+                cast("Controls", tuple(reversed(span.control_points))),
+                span.is_line,
+                span.certified_error_mm,
+            )
+            vertices = tuple(reversed(vertices))
+        spans.append(span)
+        points.extend(vertices[:-1])
+    points.append(points[0])
+    return _AssembledRing(CurveRing(tuple(spans)), LineString(points))
+
+
+def _assemble_polygon(
+    rings: tuple[_AssembledRing, ...],
+) -> tuple[CurvePolygon, Polygon]:
+    exterior, *holes = rings
+    return (
+        CurvePolygon(exterior.curve, tuple(ring.curve for ring in holes)),
+        Polygon(exterior.proxy.coords, [ring.proxy.coords for ring in holes]),
+    )
+
+
+def _proxy_box(hull: tuple[RationalPoint, ...]) -> Polygon:
+    return box(
+        nextafter(float(min(p[0] for p in hull)), -inf),
+        nextafter(float(min(p[1] for p in hull)), -inf),
+        nextafter(float(max(p[0] for p in hull)), inf),
+        nextafter(float(max(p[1] for p in hull)), inf),
+    )
+
+
+def _cached[K, V](cache: OrderedDict[K, V], key: K, operation: Callable[[], V]) -> V:
+    try:
+        result = cache.pop(key)
+    except KeyError:
+        result = operation()
+        if len(cache) >= _PROOF_CACHE_LIMIT:
+            _ = cache.popitem(last=False)
+    cache[key] = result
+    return result
+
+
+class ProofCache:
+    """Bounded exact proofs for one refinement call, never a global cache.
+
+    Keys contain geometry and all proof inputs, rather than piece/index IDs.
+    Each map retains at most 100,000 entries; geometry sizes remain variable.
+    Eviction only recomputes a proof. Keep the cache local to its caller.
+    """
+
+    def __init__(self) -> None:
+        self._pairs: OrderedDict[
+            tuple[RationalControls, RationalControls, frozenset[RationalPoint]],
+            tuple[bool, frozenset[Fraction], frozenset[Fraction]],
+        ] = OrderedDict()
+        self._flattened: OrderedDict[
+            tuple[BezierSpan, float, frozenset[Fraction]],
+            tuple[tuple[Point2, ...], tuple[tuple[RationalPoint, ...], ...]],
+        ] = OrderedDict()
+        self._hulls: OrderedDict[
+            tuple[
+                tuple[RationalPoint, ...],
+                tuple[RationalPoint, ...],
+                frozenset[RationalPoint],
+            ],
+            bool,
+        ] = OrderedDict()
+        self._rings: OrderedDict[tuple[_RingPart, ...], _AssembledRing] = OrderedDict()
+        self._polygons: OrderedDict[
+            tuple[_AssembledRing, ...], tuple[CurvePolygon, Polygon]
+        ] = OrderedDict()
+        # Shapely geometries are immutable. Retaining both operands makes their
+        # identities safe keys without repeatedly hashing large geometry WKB.
+        self._validity: OrderedDict[tuple[int, int], tuple[Polygon, Polygon, bool]] = (
+            OrderedDict()
+        )
+        self._relations: OrderedDict[
+            tuple[int, int], tuple[BaseGeometry, BaseGeometry, str]
+        ] = OrderedDict()
+        self._proxy_boxes: OrderedDict[
+            int, tuple[tuple[RationalPoint, ...], Polygon]
+        ] = OrderedDict()
+
+    def proxy_box(self, hull: tuple[RationalPoint, ...]) -> Polygon:
+        # Flattening reuses immutable hull tuples. Retain the exact operand so
+        # its identity cannot be recycled while this conservative box is cached.
+        return _cached(self._proxy_boxes, id(hull), lambda: (hull, _proxy_box(hull)))[1]
+
+    def ring(self, parts: tuple[_RingPart, ...]) -> _AssembledRing:
+        # Actual rounded vertices include every current cut and tolerance's
+        # effect. Full span metadata and traversal directions are also retained.
+        return _cached(self._rings, parts, lambda: _assemble_ring(parts))
+
+    def polygon(
+        self, rings: tuple[_AssembledRing, ...]
+    ) -> tuple[CurvePolygon, Polygon]:
+        return _cached(self._polygons, rings, lambda: _assemble_polygon(rings))
+
+    def valid_polygon(self, polygon: Polygon, silhouette: Polygon) -> bool:
+        return _cached(
+            self._validity,
+            (id(polygon), id(silhouette)),
+            lambda: (
+                polygon,
+                silhouette,
+                polygon.is_valid and polygon.area > 0 and silhouette.covers(polygon),
+            ),
+        )[2]
+
+    def relation(self, left: BaseGeometry, right: BaseGeometry) -> str:
+        # DE-9IM is ordered; reversing operands needs its own result.
+        return _cached(
+            self._relations,
+            (id(left), id(right)),
+            lambda: (left, right, left.relate(right)),
+        )[2]
+
+    def disjoint(
+        self,
+        a: RationalControls,
+        b: RationalControls,
+        allowed: set[RationalPoint],
+        cuts_a: set[Fraction],
+        cuts_b: set[Fraction],
+    ) -> bool:
+        """Replay a complete top-level pair proof on both unit intervals."""
+
+        def prove() -> tuple[bool, frozenset[Fraction], frozenset[Fraction]]:
+            # Recursion only adds cuts. Store this pair's contribution before
+            # merging it with cuts already supplied by other neighbors.
+            left, right = set[Fraction](), set[Fraction]()
+            result = _disjoint(a, b, allowed, cuts_a=left, cuts_b=right)
+            return result, frozenset(left), frozenset(right)
+
+        result, left, right = _cached(self._pairs, (a, b, frozenset(allowed)), prove)
+        cuts_a.update(left)
+        cuts_b.update(right)
+        return result
+
+    def flatten(
+        self, span: BezierSpan, tolerance: float, cuts: set[Fraction]
+    ) -> tuple[tuple[Point2, ...], list[tuple[RationalPoint, ...]]]:
+        def prove() -> tuple[tuple[Point2, ...], tuple[tuple[RationalPoint, ...], ...]]:
+            points, hulls = _flatten(span, tolerance, cuts)
+            return points, tuple(hulls)
+
+        points, hulls = _cached(
+            self._flattened, (span, tolerance, frozenset(cuts)), prove
+        )
+        return points, list(hulls)
+
+    def separated(
+        self,
+        a: Sequence[RationalPoint],
+        b: Sequence[RationalPoint],
+        allowed: set[RationalPoint],
+    ) -> bool:
+        return _cached(
+            self._hulls,
+            (tuple(a), tuple(b), frozenset(allowed)),
+            lambda: _separated(a, b, allowed),
+        )
 
 
 def _point(coordinate: Sequence[float]) -> Point2:
@@ -556,7 +736,7 @@ def _disjoint(
 
 
 def _unsafe_pair(
-    pieces: Sequence[_Piece],
+    pieces: Sequence[_Piece], proof_cache: ProofCache | None = None
 ) -> tuple[list[tuple[int, int]], list[set[Fraction]]]:
     boxes = [
         box(
@@ -577,13 +757,18 @@ def _unsafe_pair(
             if neighbor <= index:
                 continue
             checked += 1
-            if checked > 1_000_000:
+            if checked > 1000000:
                 raise ValueError("curve topology exceeds 1,000,000 candidate pairs")
-            a, b = controls[index], controls[neighbor]
+            a, b = (controls[index], controls[neighbor])
             allowed = {a[0], a[-1]} & {b[0], b[-1]}
-            if not _disjoint(a, b, allowed, cuts_a=cuts[index], cuts_b=cuts[neighbor]):
+            disjoint = (
+                _disjoint(a, b, allowed, cuts_a=cuts[index], cuts_b=cuts[neighbor])
+                if proof_cache is None
+                else proof_cache.disjoint(a, b, allowed, cuts[index], cuts[neighbor])
+            )
+            if not disjoint:
                 unsafe.append((index, neighbor))
-    return unsafe, cuts
+    return (unsafe, cuts)
 
 
 def _flatten(
@@ -634,17 +819,14 @@ def _flatten(
 
 
 def _proxy_unsafe(
-    pieces: Sequence[_Piece], hulls: Sequence[Sequence[tuple[RationalPoint, ...]]]
+    pieces: Sequence[_Piece],
+    hulls: Sequence[Sequence[tuple[RationalPoint, ...]]],
+    proof_cache: ProofCache | None = None,
 ) -> list[tuple[int, int]]:
     """Certify the complete native-to-proxy homotopy, including float rounding."""
     records = [(index, hull) for index, part in enumerate(hulls) for hull in part]
     boxes = [
-        box(
-            nextafter(float(min(p[0] for p in hull)), -inf),
-            nextafter(float(min(p[1] for p in hull)), -inf),
-            nextafter(float(max(p[0] for p in hull)), inf),
-            nextafter(float(max(p[1] for p in hull)), inf),
-        )
+        _proxy_box(hull) if proof_cache is None else proof_cache.proxy_box(hull)
         for _, hull in records
     ]
     tree = STRtree(boxes)
@@ -666,13 +848,32 @@ def _proxy_unsafe(
                 _rational(sa.control_points[0]),
                 _rational(sa.control_points[-1]),
             } & {_rational(sb.control_points[0]), _rational(sb.control_points[-1])}
-            if not _separated(a, b, allowed):
+            separated = (
+                _separated(a, b, allowed)
+                if proof_cache is None
+                else proof_cache.separated(a, b, allowed)
+            )
+            if not separated:
                 unsafe.add((min(left, right), max(left, right)))
     return sorted(unsafe)
 
 
-def _relationships(geometries: Sequence[BaseGeometry]) -> dict[tuple[int, int], str]:
+def _relationships(
+    geometries: Sequence[BaseGeometry], proof_cache: ProofCache | None = None
+) -> dict[tuple[int, int], str]:
     tree = STRtree(geometries)
+    if proof_cache is not None:
+        relationships: dict[tuple[int, int], str] = {}
+        for i, geometry in enumerate(geometries):
+            for j in cast("list[int]", tree.query(geometry).tolist()):
+                if i >= j:
+                    continue
+                relation = proof_cache.relation(geometry, geometries[j])
+                # Disjoint means no interior/boundary intersection in either
+                # direction. Avoid a separate GEOS intersects call before relate.
+                if relation[:2] != "FF" or relation[3:5] != "FF":
+                    relationships[i, j] = relation
+        return relationships
     return {
         (i, j): geometry.relate(geometries[j])
         for i, geometry in enumerate(geometries)
@@ -690,52 +891,48 @@ def _assemble(
     source: PanelContours,
     proxy_tolerance: float,
     topology_cuts: Sequence[set[Fraction]],
+    proof_cache: ProofCache | None = None,
 ) -> tuple[CurveContours, PanelContours, list[LineString], list[tuple[int, int]]]:
     by_chain: dict[int, list[_Piece]] = defaultdict(list)
     flattened: dict[_Piece, tuple[Point2, ...]] = {}
     hulls: list[list[tuple[RationalPoint, ...]]] = []
     for piece, cuts in zip(pieces, topology_cuts, strict=True):
         by_chain[piece.chain].append(piece)
-        flattened[piece], leaf_hulls = _flatten(piece.span, proxy_tolerance, cuts)
+        flattened[piece], leaf_hulls = (
+            _flatten(piece.span, proxy_tolerance, cuts)
+            if proof_cache is None
+            else proof_cache.flatten(piece.span, proxy_tolerance, cuts)
+        )
         hulls.append(leaf_hulls)
-    proxy_unsafe = _proxy_unsafe(pieces, hulls)
+    proxy_unsafe = (
+        _proxy_unsafe(pieces, hulls)
+        if proof_cache is None
+        else _proxy_unsafe(pieces, hulls, proof_cache)
+    )
     for chain_pieces in by_chain.values():
         chain_pieces.sort(key=lambda piece: piece.start)
-    rings: list[CurveRing] = []
-    proxy_rings: list[LineString] = []
+    rings: list[_AssembledRing] = []
     for ring_uses in uses:
-        spans: list[BezierSpan] = []
-        points: list[Point2] = []
-        for chain_id, forward in ring_uses:
-            chain_pieces = by_chain[chain_id]
-            for piece in chain_pieces if forward else reversed(chain_pieces):
-                span = piece.span
-                vertices = flattened[piece]
-                if not forward:
-                    span = BezierSpan(
-                        cast("Controls", tuple(reversed(span.control_points))),
-                        span.is_line,
-                        span.certified_error_mm,
-                    )
-                    vertices = tuple(reversed(vertices))
-                spans.append(span)
-                points.extend(vertices[:-1])
-        points.append(points[0])
-        rings.append(CurveRing(tuple(spans)))
-        proxy_rings.append(LineString(points))
-    polygons = [
-        CurvePolygon(
-            rings[indices.start], tuple(rings[index] for index in list(indices)[1:])
+        parts = tuple(
+            (piece.span, forward, flattened[piece])
+            for chain_id, forward in ring_uses
+            for piece in (
+                by_chain[chain_id] if forward else reversed(by_chain[chain_id])
+            )
+        )
+        rings.append(
+            _assemble_ring(parts) if proof_cache is None else proof_cache.ring(parts)
+        )
+    assembled = [
+        (
+            _assemble_polygon(tuple(rings[index] for index in indices))
+            if proof_cache is None
+            else proof_cache.polygon(tuple(rings[index] for index in indices))
         )
         for indices in ranges
     ]
-    proxy_polygons = [
-        Polygon(
-            proxy_rings[indices.start].coords,
-            [proxy_rings[index].coords for index in list(indices)[1:]],
-        )
-        for indices in ranges
-    ]
+    polygons = [polygon for polygon, _ in assembled]
+    proxy_polygons = [polygon for _, polygon in assembled]
     split = 1 + len(source.orange)
     curves = CurveContours(
         polygons[0],
@@ -756,7 +953,7 @@ def _assemble(
             for p in [source.silhouette, *proxy_polygons[1:]]
         ),
     )
-    return curves, proxy, proxy_rings, proxy_unsafe
+    return curves, proxy, [ring.proxy for ring in rings], proxy_unsafe
 
 
 def _comparison(source: PanelContours, curves: CurveContours, tolerance: float) -> str:

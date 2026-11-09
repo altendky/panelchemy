@@ -760,3 +760,173 @@ without a time limit; it stops because of the geometric constraint, before CAD
 construction or STEP export. Its saved diagnostic trace is not an accepted
 printable model. These results do not establish reliable conversion of arbitrary
 detailed artwork or a fresh successful four-image batch.
+
+## Contact Preparation Reuse
+
+A later compact-cleaned Torn evaluation took 6,230.73 seconds before the final
+radius gate rejected 52 selected spans. Contact refinement accounted for
+3,843.34 seconds (64.1 minutes), including 465.75 seconds of per-contact source
+preparation. These are fitting-stage measurements, not successful model exports.
+
+Contact refinement now prepares the unchanged source once per call. Source
+validation, spatial neighborhoods, small-component groups and individual bridge
+eligibility are reused across proposed selections. Conflicts between selected
+bridges, cross-color conflicts and combined-parent hole preservation retain
+their existing checks. A finalized parent union is reused only for the same
+original parent and selected source members within that preparation.
+
+Hole correspondence uses spatial envelope queries before the same exact
+interior-intersection predicate. Missing, split or multiply owned holes still
+reject; neither the source-distance allowance nor the topology rules change.
+Expected polygon and ring relationships are computed lazily once per proposed
+reference. Every candidate still independently checks its actual curve/proxy
+separation, palette topology, source distance and radius failures.
+
+An isolated replay of initial discovery plus six recorded selection subsets
+took 267.44 seconds before preparation reuse and 31.63 seconds afterward.
+Selected polygon bytes, source groups, contacts and diagnostics matched in all
+cases. These shared-host measurements cover preparation, not the full stage.
+
+The preliminary stage replay identified two additional costs. Whole-graph
+assembly repeatedly proves the same curve pairs and rebuilds the same proxies.
+A per-refinement cache now retains complete pair results and their subdivision
+cuts, flattened curves keyed by the full cuts and tolerance, and exact proxy
+hull-separation results. Spatial queries, pair-count limits and candidate
+topology checks still run for every assembly; changed controls invalidate their
+entries. A temporary whole-assembly comparison took 31.98–35.20 seconds uncached,
+37.83 seconds on a cold cache and 5.44 seconds warm. A local handle change took
+34.34 seconds uncached and 4.70 seconds cached, with identical complete assembly
+outputs and subdivision cuts. These are assembly-only measurements.
+
+The largest parent exterior also exhausted the source-distance proof's shared
+100,000-node budget. All 1,611 forward spans passed, but one unresolved source
+endpoint triggered progressively finer proxies of the entire outline. Source
+certification now builds one complete coarse proxy, then refines nearby curves
+only for source segments that need a tighter witness. Every source segment
+still requires its own positive certificate, and later segments resume the
+complete coarse proxy. The original distance, depth and node limits remain.
+The diagnostic replay certifies all 18,758 source segments using 65,848 nodes;
+only 140 segments need local refinement. This successful baseline permits the
+existing paired-ring proof path instead of repeatedly checking whole-parent
+unions. It does not itself establish an accepted panel or STEP export.
+
+Forward source-distance proofs are also reused per original parent ring within
+one contact-refinement call. The context owns immutable base paths and the fixed
+tolerance. It records only positive proofs of exact controls against those base
+paths. Added fragment paths enlarge that source, so unchanged controls retain
+their proof; failed proofs and success depending on added paths are not learned.
+Every reverse-distance obligation still checks the full current source against
+the current candidate. The complete-boundary result cache remains keyed by all
+paths and selected coefficients.
+
+In a retained large-boundary replay, the first source-bound check took 18.63
+seconds and computed 1,611 forward proofs. A one-span edit took 6.61 seconds and
+computed one new forward proof; repeating it took 6.59 seconds with none. All
+reverse and proxy checks remained active. These are boundary-only timings, not
+complete contact-stage or conversion speedups.
+
+The complete contact-stage replay before forward-proof reuse took 2,391.85
+seconds (39.9 minutes), versus the historical 3,843.34 seconds (64.1 minutes).
+It made 87 certified attachment repairs rather than 40, and reduced final
+radius failures from 52 to 45. Peak RSS was about 503 MiB. This remains a rejected
+panel, and bounded search outcomes differ; it is not an equal-output speed
+comparison or a complete conversion benchmark. Source checks consumed 1,357
+seconds, graph assembly 527 seconds and radius checks 428 seconds. Assembly's
+nested timers are included in its total and must not be added again.
+
+With positive forward-proof reuse, the complete replay took 2,078.57 seconds
+(34.6 minutes), about 1.85 times faster than the original contact stage. It made
+104 certified repairs, retaining all 40 original selections and adding 64;
+41 selected spans still fail the final radius gate. Peak RSS was about 537 MiB.
+The preceding comparison without forward reuse made 87 repairs in 39.9 minutes;
+the additional cache retained those selections and added 17. These are single
+shared-host runs with lightweight timers, and parts overlapped test execution
+and the comparison run. Different bounded-search outcomes make these useful-work
+measurements rather than equal-output benchmarks.
+
+The final stage spent about 847 seconds in source-distance proofs, 634 seconds
+in complete graph assembly and 512 seconds in radius checks. It performed 944
+paired checks and 72 whole-union checks. Rechecking unchanged parts of complete
+boundaries, graph assembly and radius validation remain substantial costs.
+This is not the tenfold overall improvement being targeted. Initial tracing,
+curvature searches and native CAD were not rerun, and this evaluation panel
+remains rejected before CAD. No Rust or additional solver dependency is needed
+for the implemented changes.
+
+### Radius and Reverse-Distance Receipts
+
+Contact refinement also reuses exact orientation and signed-curvature results
+within one call. Every scan still rebuilds shared ownership and the exposed
+material-height differences. Cache hits validate the complete current inputs;
+geometry, signed offset, margin and resource-policy changes require the correct
+proof. The independent final pre-CAD gate remains uncached by default.
+
+Distance contexts retain positive receipts for complete source segments. Each
+receipt names the actual curve controls supporting every accepted subdivision
+leaf; all of those owners must survive before reuse. New or changed source
+segments and missing owners require new proofs. Failed or incomplete segment
+checks never create receipts. Every current source segment remains visited.
+The context also retains exact proxy subdivisions keyed by controls and epsilon,
+with bounded storage and policy invalidation. Newly added paths are checked
+before unchanged base paths to reject invalid attachments sooner. No source,
+taper, topology or approximation allowance is increased.
+
+The combined complete contact-stage replay took 1,377.42 seconds (23.0 minutes),
+versus 2,078.57 seconds (34.6 minutes) before these receipts. It retained all 104
+previous attachment selections and added two, while the independent uncached
+radius gate still found 41 failing spans. Peak RSS increased from about 537 to
+590 MiB. This is about 34% less stage time, or 2.79 times faster than the original
+64.1-minute stage, with different bounded-search outcomes. These are single
+shared-host measurements, not equal-output benchmarks.
+
+Radius checks fell from about 512 to 72 seconds and source-distance checks from
+847 to 537 seconds. Complete graph assembly took about 681 seconds, including
+its nested operations, and is now the largest measured cost. The stage performed
+1,064 paired checks and 66 whole-union checks. Initial tracing, curvature
+searches and native CAD remain outside this replay; the remaining radius
+failures still reject this evaluation panel before model construction.
+
+### Reusing Complete Assembly Artifacts
+
+Positive fixed-source forward proofs now also survive a rejected candidate
+temporarily removing their curve. That removal does not invalidate the exact
+controls' proof against the immutable base paths. Current-geometry-dependent
+proxies and reverse receipts still prune missing owners, and policy changes
+and the weighted capacity bound remain active. In a deliberately costly
+five-edit diagnostic, this reduced forward computations from 15 to five and
+elapsed time from 8.68 to 5.82 seconds; it is not a stage-wide speed estimate.
+
+Assembly retains unchanged curve rings and proxy lines keyed by full ordered
+span metadata, traversal direction and actual rounded vertices. Ordered ring
+artifacts identify polygons, and exact immutable operands identify cached
+validity, silhouette coverage and ordered DE-9IM results. Strong references
+keep identity keys valid. Current hole counts, candidate-pair discovery,
+subdivision cuts and native/proxy separation checks still run. Relationship
+indices are rebuilt from the current component order; a bounding-box query and
+the detailed relationship replace a separate intersection predicate on the
+cached path. Each map has a bounded entry count; retained geometry sizes vary.
+
+A replay using the actual artwork packet matched complete assembly outputs,
+subdivision cuts and unsafe pairs against the preserved implementation,
+including a local handle change. Repeated assembly took about 4.03 seconds
+before artifact reuse and 3.40 seconds after it. Relationship checks fell from
+about 0.69 to 0.02 seconds, but most assembly work remained elsewhere. The first
+changed candidate took 3.95 seconds before reuse and 4.46 afterward, so these
+single shared-host observations do not establish a universal speedup or a new
+complete-stage time. Profiling the warm path identified repeated conservative
+proxy-hull bounding-box construction as the next substantial cost.
+
+The follow-up implementation reuses those conservative boxes by the identity of
+the immutable flattened hull tuple, retaining the tuple beside its box in a
+bounded map. Its exact rational extrema and outward `nextafter` padding are
+unchanged. Every assembly still builds the current spatial index and checks
+the current candidate pairs with the same limits and separation proofs.
+
+An actual-production replay reduced warm proxy checking from 2.68 to 0.77
+seconds. Complete repeated assembly fell from 3.39 to 2.14 seconds; a local
+handle change took 3.34 seconds with box reuse disabled and 2.02 enabled.
+Complete outputs, cuts and unsafe-pair lists matched, including restoration of
+the original geometry. Of 57,634 hulls, the handle change reused 57,628 boxes and
+constructed six. First population incurred about 0.9 seconds extra and roughly
+22 MiB RSS. These are bounded assembly-only, shared-host measurements; no new
+complete contact-stage or conversion time is established by this experiment.

@@ -90,21 +90,22 @@ def test_zero_tolerance_keeps_exact_original_components() -> None:
 def test_raw_source_proof_cannot_be_skipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original = geometric_distance.within_paths
+    original = geometric_distance._within_paths
     calls = 0
 
     def reject_merged(
         paths: Sequence[Sequence[Point2]],
         spans: Sequence[BezierSpan],
         tolerance_mm: float,
+        forward: geometric_distance.ForwardProofCache | None = None,
     ) -> bool:
         nonlocal calls
         if len(paths) > 1:
             calls += 1
             return False
-        return original(paths, spans, tolerance_mm)
+        return original(paths, spans, tolerance_mm, forward)
 
-    monkeypatch.setattr(geometric_distance, "within_paths", reject_merged)
+    monkeypatch.setattr(geometric_distance, "_within_paths", reject_merged)
     slope = tan(radians(10))
     fitted = fit_outlines(
         artwork(),

@@ -4,12 +4,14 @@
 # pyright: reportPrivateUsage=false
 
 from collections.abc import Iterator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import cached_property
 from itertools import chain, pairwise
 from math import hypot, isfinite, ulp
 from time import monotonic
 from typing import cast
 
+from shapely import STRtree
 from shapely.geometry import LineString, Polygon
 
 from panelchemy import boundary_tapers, geometric_distance
@@ -23,6 +25,29 @@ type _Path = tuple[c.Point2, ...]
 type _DistanceKey = tuple[tuple[_Path, ...], tuple[_Key, ...], float]
 
 
+@dataclass(frozen=True)
+class _ReferenceTopology:
+    """Lazy, unchanged topology expectations for one proposed reference."""
+
+    reference: PanelContours
+
+    @cached_property
+    def polygons(self) -> dict[tuple[int, int], str]:
+        r = self.reference
+        return c._relationships([r.silhouette, *r.orange, *r.white])
+
+    @cached_property
+    def rings(self) -> dict[tuple[int, int], str]:
+        r = self.reference
+        return c._relationships(
+            [
+                LineString(ring.coords)
+                for polygon in (r.silhouette, *r.orange, *r.white)
+                for ring in (polygon.exterior, *polygon.interiors)
+            ]
+        )
+
+
 def _key(span: c.BezierSpan) -> _Key:
     p = span.control_points
     if span.is_line:
@@ -30,9 +55,13 @@ def _key(span: c.BezierSpan) -> _Key:
     return span.is_line, min(p, cast("c.Controls", tuple(reversed(p))))
 
 
-def _bad(contours: c.CurveContours, runs: tuple[float, float, float]) -> set[_Key]:
+def _bad(
+    contours: c.CurveContours,
+    runs: tuple[float, float, float],
+    proofs: boundary_tapers.ProofCache | None = None,
+) -> set[_Key]:
     try:
-        boundary_tapers.require_curvature(contours, runs)
+        boundary_tapers.require_curvature(contours, runs, proofs)
     except boundary_tapers.CurvatureLimitError as error:
         return {_key(span) for span, _ in error.failures.values()}
     return set()
@@ -59,7 +88,15 @@ def _source_certificate(
     spans: Sequence[c.BezierSpan],
     tolerance: float,
     cache: dict[_DistanceKey, bool],
+    forward: geometric_distance.ForwardProofCache | None = None,
 ) -> bool:
+    if forward is not None and (
+        forward.tolerance_mm != tolerance
+        or tuple(paths[: len(forward.base_paths)]) != forward.base_paths
+    ):
+        raise ValueError(
+            "forward proofs require their original source paths and tolerance"
+        )
     # This cache lives for one refine call. Both original paths and selected
     # coefficients are part of the key, so an accepted edit cannot reuse an
     # older proof for the changed ring or its enlarged original source group.
@@ -69,7 +106,11 @@ def _source_certificate(
         tolerance,
     )
     if key not in cache:
-        cache[key] = geometric_distance.within_paths(paths, spans, tolerance)
+        cache[key] = (
+            geometric_distance.within_paths(paths, spans, tolerance)
+            if forward is None
+            else forward.within_extra_paths(paths[len(forward.base_paths) :], spans)
+        )
     return cache[key]
 
 
@@ -92,6 +133,7 @@ def _ordered_reference(
             new = [Polygon(ring) for ring in polygon.interiors]
             if len(old) != len(new):
                 return None
+            tree = STRtree(new)
             # Match the surviving hole interiors one-to-one. This only orders
             # existing reference rings; geometry, source bounds and complete
             # topology still pass their ordinary independent proof gates.
@@ -99,7 +141,9 @@ def _ordered_reference(
             order: list[int] = []
             for ring in old:
                 matches = [
-                    i for i in unused if ring.relate_pattern(new[i], "T********")
+                    i
+                    for i in cast("list[int]", tree.query(ring).tolist())
+                    if i in unused and ring.relate_pattern(new[i], "T********")
                 ]
                 if len(matches) != 1:
                     return None
@@ -312,8 +356,14 @@ def _short_arc_candidates(
 
 
 def _assemble(
-    polygons: list[c.CurvePolygon], reference: PanelContours, tolerance: float
+    polygons: list[c.CurvePolygon],
+    reference: PanelContours,
+    tolerance: float,
+    expected: _ReferenceTopology | None = None,
+    proofs: c.ProofCache | None = None,
 ) -> tuple[c.CurveContours, PanelContours] | None:
+    if expected is None or expected.reference is not reference:
+        expected = _ReferenceTopology(reference)
     pieces: list[c._Piece] = []
     selected: dict[_Key, int] = {}
     uses: list[list[tuple[int, bool]]] = []
@@ -343,11 +393,11 @@ def _assemble(
             uses.append(owners)
         ranges.append(range(first, len(uses)))
     try:
-        unsafe, cuts = c._unsafe_pair(pieces)
+        unsafe, cuts = c._unsafe_pair(pieces, proofs)
         if unsafe:
             return None
         curves, proxy, rings, proxy_unsafe = c._assemble(
-            pieces, uses, ranges, reference, tolerance, cuts
+            pieces, uses, ranges, reference, tolerance, cuts, proofs
         )
     except ValueError as error:
         if str(error) not in {
@@ -358,26 +408,21 @@ def _assemble(
         }:
             raise
         return None
-    expected = [reference.silhouette, *reference.orange, *reference.white]
+    original_polygons = [reference.silhouette, *reference.orange, *reference.white]
     actual = [proxy.silhouette, *proxy.orange, *proxy.white]
     if (
         proxy_unsafe
         or any(
-            not p.is_valid
-            or p.area <= 0
+            not (
+                p.is_valid and p.area > 0 and reference.silhouette.covers(p)
+                if proofs is None
+                else proofs.valid_polygon(p, reference.silhouette)
+            )
             or len(p.interiors) != len(original.interiors)
-            or not reference.silhouette.covers(p)
-            for p, original in zip(actual, expected, strict=True)
+            for p, original in zip(actual, original_polygons, strict=True)
         )
-        or c._relationships(actual) != c._relationships(expected)
-        or c._relationships(rings)
-        != c._relationships(
-            [
-                LineString(r.coords)
-                for polygon in expected
-                for r in (polygon.exterior, *polygon.interiors)
-            ]
-        )
+        or c._relationships(actual, proofs) != expected.polygons
+        or c._relationships(rings, proofs) != expected.rings
     ):
         return None
     return curves, proxy
@@ -401,14 +446,14 @@ def refine(
     """
     if not isfinite(proxy_tolerance_mm) or proxy_tolerance_mm <= 0:
         raise ValueError("contact refinement requires positive proxy tolerance")
-    interpretation = ci.before_graph(
-        source, scale_mm=scale_mm, tolerance_mm=tolerance_mm
-    )
+    plan = ci.prepare(source, scale_mm=scale_mm, tolerance_mm=tolerance_mm)
+    interpretation = plan.select()
     if len(contours.orange) != len(source.orange) or len(contours.white) != len(
         source.white
     ):
         raise ValueError("contact refinement requires original component indexing")
-    old_bad = _bad(contours, material_runs)
+    radius_proofs = boundary_tapers.ProofCache()
+    old_bad = _bad(contours, material_runs, radius_proofs)
     by_color: dict[ci.Color, dict[int, c.CurvePolygon]] = {
         "orange": dict(enumerate(contours.orange)),
         "white": dict(enumerate(contours.white)),
@@ -416,11 +461,13 @@ def refine(
     accepted: list[dict[str, object]] = []
     blocked: list[dict[str, object]] = []
     selected: _Selected = frozenset()
-    reference = ci.before_graph(
-        source, scale_mm=scale_mm, tolerance_mm=tolerance_mm, selected_tips=selected
-    )
+    reference = plan.select(selected)
     source_groups: dict[tuple[ci.Color, int], list[tuple[_Path, ...]]] = {}
+    forward_proofs: dict[
+        tuple[ci.Color, int], list[geometric_distance.ForwardProofCache]
+    ] = {}
     certificates: dict[_DistanceKey, bool] = {}
+    proofs = c.ProofCache()
     preparation_seconds = 0.0
     paired_checks = union_checks = 0
     for contact in interpretation.contacts:
@@ -457,12 +504,7 @@ def refine(
         choice: _Selected = selected | frozenset[tuple[ci.Color, int]](
             ((contact.color, contact.tip),)
         )
-        proposed_reference = ci.before_graph(
-            source,
-            scale_mm=scale_mm,
-            tolerance_mm=tolerance_mm,
-            selected_tips=choice,
-        )
+        proposed_reference = plan.select(choice)
         reference_tips: _Selected = frozenset(
             (v.color, v.tip) for v in proposed_reference.contacts
         )
@@ -483,6 +525,7 @@ def refine(
             )
             continue
         proposed_reference = replace(proposed_reference, contours=ordered)
+        expected = _ReferenceTopology(ordered)
         groups = _groups(proposed_reference, contact.color)
         group = next(indices for indices in groups if contact.parent in indices)
         originals = [_source(source, contact.color)[i] for i in group]
@@ -494,10 +537,15 @@ def refine(
                 (tuple((float(x), float(y)) for x, y in ring.coords),)
                 for ring in (original.exterior, *original.interiors)
             ]
+            forward_proofs[source_key] = [
+                geometric_distance.ForwardProofCache(group, tolerance_mm)
+                for group in source_groups[source_key]
+            ]
         paths = source_groups[source_key]
+        forward = forward_proofs[source_key]
         baseline = [
-            _source_certificate(group, ring.spans, tolerance_mm, certificates)
-            for group, ring in zip(paths, parent_rings, strict=True)
+            _source_certificate(group, ring.spans, tolerance_mm, certificates, stored)
+            for group, ring, stored in zip(paths, parent_rings, forward, strict=True)
         ]
         tip_paths = tuple(
             tuple(path)
@@ -536,7 +584,11 @@ def refine(
                 if not all(
                     ok for i, ok in enumerate(baseline) if i != ring_index
                 ) or not _source_certificate(
-                    original_paths, rings[ring_index].spans, tolerance_mm, certificates
+                    original_paths,
+                    rings[ring_index].spans,
+                    tolerance_mm,
+                    certificates,
+                    forward[ring_index],
                 ):
                     deferred.append(candidate)
                     continue
@@ -560,9 +612,16 @@ def refine(
                         else by_color[color][owner]
                     )
             checked = _assemble(
-                polygons, proposed_reference.contours, proxy_tolerance_mm
+                polygons,
+                proposed_reference.contours,
+                proxy_tolerance_mm,
+                expected,
+                proofs,
             )
-            if checked is None or not _bad(checked[0], material_runs) <= old_bad:
+            if (
+                checked is None
+                or not _bad(checked[0], material_runs, radius_proofs) <= old_bad
+            ):
                 continue
             contours, proxy = checked
             by_color[contact.color][contact.parent] = candidate

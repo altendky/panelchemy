@@ -393,22 +393,65 @@ def test_reference_hole_permutation_keeps_identity_and_geometry() -> None:
     )
 
 
+def test_reusing_reference_topology_still_checks_each_candidate() -> None:
+    source = PanelContours(
+        box(0, 0, 20, 20),
+        [box(2, 2, 8, 8)],
+        [box(12, 12, 14, 14)],
+        0.1,
+        (0, 0, 200, 200),
+        12,
+    )
+    polygons = [
+        c.polygon_lines(p) for p in (source.silhouette, *source.orange, *source.white)
+    ]
+    expected = cr._ReferenceTopology(source)
+    proofs = c.ProofCache()
+    assert cr._assemble(polygons, source, 0.001, expected, proofs) is not None
+    assert cr._assemble(polygons, source, 0.001, expected, proofs) is not None
+    # This candidate has disjoint boundary curves but moves white into orange,
+    # changing the palette relationship. Reusing expectations cannot hide it.
+    changed = [*polygons[:-1], c.polygon_lines(box(4, 4, 6, 6))]
+    assert cr._assemble(changed, source, 0.001, expected, proofs) is None
+
+
+def test_reference_topology_cache_is_bound_to_one_proposal() -> None:
+    source = PanelContours(
+        box(0, 0, 20, 20),
+        [],
+        [box(2, 2, 4, 4), box(6, 6, 8, 8)],
+        0.1,
+        (0, 0, 200, 200),
+        12,
+    )
+    old_expected = cr._ReferenceTopology(source)
+    _ = old_expected.polygons, old_expected.rings
+    # The new reference authorizes a point contact absent from the old one.
+    proposal = replace(source, white=[source.white[0], box(4, 4, 6, 6)])
+    polygons = [
+        c.polygon_lines(p)
+        for p in (proposal.silhouette, *proposal.orange, *proposal.white)
+    ]
+    assert cr._assemble(polygons, proposal, 0.001, old_expected) is not None
+
+
 def test_changed_hole_source_group_composes_with_untouched_ring_certificates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, contours, proxy = hole_example()
-    original = geometric_distance.within_paths
+    original = geometric_distance._within_paths
     calls: list[tuple[Sequence[Sequence[c.Point2]], float]] = []
 
     def checked(
         paths: Sequence[Sequence[c.Point2]],
         spans: Sequence[c.BezierSpan],
         tolerance: float,
+        forward: geometric_distance.ForwardProofCache | None = None,
     ) -> bool:
         calls.append((paths, tolerance))
-        return original(paths, spans, tolerance)
+        return original(paths, spans, tolerance, forward)
 
-    monkeypatch.setattr(geometric_distance, "within_paths", checked)
+    monkeypatch.setattr(geometric_distance, "_within_paths", checked)
     result, _, report = refine(source, contours, proxy)
     assert report["changed"] is True
     assert all(tolerance == 0.2 for _, tolerance in calls)
@@ -424,18 +467,19 @@ def test_conservative_pairing_failure_keeps_the_original_union_predicate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source, contours, proxy = hole_example()
-    original = geometric_distance.within_paths
+    original = geometric_distance._within_paths
 
     def unproved_pairs(
         paths: Sequence[Sequence[c.Point2]],
         spans: Sequence[c.BezierSpan],
         tolerance: float,
+        forward: geometric_distance.ForwardProofCache | None = None,
     ) -> bool:
         # Pairing is inconclusive; the distinct whole-parent union still gets
         # its real certificate, using the same source tolerance.
-        return len(paths) >= 4 and original(paths, spans, tolerance)
+        return len(paths) >= 4 and original(paths, spans, tolerance, forward)
 
-    monkeypatch.setattr(geometric_distance, "within_paths", unproved_pairs)
+    monkeypatch.setattr(geometric_distance, "_within_paths", unproved_pairs)
     result, _, report = refine(source, contours, proxy)
     assert report["changed"] is True
     detail = cast("dict[str, object]", report["contact_interpretation"])
@@ -456,7 +500,7 @@ def test_source_cache_tracks_original_group_and_exact_selected_coefficients(
         calls += 1
         return True
 
-    monkeypatch.setattr(geometric_distance, "within_paths", certified)
+    monkeypatch.setattr(geometric_distance, "_within_paths", certified)
     cache: dict[cr._DistanceKey, bool] = {}
     assert cr._source_certificate(paths, ring.spans, 0.2, cache)
     assert cr._source_certificate(paths, replace(ring).spans, 0.2, cache)
@@ -501,6 +545,7 @@ def test_identical_holeless_pair_and_union_reuse_a_failed_exact_proof(
         paths: Sequence[Sequence[c.Point2]],
         spans: Sequence[c.BezierSpan],
         tolerance: float,
+        _forward: geometric_distance.ForwardProofCache | None = None,
     ) -> bool:
         calls.append(
             (
@@ -511,13 +556,25 @@ def test_identical_holeless_pair_and_union_reuse_a_failed_exact_proof(
         )
         return False
 
-    monkeypatch.setattr(geometric_distance, "within_paths", rejected)
+    monkeypatch.setattr(geometric_distance, "_within_paths", rejected)
     result, _, report = refine(source, contours, proxy)
     assert result is contours and report["changed"] is False
     detail = cast("dict[str, object]", report["contact_interpretation"])
     assert cast("int", detail["whole_union_source_checks"]) > 0
     assert any(len(paths) == 2 for paths, _, _ in calls)
     assert len(calls) == len(set(calls))
+
+
+def test_forward_source_cache_cannot_be_used_for_another_group_or_tolerance() -> None:
+    source, contours, _ = example()
+    paths = (tuple((float(x), float(y)) for x, y in source.white[0].exterior.coords),)
+    other = (tuple((float(x), float(y)) for x, y in source.white[1].exterior.coords),)
+    forward = geometric_distance.ForwardProofCache(paths, 0.2)
+    for selected, tolerance in ((other, 0.2), (paths, 0.1)):
+        with pytest.raises(ValueError, match="original source paths and tolerance"):
+            _ = cr._source_certificate(
+                selected, contours.white[0].exterior.spans, tolerance, {}, forward
+            )
 
 
 def test_baseline_preparation_has_explicit_time_accounting_outside_search(
@@ -643,17 +700,18 @@ def test_grouped_attachment_certifies_every_original_member_path(
         contours, white=(contours.white[0], *(c.polygon_lines(p) for p in tips))
     )
     calls: list[tuple[cr._Path, ...]] = []
-    certificate = geometric_distance.within_paths
+    certificate = geometric_distance._within_paths
 
     def checked(
         paths: Sequence[Sequence[c.Point2]],
         spans: Sequence[c.BezierSpan],
         tolerance: float,
+        forward: geometric_distance.ForwardProofCache | None = None,
     ) -> bool:
         calls.append(tuple(tuple(path) for path in paths))
-        return certificate(paths, spans, tolerance)
+        return certificate(paths, spans, tolerance, forward)
 
-    monkeypatch.setattr(geometric_distance, "within_paths", checked)
+    monkeypatch.setattr(geometric_distance, "_within_paths", checked)
     result, _, report = refine(source, contours, source)
     original_tip_paths = [tuple(path) for path in cr._paths(tips)]
     assert any(all(path in group for path in original_tip_paths) for group in calls)

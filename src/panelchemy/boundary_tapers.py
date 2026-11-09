@@ -1,6 +1,10 @@
 """Taper requirements for shared palette boundaries, in canonical direction."""
 
-from collections.abc import Sequence
+# The cached and uncached gates share curvature's exact input validation.
+# pyright: reportPrivateUsage=false
+
+from collections import OrderedDict
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from math import comb, isfinite
@@ -8,6 +12,85 @@ from typing import cast
 
 from panelchemy import curvature
 from panelchemy.curves import BezierSpan, Controls, CurveContours, CurveRing
+
+_PROOF_CACHE_LIMIT = 100_000
+
+
+def _cached[K, V](cache: OrderedDict[K, V], key: K, operation: Callable[[], V]) -> V:
+    try:
+        result = cache.pop(key)
+    except KeyError:
+        result = operation()
+        if len(cache) >= _PROOF_CACHE_LIMIT:
+            _ = cache.popitem(last=False)
+    cache[key] = result
+    return result
+
+
+type _OrientationKey = tuple[CurveRing, tuple[type[object], ...]]
+type _BoundKey = tuple[
+    bool,
+    tuple[tuple[Fraction, ...], ...],
+    Fraction,
+    Fraction,
+    int,
+    int,
+    int,
+]
+
+
+class ProofCache:
+    """Bounded, context-owned exact proofs; never cache material ownership.
+
+    Create one cache for a refinement operation. Every gate still reconstructs
+    shared boundaries and validates the current inputs and resource policy.
+    Both proved and unproved bounds can be reused for identical inputs.
+    """
+
+    def __init__(self) -> None:
+        self._orientations: OrderedDict[_OrientationKey, bool] = OrderedDict()
+        self._bounds: OrderedDict[_BoundKey, bool] = OrderedDict()
+
+    def positive_area(self, ring: CurveRing) -> bool:
+        # Keep the complete original ring, including unused line handles. Type
+        # tags prevent an invalid bool coordinate aliasing an integer coordinate.
+        types = tuple(
+            kind
+            for span in ring.spans
+            for kind in (
+                type(span.is_line),
+                *(type(value) for point in span.control_points for value in point),
+            )
+        )
+        return _cached(self._orientations, (ring, types), lambda: _positive_area(ring))
+
+    def within_curvature(
+        self,
+        span: BezierSpan,
+        offset_mm: float | Fraction,
+        inward_sign: int,
+        fraction: float | Fraction = curvature._DEFAULT_FRACTION,
+    ) -> bool:
+        # Validation must precede lookup: bool == 1, but bool is not a permitted
+        # curvature coordinate. Exact normalized values are safe keys only after
+        # all controls, offsets, directions, and margins have been validated.
+        offset, margin, direction, points = curvature._validated_inputs(
+            span, offset_mm, inward_sign, fraction
+        )
+        key = (
+            span.is_line,
+            points,
+            offset,
+            margin,
+            direction,
+            curvature._MAX_NODES,
+            curvature._MAX_DEPTH,
+        )
+        return _cached(
+            self._bounds,
+            key,
+            lambda: curvature.within_curvature(span, offset_mm, inward_sign, fraction),
+        )
 
 
 @dataclass(frozen=True)
@@ -61,7 +144,9 @@ def _positive_area(ring: CurveRing) -> bool:
 
 
 def require_curvature(
-    contours: CurveContours, material_runs_mm: tuple[float, float, float]
+    contours: CurveContours,
+    material_runs_mm: tuple[float, float, float],
+    proof_cache: ProofCache | None = None,
 ) -> None:
     """Hard pre-CAD gate on actual selected curves and shared exposed heights.
 
@@ -81,7 +166,11 @@ def require_curvature(
     for polygon in (contours.silhouette, *contours.orange, *contours.white):
         first = len(uses)
         for ring_index, ring in enumerate((polygon.exterior, *polygon.interiors)):
-            material_left = _positive_area(ring) == (ring_index == 0)
+            material_left = (
+                _positive_area(ring)
+                if proof_cache is None
+                else proof_cache.positive_area(ring)
+            ) == (ring_index == 0)
             ring_uses: list[tuple[int, bool]] = []
             for span in ring.spans:
                 controls = span.control_points
@@ -105,9 +194,11 @@ def require_curvature(
         index: (spans[index], limit)
         for index, limit in limits.items()
         if limit.offset_mm > 0
-        and not curvature.within_curvature(
-            spans[index], limit.offset_mm, limit.inward_sign
-        )
+        and not (
+            curvature.within_curvature
+            if proof_cache is None
+            else proof_cache.within_curvature
+        )(spans[index], limit.offset_mm, limit.inward_sign)
     }
     if failures:
         raise CurvatureLimitError(contours, failures)

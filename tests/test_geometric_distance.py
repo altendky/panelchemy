@@ -3,6 +3,9 @@
 # Synthetic fixtures use the conversion core's line constructor.
 # pyright: reportPrivateUsage=false
 
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import FrozenInstanceError
 from fractions import Fraction
 from math import cos, hypot, inf, nextafter, pi, sin
 from random import Random
@@ -14,9 +17,15 @@ from panelchemy import geometric_distance
 from panelchemy.curves import (
     BezierSpan,
     Controls,
+    RationalControls,
+    _controls,
     _line,
 )
-from panelchemy.geometric_distance import within_distance, within_paths
+from panelchemy.geometric_distance import (
+    ForwardProofCache,
+    within_distance,
+    within_paths,
+)
 
 
 def test_disconnected_paths_do_not_gain_a_fictitious_connecting_segment() -> None:
@@ -32,6 +41,116 @@ def test_paths_share_the_original_total_distance_budget() -> None:
     shifted = (_line((0, 0.25), (1, 0.25)), _line((1, 0.25), (1, 1.25)))
     assert within_paths(paths, shifted, 0.25)
     assert not within_paths(paths, shifted, nextafter(0.25, 0))
+
+
+def test_cache_reuses_positive_work_and_defaults_stay_uncached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = (((0.0, 0.0), (1.0, 0.0)),)
+    spans = (_line((0, 0), (1, 0)),)
+    forward_calls = reverse_calls = 0
+    forward = geometric_distance._curve_to_source
+    reverse = geometric_distance._source_to_proxy
+
+    def checked_forward(
+        controls: RationalControls,
+        target: geometric_distance._Capsules,
+        budget: geometric_distance._Budget,
+    ) -> bool:
+        nonlocal forward_calls
+        forward_calls += 1
+        return forward(controls, target, budget)
+
+    def checked_reverse(
+        segment: geometric_distance._Segment,
+        target: geometric_distance._Capsules,
+        budget: geometric_distance._Budget,
+        receipt: set[RationalControls] | None = None,
+    ) -> bool:
+        nonlocal reverse_calls
+        reverse_calls += 1
+        return reverse(segment, target, budget, receipt)
+
+    monkeypatch.setattr(geometric_distance, "_curve_to_source", checked_forward)
+    monkeypatch.setattr(geometric_distance, "_source_to_proxy", checked_reverse)
+    cache = ForwardProofCache(paths, 0.2)
+    assert cache.within_extra_paths((), spans)
+    assert cache.within_extra_paths((), spans)
+    assert (forward_calls, reverse_calls) == (1, 1)
+    assert within_paths(paths, spans, 0.2)
+    assert within_paths(paths, spans, 0.2)
+    assert (forward_calls, reverse_calls) == (3, 3)
+    # A completed forward proof does not waive new reverse obligations.
+    assert not cache.within_extra_paths((((4.0, 0.0), (5.0, 0.0)),), spans)
+    assert forward_calls == 3
+    monkeypatch.setattr(geometric_distance, "_MAX_NODES", 0)
+    assert not cache.within_extra_paths((), spans)
+
+
+def test_forward_failure_is_retried_for_extras_without_caching_union_only_success() -> (
+    None
+):
+    base = (((0.0, 0.0), (1.0, 0.0)),)
+    extra = (((4.0, 0.0), (5.0, 0.0)),)
+    spans = (_line((0, 0), (1, 0)), _line((4, 0), (5, 0)))
+    cache = ForwardProofCache(base, 0.2)
+    assert not cache.within_extra_paths((), spans)
+    assert cache.within_extra_paths(extra, spans)
+    # Success against the enlarged target must not poison base-only proofs.
+    assert not cache.within_extra_paths((), spans)
+
+
+def test_forward_cache_does_not_reuse_changed_geometry_or_another_source() -> None:
+    paths = (((0.0, 0.0), (1.0, 0.0)),)
+    span = _line((0, 0.25), (1, 0.25))
+    cache = ForwardProofCache(paths, 0.25)
+    assert cache.within_extra_paths((), (span,))
+    assert not cache.within_extra_paths((), (_line((0, 0.25), (1, 0.5)),))
+    assert not ForwardProofCache(paths, nextafter(0.25, 0)).within_extra_paths(
+        (), (span,)
+    )
+    assert not ForwardProofCache((((0.0, 2.0), (1.0, 2.0)),), 0.25).within_extra_paths(
+        (), (span,)
+    )
+
+
+def test_forward_cache_freezes_its_source_and_tolerance() -> None:
+    paths = [[(0.0, 0.0), (1.0, 0.0)]]
+    cache = ForwardProofCache(paths, 0.2)
+    paths[0][1] = (100.0, 0.0)
+    assert cache.base_paths == (((0.0, 0.0), (1.0, 0.0)),)
+    assert cache.tolerance_mm == 0.2
+    for attribute in ("base_paths", "tolerance_mm"):
+        with pytest.raises(FrozenInstanceError):
+            setattr(cache, attribute, None)
+    assert cache.within_extra_paths((), (_line((0, 0), (1, 0)),))
+    assert not cache.within_extra_paths((), (_line((0, 0), (100, 0)),))
+
+
+@pytest.mark.parametrize("tolerance", [-1, inf, float("nan"), True])
+def test_forward_cache_rejects_invalid_tolerance(tolerance: float) -> None:
+    with pytest.raises(ValueError, match="finite planar"):
+        _ = ForwardProofCache((((0.0, 0.0), (1.0, 0.0)),), tolerance)
+
+
+@pytest.mark.parametrize("paths", [(), ((),), (((0.0, 0.0),),)])
+def test_forward_cache_rejects_invalid_base_paths(
+    paths: tuple[tuple[tuple[float, float], ...], ...],
+) -> None:
+    with pytest.raises(ValueError, match="finite planar"):
+        _ = ForwardProofCache(paths, 0.2)
+
+
+def test_forward_cache_still_validates_extras_and_current_spans() -> None:
+    cache = ForwardProofCache((((0.0, 0.0), (1.0, 0.0)),), 0.2)
+    spans = (_line((0, 0), (1, 0)),)
+    assert cache.within_extra_paths((), spans)
+    with pytest.raises(ValueError, match="finite planar"):
+        _ = cache.within_extra_paths(((),), spans)
+    with pytest.raises(ValueError, match="finite planar"):
+        _ = cache.within_extra_paths((((0.0, 0.0), (inf, 0.0)),), spans)
+    with pytest.raises(ValueError, match="finite planar"):
+        _ = cache.within_extra_paths((), ())
 
 
 @pytest.mark.parametrize("paths", [(), ((),), (((0.0, 0.0),),)])
@@ -119,6 +238,123 @@ def test_proxy_refinement_does_not_accept_actual_out_of_tolerance_source() -> No
     k = 0.5522847498307936
     curve = BezierSpan(((1, 0), (1, k), (k, 1), (0, 1)), False)
     assert not within_distance(source, (curve,), 0.2)
+
+
+@pytest.mark.parametrize("index_threshold", [0, 10_000])
+def test_reverse_refinement_reuses_only_nearby_curve_proxies(
+    monkeypatch: pytest.MonkeyPatch,
+    index_threshold: int,
+) -> None:
+    monkeypatch.setattr(geometric_distance, "_INDEX_MIN_SEGMENTS", index_threshold)
+    k = 0.5522847498307936
+    offsets = (0, 10, 20, 30)
+    paths = tuple(
+        tuple(
+            (
+                offset + radius * cos(i * pi / 200),
+                radius * sin(i * pi / 200),
+            )
+            for i in range(101)
+        )
+        for offset in offsets
+        for radius in (1.195 if offset == 0 else 1.0,)
+    )
+    curves = tuple(
+        BezierSpan(
+            ((offset + 1, 0), (offset + 1, k), (offset + k, 1), (offset, 1)), False
+        )
+        for offset in offsets
+    )
+    calls: Counter[tuple[RationalControls, Fraction]] = Counter()
+    original = geometric_distance._proxy
+
+    def proxy(
+        controls: RationalControls,
+        epsilon: Fraction,
+        budget: geometric_distance._Budget,
+    ) -> list[geometric_distance._Segment] | None:
+        calls[controls, epsilon] += 1
+        return original(controls, epsilon, budget)
+
+    monkeypatch.setattr(geometric_distance, "_proxy", proxy)
+    assert within_paths(paths, curves, 0.2)
+    coarse = Fraction(0.2) / 16
+    for curve in curves:
+        controls = _controls(curve)
+        assert calls[controls, coarse] == 1
+        refined = [
+            epsilon
+            for owner, epsilon in calls
+            if owner == controls and epsilon < coarse
+        ]
+        if curve is curves[0]:
+            assert refined
+        else:
+            # Near-limit source points do not rebuild distant curves.
+            assert not refined
+    # Adjacent source segments reuse exact subdivisions.
+    assert max(calls.values()) == 1
+
+
+def test_local_reverse_refinement_keeps_one_shared_computational_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tuple(
+        (1.195 * cos(i * pi / 200), 1.195 * sin(i * pi / 200)) for i in range(101)
+    )
+    k = 0.5522847498307936
+    curve = BezierSpan(((1, 0), (1, k), (k, 1), (0, 1)), False)
+    budgets: set[geometric_distance._Budget] = set()
+    spent = 0
+    original = geometric_distance._Budget.spend
+
+    def spend(budget: geometric_distance._Budget) -> bool:
+        nonlocal spent
+        budgets.add(budget)
+        spent += 1
+        return original(budget)
+
+    monkeypatch.setattr(geometric_distance._Budget, "spend", spend)
+    assert within_distance(source, (curve,), 0.2)
+    assert len(budgets) == 1
+    required = spent
+    monkeypatch.setattr(geometric_distance, "_MAX_NODES", required - 1)
+    assert not within_distance(source, (curve,), 0.2)
+
+
+def test_local_reverse_success_does_not_skip_later_disconnected_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    near_limit = tuple(
+        (1.195 * cos(i * pi / 200), 1.195 * sin(i * pi / 200)) for i in range(101)
+    )
+    k = 0.5522847498307936
+    curves = (
+        BezierSpan(((1, 0), (1, k), (k, 1), (0, 1)), False),
+        _line((10, 0), (10.5, 0)),
+    )
+    local_calls = 0
+    original = geometric_distance._local_proxy
+
+    def local_proxy(
+        controls: Sequence[RationalControls],
+        owners: Sequence[int],
+        tolerance: Fraction,
+        refinement: int,
+        budget: geometric_distance._Budget,
+        cache: dict[tuple[int, int], tuple[geometric_distance._Segment, ...]],
+        proof_cache: ForwardProofCache | None = None,
+    ) -> geometric_distance._Capsules | None:
+        nonlocal local_calls
+        if refinement > 0:
+            local_calls += 1
+        return original(
+            controls, owners, tolerance, refinement, budget, cache, proof_cache
+        )
+
+    monkeypatch.setattr(geometric_distance, "_local_proxy", local_proxy)
+    assert not within_paths((near_limit, ((10.0, 0.0), (11.0, 0.0))), curves, 0.2)
+    assert local_calls > 0
 
 
 def test_tangential_reparameterization_accepts_identical_line() -> None:
