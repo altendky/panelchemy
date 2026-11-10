@@ -499,9 +499,12 @@ palette verification. Later contact cleanup can build on those repairs.
 After contact cleanup, remaining radius failures get a bounded corner repair.
 It first tries intersecting the failed span's endpoint tangent rays. Existing
 corners may release their incident tangent directions; smooth outer joins keep
-their inherited rays. A two-span window can include a smooth neighbor when its
-outer endpoint is already a corner, but cannot erase an interior corner.
-Smooth vertices shared by other rings remain pinned too.
+their inherited rays. It first offers a two-span window including a smooth
+neighbor, then the surrounding smooth run up to existing corners or protected
+junctions. It cannot erase an interior corner or a vertex shared by other rings,
+and cannot replace an entire ring. Wider windows use the failing bend's endpoints
+as a bounded set of additional corner proposals, independent of the number of
+pieces in the surrounding run.
 Where both window ends are existing corners, a short original source arc can
 also propose two or three straight sides, simplified at 90% of the configured
 fit tolerance. These are local alternatives, not a return to pixel-cell tracing.
