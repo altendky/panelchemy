@@ -239,7 +239,12 @@ def test_neighbor_windows_preserve_existing_corners_and_wrap_safely(
             if not any(old is current for current in candidate.spans)
         )
         removed_groups.add(missing)
-        assert missing in {frozenset({1}), frozenset({0, 1}), frozenset({1, 2})}
+        assert missing in {
+            frozenset({1}),
+            frozenset({0, 1}),
+            frozenset({1, 2}),
+            frozenset({0, 1, 2}),
+        }
         assert old_corners <= {s.control_points[0] for s in candidate.spans}
         assert all(
             a.control_points[-1] == b.control_points[0]
@@ -249,6 +254,7 @@ def test_neighbor_windows_preserve_existing_corners_and_wrap_safely(
         )
     assert frozenset({0, 1}) in removed_groups
     assert frozenset({1, 2}) in removed_groups
+    assert frozenset({0, 1, 2}) in removed_groups
 
 
 def test_a_neighbor_window_cannot_erase_its_existing_interior_corner() -> None:
@@ -265,6 +271,113 @@ def test_a_neighbor_window_cannot_erase_its_existing_interior_corner() -> None:
         (0, 0) in {s.control_points[0] for s in candidate.spans}
         for candidate in candidates
     )
+
+
+def _subdivided_bend() -> tuple[c.BezierSpan, ...]:
+    bend = c.BezierSpan(((0, 0), (0, -0.25), (-0.125, -0.25), (-0.25, -0.125)), False)
+    pieces = tuple(
+        c.BezierSpan(
+            cast("c.Controls", tuple((float(x), float(y)) for x, y in controls)),
+            False,
+        )
+        for controls in c._split(c._controls(bend))
+    )
+    return (
+        c._line((0, 0.25), (0, 0)),
+        *pieces,
+        c._line((-0.25, -0.125), (-0.375, 0)),
+        c._line((-0.375, 0), (0, 0.25)),
+    )
+
+
+@pytest.mark.parametrize("rotation", range(5))
+def test_wider_corner_run_is_independent_of_smooth_subdivision_and_seam(
+    rotation: int,
+) -> None:
+    original = _subdivided_bend()
+    spans = (*original[rotation:], *original[:rotation])
+    ring = c.CurveRing(spans)
+    candidates = list(cr._corner_rings(ring, spans.index(original[1])))
+    widened = [
+        candidate
+        for candidate in candidates
+        if all(not any(s is old for s in candidate.spans) for old in original[:4])
+    ]
+    assert widened
+    # Smaller original families remain a prefix; run expansion is a fallback.
+    assert candidates[-len(widened) :] == widened
+    for candidate in widened:
+        assert any(s is original[-1] for s in candidate.spans)
+        assert original[0].control_points[0] in {
+            s.control_points[0] for s in candidate.spans
+        }
+        assert original[-2].control_points[-1] in {
+            s.control_points[-1] for s in candidate.spans
+        }
+        assert all(
+            a.control_points[-1] == b.control_points[0]
+            for a, b in zip(
+                candidate.spans, (*candidate.spans[1:], candidate.spans[0]), strict=True
+            )
+        )
+
+
+@pytest.mark.parametrize("rotation", range(5))
+@pytest.mark.parametrize("join", [0, 1, 2])
+def test_wider_corner_run_preserves_every_protected_interior_join(
+    rotation: int, join: int
+) -> None:
+    original = _subdivided_bend()
+    spans = (*original[rotation:], *original[:rotation])
+    protected = original[join].control_points[-1]
+    candidates = list(
+        cr._corner_rings(
+            c.CurveRing(spans),
+            spans.index(original[1]),
+            protected_points=frozenset({protected}),
+        )
+    )
+    assert candidates
+    for candidate in candidates:
+        assert protected in {s.control_points[0] for s in candidate.spans}
+        assert not all(
+            not any(s is old for s in candidate.spans) for old in original[:4]
+        )
+
+
+def test_a_fully_smooth_ring_does_not_get_a_whole_ring_corner_replacement() -> None:
+    spans = (
+        c.BezierSpan(((1, 0), (1, 0.5), (0.5, 1), (0, 1)), False),
+        c.BezierSpan(((0, 1), (-0.5, 1), (-1, 0.5), (-1, 0)), False),
+        c.BezierSpan(((-1, 0), (-1, -0.5), (-0.5, -1), (0, -1)), False),
+        c.BezierSpan(((0, -1), (0.5, -1), (1, -0.5), (1, 0)), False),
+    )
+    assert all(corner.smooth_join(spans[i - 1], s) for i, s in enumerate(spans))
+    candidates = list(cr._corner_rings(c.CurveRing(spans), 0))
+    assert candidates
+    assert all(all(s in candidate.spans for s in spans[1:]) for candidate in candidates)
+
+
+def test_a_single_span_success_does_not_scan_the_surrounding_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def smooth(_before: c.BezierSpan, _after: c.BezierSpan) -> bool:
+        nonlocal calls
+        calls += 1
+        assert calls <= 4, "an earlier success should avoid the wider-run scan"
+        return True
+
+    def candidate(
+        span: c.BezierSpan, **_kwargs: object
+    ) -> tuple[tuple[c.BezierSpan, ...], ...]:
+        return ((c._line(span.control_points[0], span.control_points[-1]),),)
+
+    monkeypatch.setattr(corner, "smooth_join", smooth)
+    monkeypatch.setattr(corner, "corner_variants", candidate)
+    assert next(cr._corner_rings(c.CurveRing(_subdivided_bend()), 1))
+    assert calls == 4
 
 
 @pytest.mark.parametrize("rotation", range(4))
@@ -387,10 +500,7 @@ def test_raw_source_corner_fallback_requires_two_existing_outer_corners(
         guide.control_points[0] in corners and guide.control_points[-1] in corners
         for guide in guides
     )
-    if smooth_start and smooth_end:
-        assert not guides
-    else:
-        assert guides
+    assert guides
 
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true"])

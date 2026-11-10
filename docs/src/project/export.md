@@ -23,6 +23,13 @@ is moved onto the build plate independently. STEP reimport verifies names,
 colors, solid counts, native validity, volumes, bounds and component placements.
 Source CAD and retained material-partition proofs are checked before export.
 
+STEP readback reports its volume difference and numerical serialization
+allowance. The allowance uses the largest of the existing absolute and relative
+limits and the source surface area times the kernel's comparison precision.
+This scales the mass check for broad, thin panels; it is not a certificate of
+whole-surface displacement. Native validity, solid counts, registration, and
+material-partition checks remain independent requirements.
+
 Two hole loops can share a vertex in valid OCCT geometry, while STEP requires
 separate boundary connectivity. Export first attempts ordinary STEP. If readback
 exposes open wires at coincident endpoints, it matches those points to source

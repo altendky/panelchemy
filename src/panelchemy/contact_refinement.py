@@ -438,7 +438,7 @@ def _corner_rings(
     *,
     protected_points: frozenset[c.Point2] = _EMPTY_POINTS,
 ) -> Iterator[c.CurveRing]:
-    """Offer one bend, then one smooth neighbor bounded by an existing corner."""
+    """Offer one bend, neighbors, then its corner-bounded smooth run."""
     spans, size = ring.spans, len(ring.spans)
     before, span, after = spans[index - 1], spans[index], spans[(index + 1) % size]
     start_free = not corner_refinement.smooth_join(before, span)
@@ -453,9 +453,40 @@ def _corner_rings(
             after, spans[(index + 2) % size]
         ):
             windows.append((index, 2, start_free, True))
-    for first, count, free_start, free_end in windows:
+
+    def surrounding_run() -> Iterator[tuple[int, int, bool, bool]]:
+        first, count = index, 1
+        while count < size and corner_refinement.smooth_join(
+            spans[first - 1], spans[first]
+        ):
+            if spans[first].control_points[0] in protected_points:
+                break
+            first = (first - 1) % size
+            count += 1
+        while count < size:
+            last = (first + count - 1) % size
+            if (
+                not corner_refinement.smooth_join(spans[last], spans[(last + 1) % size])
+                or spans[last].control_points[-1] in protected_points
+            ):
+                break
+            count += 1
+        if 2 < count < size:
+            last = (first + count - 1) % size
+            yield (
+                first,
+                count,
+                not corner_refinement.smooth_join(spans[first - 1], spans[first]),
+                not corner_refinement.smooth_join(
+                    spans[last], spans[(last + 1) % size]
+                ),
+            )
+
+    for first, count, free_start, free_end in chain(windows, surrounding_run()):
         rotated = (*spans[first:], *spans[:first])
-        if count > 1 and rotated[0].control_points[-1] in protected_points:
+        if any(
+            part.control_points[-1] in protected_points for part in rotated[: count - 1]
+        ):
             continue
         left, right = rotated[0], rotated[count - 1]
         guide = (
@@ -476,7 +507,11 @@ def _corner_rings(
             guide,
             free_start=free_start,
             free_end=free_end,
-            apices=tuple(part.control_points[-1] for part in rotated[: count - 1]),
+            apices=(
+                tuple(part.control_points[-1] for part in rotated[: count - 1])
+                if count <= 2
+                else (span.control_points[0], span.control_points[-1])
+            ),
         ):
             yield c.CurveRing((*replacement, *rotated[count:]))
         if free_start and free_end and tolerance_mm > 0:

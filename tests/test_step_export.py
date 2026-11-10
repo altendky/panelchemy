@@ -11,6 +11,7 @@ from OCP.gp import gp_Trsf, gp_Vec
 from OCP.IFSelect import IFSelect_ReturnStatus
 from OCP.Interface import Interface_Static
 from OCP.STEPCAFControl import STEPCAFControl_Writer
+from OCP.STEPControl import STEPControl_Reader
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS_Shape
 from PIL import Image
@@ -190,6 +191,75 @@ def test_roundtrip_validator_rejects_changed_colors_and_registration() -> None:
         _ = step_export._read_assembly(  # pyright: ignore[reportPrivateUsage]
             bundle.files["relief-multipart.step"], swapped, SeparationConfig().palette
         )
+
+
+def _broad_plate(hole_growth_mm: float = 0) -> TopoDS_Shape:
+    polygon = Polygon(
+        box(0, 0, 250, 180).exterior.coords,
+        [box(100, 80, 110 + hole_growth_mm, 90).exterior.coords],
+    )
+    return occt.prism(polygon, 0, 4)
+
+
+@pytest.mark.parametrize("combined", [False, True], ids=["material", "combined"])
+@pytest.mark.parametrize("hole_growth_mm", [0.0001, 0.001])
+def test_step_mass_allowance_for_broad_thin_geometry(
+    monkeypatch: pytest.MonkeyPatch, combined: bool, hole_growth_mm: float
+) -> None:
+    original = _broad_plate()
+    restored = _broad_plate(hole_growth_mm)
+
+    class ChangedReader(STEPControl_Reader):
+        @override
+        def OneShape(self) -> TopoDS_Shape:
+            return restored
+
+    monkeypatch.setattr(mesh_export, "STEPControl_Reader", ChangedReader)
+
+    def check() -> dict[str, object]:
+        if combined:
+            return mesh_export._step_once(original)[1]  # pyright: ignore[reportPrivateUsage]
+        return step_export._check_shape(original, restored)  # pyright: ignore[reportPrivateUsage]
+
+    difference = abs(occt.volume(original) - occt.volume(restored))
+    assert difference > max(1e-7, occt.volume(original) * 1e-8)
+    if hole_growth_mm == 0.001:
+        with pytest.raises(ExportError, match="volume"):
+            _ = check()
+        return
+    report = check()
+    assert report["valid"] is True
+    assert cast("float", report["volume_difference_mm3"]) == pytest.approx(difference)
+    assert cast("float", report["volume_allowance_mm3"]) >= difference
+    assert cast("float", report["source_surface_area_mm2"]) == pytest.approx(
+        occt.area(original), rel=1e-12, abs=1e-9
+    )
+
+
+@pytest.mark.parametrize("combined", [False, True], ids=["material", "combined"])
+def test_step_mass_allowance_does_not_hide_additional_solids(
+    monkeypatch: pytest.MonkeyPatch, combined: bool
+) -> None:
+    original = _broad_plate()
+    polygon = Polygon(
+        box(0, 0, 250, 180).exterior.coords, [box(100, 80, 110, 90).exterior.coords]
+    )
+    restored = step_export._compound(  # pyright: ignore[reportPrivateUsage]
+        [occt.prism(polygon, 0, 2), occt.prism(polygon, 2, 4)]
+    )
+    assert occt.volume(restored) == pytest.approx(occt.volume(original), rel=1e-12)
+
+    class ChangedReader(STEPControl_Reader):
+        @override
+        def OneShape(self) -> TopoDS_Shape:
+            return restored
+
+    monkeypatch.setattr(mesh_export, "STEPControl_Reader", ChangedReader)
+    with pytest.raises(ExportError, match="solids"):
+        if combined:
+            _ = mesh_export._step_once(original)  # pyright: ignore[reportPrivateUsage]
+        else:
+            _ = step_export._check_shape(original, restored)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_serialized_component_translation_is_rejected(

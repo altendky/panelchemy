@@ -1212,6 +1212,38 @@ def _read_stl(data: bytes) -> _Mesh:
     return _Mesh(points, triangles)
 
 
+def _step_volume_allowance(source: TopoDS_Shape, volume_mm3: float) -> dict[str, float]:
+    """Scale numerical STEP mass comparisons to the source's surface area.
+
+    This is an engineering serialization allowance, not a certificate of
+    whole-surface displacement. Validity and registration checks are separate.
+    """
+    area = occt.area(source)
+    precision = Precision.Confusion_s()
+    if (
+        not isfinite(area)
+        or area <= 0
+        or not isfinite(volume_mm3)
+        or not isfinite(precision)
+        or precision <= 0
+    ):
+        raise ExportError("STEP source has no finite serialization volume allowance")
+    return {
+        "volume_allowance_mm3": max(1e-7, abs(volume_mm3) * 1e-8, area * precision),
+        "source_surface_area_mm2": area,
+        "kernel_comparison_precision_mm": precision,
+    }
+
+
+def _solid_count(shape: TopoDS_Shape) -> int:
+    explorer = TopExp_Explorer(shape, TopAbs_SOLID)
+    count = 0
+    while explorer.More():
+        count += 1
+        explorer.Next()
+    return count
+
+
 def _step_once(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
     copied = BRepBuilderAPI_Copy(shape, True, False).Shape()
     stream = BytesIO()
@@ -1268,8 +1300,14 @@ def _step_once(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
                 "STEP roundtrip has open wires at coincident endpoints", points
             )
         raise ExportError("STEP roundtrip invalidated the CAD solid")
+    if _solid_count(shape) != _solid_count(roundtrip):
+        raise ExportError("STEP roundtrip changed the number of CAD solids")
     original, restored = occt.volume(shape), occt.volume(roundtrip)
-    if abs(original - restored) > max(1e-7, original * 1e-8):
+    allowance = _step_volume_allowance(shape, original)
+    if (
+        not isfinite(restored)
+        or abs(original - restored) > allowance["volume_allowance_mm3"]
+    ):
         raise ExportError("STEP roundtrip changed the CAD solid volume")
     before, after = _bounds(shape), _bounds(roundtrip)
     if (
@@ -1285,6 +1323,7 @@ def _step_once(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
         "valid": True,
         "volume_mm3": restored,
         "volume_difference_mm3": abs(original - restored),
+        **allowance,
         "units": "millimeter",
         "serialized_length_units": length_units,
         "timestamp_may_vary": True,

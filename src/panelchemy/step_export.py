@@ -37,6 +37,7 @@ from panelchemy.export import (
     StepTopologyError,
     _bounds,  # pyright: ignore[reportPrivateUsage]
     _step,  # pyright: ignore[reportPrivateUsage]
+    _step_volume_allowance,  # pyright: ignore[reportPrivateUsage]
 )
 from panelchemy.separation import Palette, SeparationConfig
 
@@ -119,7 +120,8 @@ def _check_shape(original: TopoDS_Shape, restored: TopoDS_Shape) -> dict[str, ob
     if any(not checker.IsValid(cell) or occt.volume(cell) <= 0 for cell in cells):
         raise ExportError("STEP roundtrip invalidated a material solid")
     before, after = occt.volume(original), occt.volume(restored)
-    if not isfinite(after) or not isclose(before, after, rel_tol=1e-8, abs_tol=1e-7):
+    allowance = _step_volume_allowance(original, before)
+    if not isfinite(after) or abs(before - after) > allowance["volume_allowance_mm3"]:
         raise ExportError("STEP roundtrip changed material volume")
     low, high = _bounds(restored)
     if any(
@@ -134,6 +136,7 @@ def _check_shape(original: TopoDS_Shape, restored: TopoDS_Shape) -> dict[str, ob
         "bounds_mm": [list(low), list(high)],
         "volume_mm3": after,
         "volume_difference_mm3": abs(before - after),
+        **allowance,
     }
 
 
