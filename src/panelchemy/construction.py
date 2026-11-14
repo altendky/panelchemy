@@ -40,7 +40,7 @@ class ConstructionProfile:
     layer_height_mm: float = 0.2
     black_thickness_mm: float = 1.6
     orange_thickness_mm: float = 0.4
-    white_thickness_mm: float = 0.6
+    white_thickness_mm: float = 0.8
     taper_angle_deg: float = 10.0
     rim_width_mm: float = 0.2
     contour_tolerance_mm: float = 0.0

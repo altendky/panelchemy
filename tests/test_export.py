@@ -159,8 +159,9 @@ def test_float32_conformance_opposite_pairs_cancel_before_serialization(
             left, right = white.points[a], white.points[b]
             middle = [(left[i] + right[i]) / 2 for i in range(3)]
             axis = 2 if left[:2] != right[:2] else 0
-            middle[axis] += 2.0**-18  # Exactly representable in float32 here.
-            point = (middle[0], middle[1], middle[2])
+            middle[axis] += 2.0**-18
+            # Keep the synthetic point on the float32 grid at any band height.
+            point = export_module._float32((middle[0], middle[1], middle[2]))  # pyright: ignore[reportPrivateUsage]
             _ = _normal([left, right, point])
             extra = len(white.points)
             conformed["white"] = _Mesh(
@@ -186,7 +187,7 @@ def test_float32_conformance_opposite_pairs_cancel_before_serialization(
     assert materials["white"]["coordinate_movement_mm"] == 0
 
 
-@pytest.mark.parametrize("colors,highest", [(1, 1.6), (2, 2), (3, 2.6)])
+@pytest.mark.parametrize("colors,highest", [(1, 1.6), (2, 2), (3, 2.8)])
 def test_serialized_exports_keep_registration_and_optional_bands(
     colors: int, highest: float
 ) -> None:
@@ -215,7 +216,7 @@ def test_serialized_exports_keep_registration_and_optional_bands(
             {"black": 0, "orange": 1.6, "white": 2}[name]
         )
         assert max(p[2] for p in stl.points) == pytest.approx(
-            {"black": 1.6, "orange": 2, "white": 2.6}[name]
+            {"black": 1.6, "orange": 2, "white": 2.8}[name]
         )
     combined = _read_stl(bundle.files["relief.stl"])
     assert max(p[2] for p in combined.points) == pytest.approx(highest)

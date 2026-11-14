@@ -78,7 +78,7 @@ def test_named_colored_assembly_roundtrip_without_meshing(
         )
         bounds = cast("list[list[float]]", parts[name]["bounds_mm"])
         assert bounds[0][2] == pytest.approx((0, 1.6, 2)[i], abs=1e-6)
-        assert bounds[1][2] == pytest.approx((1.6, 2, 2.6)[i], abs=1e-6)
+        assert bounds[1][2] == pytest.approx((1.6, 2, 2.8)[i], abs=1e-6)
     if colors == 3:
         assert parts["white"]["solid_count"] == 2
     assert bundle.validation["mesh_validated"] is False
