@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 from importlib.metadata import version
 from io import BytesIO
-from math import cos, isclose, pi
+from math import cos, pi
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
@@ -34,7 +34,8 @@ from panelchemy.contours import PanelContours, vectorize
 from panelchemy.curves import CurveContours, Point2, fit_contours
 from panelchemy.material_partition import MaterialPartition
 from panelchemy.outline_fitting import fit_outlines
-from panelchemy.raster_cleanup import RasterCleanupResult, cleanup
+from panelchemy.raster_cleanup import RasterCleanupResult
+from panelchemy.raster_retention import prepare_raster
 from panelchemy.separation import (
     Mask,
     SeparationConfig,
@@ -42,6 +43,8 @@ from panelchemy.separation import (
     prepare_artifacts,
     separate,
 )
+from panelchemy.shade_guides import ShadeGuides
+from panelchemy.volume_comparison import compare_volumes
 
 if TYPE_CHECKING:
     from panelchemy.export import ExportConfig
@@ -103,6 +106,7 @@ def build_relief(
     result: SeparationResult,
     profile: ConstructionProfile | None = None,
     *,
+    rgb_image: Image.Image | None = None,
     max_vertices: int = 25_000,
     workers: int = 1,
 ) -> ReliefModel:
@@ -122,11 +126,21 @@ def build_relief(
         raise ValueError(
             "Review the boundary warnings and supply an explicit silhouette before building relief"
         )
-    raster_cleanup = None
-    if profile.raster_cleanup_mm > 0:
-        raster_cleanup = cleanup(
-            result, profile.long_edge_mm, profile.raster_cleanup_mm
-        )
+    if rgb_image is not None and (
+        result.labels.ndim != 2
+        or rgb_image.size != (result.labels.shape[1], result.labels.shape[0])
+    ):
+        raise ValueError("RGB guidance must match the separated image dimensions")
+    raw_result = result
+    raster_cleanup = prepare_raster(
+        result,
+        long_edge_mm=profile.long_edge_mm,
+        compact_width_mm=profile.raster_cleanup_mm,
+        body_width_mm=profile.stroke_body_width_mm,
+        stroke_length_mm=profile.stroke_support_length_mm,
+        line_width_mm=profile.assumed_line_width_mm,
+    )
+    if raster_cleanup is not None:
         result = raster_cleanup.cleaned
     # Approximation still starts from exact cells. Bound source allocation
     # separately, then enforce the configured kernel budget on the result.
@@ -161,6 +175,11 @@ def build_relief(
                 ),
                 palette=result.config.palette,
                 workers=workers,
+                shade_guides=ShadeGuides(
+                    rgb_image, original=raw_result, retained=result, source=contours
+                )
+                if rgb_image is not None
+                else None,
             )
         else:
             fitted = fit_contours(
@@ -315,9 +334,8 @@ def build_relief(
     materials = material_partition.materials_for(partition)
     volumes = {name: occt.volume(shape) for name, shape in materials.items()}
     solid_volume = occt.volume(solid)
-    if solid_volume <= 0 or not isclose(
-        sum(volumes.values()), solid_volume, rel_tol=1e-8, abs_tol=1e-7
-    ):
+    comparison = compare_volumes(solid_volume, sum(volumes.values()))
+    if not comparison.acceptable:
         raise occt.KernelError("material volumes do not account for the combined solid")
     expected_top = occt.fuse(expected_white_faces)
     actual_top = planar_boundary.top_boundary(solid, profile.white_top)
@@ -346,6 +364,8 @@ def build_relief(
     clipped_volume = max(0.0, occt.volume(untrimmed) - occt.volume(raised))
     orange_occluded = orange.intersection(white_floor).area
     warnings = list(result.warnings)
+    if comparison.warning is not None:
+        warnings.append(comparison.warning)
     if clipped_volume > 1e-7:
         warnings.append(
             "Expanded lower tapers were clipped to protect the black rim; feature tops were preserved."
@@ -378,6 +398,7 @@ def build_relief(
         "solid_count": solid_count,
         "solid_volume_mm3": solid_volume,
         "material_volumes_mm3": volumes,
+        "material_volume_comparison": comparison.diagnostics(),
         "native_material_partition": partition.diagnostics,
         "rim_clipped_volume_mm3": clipped_volume,
         "rim_guard_arc_segments_per_quadrant": guard_segments,
@@ -549,7 +570,14 @@ def process_relief_file(
             separation_config,
             silhouette=silhouette_mask,
         )
-    model = build_relief(result, profile, max_vertices=max_vertices, workers=workers)
+        rgb_image = image.copy()
+    model = build_relief(
+        result,
+        profile,
+        rgb_image=rgb_image,
+        max_vertices=max_vertices,
+        workers=workers,
+    )
     # Staging avoids publishing BRep files if a kernel write or preview fails.
     with TemporaryDirectory(prefix="panelchemy-relief-") as staging:
         stage = Path(staging)

@@ -7,13 +7,14 @@ import pytest
 from panelchemy.construction import ConstructionProfile
 
 
-def test_user_defaults_define_twenty_layers_and_three_bands() -> None:
+def test_user_defaults_define_thirteen_layers_and_three_bands() -> None:
     profile = ConstructionProfile()
     assert profile.long_edge_mm == 250
     assert profile.nozzle_diameter_mm == 0.4
     assert profile.layer_height_mm == 0.2
-    assert (profile.black_top, profile.orange_top, profile.white_top) == (2, 3, 4)
-    assert profile.white_top / profile.layer_height_mm == 20
+    assert (profile.black_top, profile.orange_top, profile.white_top) == (1.6, 2, 2.6)
+    assert profile.black_top / profile.layer_height_mm == 8
+    assert profile.white_top / profile.layer_height_mm == 13
     assert profile.contour_tolerance_mm == 0
 
 
@@ -59,6 +60,17 @@ def test_raster_cleanup_is_disabled_by_default_and_roundtrips() -> None:
     assert ConstructionProfile(raster_cleanup_mm=2).raster_cleanup_mm == 2
 
 
+def test_stroke_retention_is_opt_in_with_configurable_physical_support() -> None:
+    assert ConstructionProfile().stroke_body_width_mm == 0
+    assert ConstructionProfile().stroke_support_length_mm == 3
+    selected = ConstructionProfile.from_mapping(
+        {"stroke_body_width_mm": 1.0, "stroke_support_length_mm": 4.0}
+    )
+    assert selected.stroke_body_width_mm == 1.0
+    assert selected.stroke_support_length_mm == 4.0
+    assert ConstructionProfile.from_mapping(selected.as_dict()) == selected
+
+
 @pytest.mark.parametrize(
     "values",
     [
@@ -93,6 +105,12 @@ def test_raster_cleanup_is_disabled_by_default_and_roundtrips() -> None:
         {"raster_cleanup_mm": float("nan")},
         {"raster_cleanup_mm": float("inf")},
         {"raster_cleanup_mm": 10**1000},
+        {"stroke_body_width_mm": -1},
+        {"stroke_body_width_mm": True},
+        {"stroke_body_width_mm": float("inf")},
+        {"stroke_support_length_mm": 0},
+        {"stroke_support_length_mm": True},
+        {"stroke_support_length_mm": float("nan")},
         {"orange_thickness_mm": 1e-12},
         {"orange_thickness_mm": 200000000.02},
         {

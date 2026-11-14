@@ -7,7 +7,7 @@ from math import pi, radians, tan
 from typing import cast, override
 
 import pytest
-from OCP.BOPAlgo import BOPAlgo_Splitter
+from OCP.BOPAlgo import BOPAlgo_MakerVolume, BOPAlgo_Splitter
 from OCP.BRep import BRep_Builder
 from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.BRepAlgoAPI import BRepAlgoAPI_BooleanOperation
@@ -184,7 +184,10 @@ def test_failed_generator_uses_exact_native_parameter_trims(
         slope: float,
         internal: bool,
         diagnostics: dict[str, object] | None = None,
+        *,
+        precise_draft: bool = False,
     ) -> BRepFill_Draft:
+        assert not precise_draft
         explorer = TopExp_Explorer(wire, TopAbs_EDGE)
         part = TopoDS.Edge(explorer.Current())
         curve = BRepAdaptor_Curve(part)
@@ -196,7 +199,10 @@ def test_failed_generator_uses_exact_native_parameter_trims(
         seen.append(interval)
         if interval == (0, 1):
             raise _DraftArrayFailure("forced known full-generator failure")
-        return _verified_draft(wire, z0, z1, slope, internal, diagnostics)
+        return cast(
+            "BRepFill_Draft",
+            _verified_draft(wire, z0, z1, slope, internal, diagnostics),
+        )
 
     monkeypatch.setattr(curved_occt, "_verified_draft", draft)
     diagnostics: dict[str, object] = {}
@@ -744,6 +750,115 @@ def test_shared_sibling_cells_glue_after_ordinary_union_fails(
 
 
 @pytest.mark.usefixtures("failed_ordinary_fuse")
+def test_partition_positivity_reuses_the_existing_interior_proof(
+    monkeypatch: pytest.MonkeyPatch, sibling_cells: list[TopoDS_Shape]
+) -> None:
+    original_volume = occt.volume
+    before = [_physical_brep(cell) for cell in sibling_cells]
+
+    def volume(shape: TopoDS_Shape) -> float:
+        if any(shape.IsSame(cell) for cell in sibling_cells):
+            pytest.fail(
+                "selected-cell positivity must not repeat accurate mass integration"
+            )
+        return original_volume(shape)
+
+    monkeypatch.setattr(occt, "volume", volume)
+    result = _fuse_draft_cells(sibling_cells)
+    assert occt.valid(result) and original_volume(result) == pytest.approx(3)
+    assert [_physical_brep(cell) for cell in sibling_cells] == before
+
+
+@pytest.mark.usefixtures("failed_ordinary_fuse")
+def test_partition_boxes_skip_separate_pairs_and_still_check_contacts(
+    monkeypatch: pytest.MonkeyPatch, sibling_cells: list[TopoDS_Shape]
+) -> None:
+    original_common = occt.common
+    pairs: list[tuple[int, int]] = []
+
+    def common(a: TopoDS_Shape, b: TopoDS_Shape) -> TopoDS_Shape:
+        first = next(i for i, cell in enumerate(sibling_cells) if cell.IsSame(a))
+        second = next(i for i, cell in enumerate(sibling_cells) if cell.IsSame(b))
+        pairs.append((first, second))
+        return original_common(a, b)
+
+    monkeypatch.setattr(occt, "common", common)
+    diagnostics: dict[str, object] = {}
+    result = _fuse_draft_cells(sibling_cells, diagnostics)
+    assert occt.volume(result) == pytest.approx(3)
+    assert pairs == [(0, 1), (1, 2)]
+    assert diagnostics["partition_separated_pairs"] == 1
+    assert diagnostics["partition_overlap_checks"] == 2
+
+
+@pytest.mark.usefixtures("failed_ordinary_fuse")
+def test_partition_does_not_skip_an_overlapping_candidate(
+    monkeypatch: pytest.MonkeyPatch, sibling_cells: list[TopoDS_Shape]
+) -> None:
+    overlap = BRepPrimAPI_MakeBox(0.1, 0.1, 0.1).Shape()
+
+    def common(*_args: TopoDS_Shape) -> TopoDS_Shape:
+        return overlap
+
+    monkeypatch.setattr(occt, "common", common)
+    with pytest.raises(occt.KernelError, match="overlap in volume"):
+        _ = _fuse_draft_cells(sibling_cells)
+
+
+def test_primary_arrangement_can_glue_a_verified_partition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    region = polygon_lines(box(0, 0, 3, 1))
+    original, _ = curved_occt.roof(region, 2, 4, 0.1)
+    arguments, tools = List_TopoDS_Shape(), List_TopoDS_Shape()
+    _ = arguments.Append(original)
+    plane = gp_Pln(gp_Pnt(1.5, 0, 0), gp_Dir(1, 0, 0))
+    _ = tools.Append(BRepBuilderAPI_MakeFace(plane, -10, 10, -10, 10).Face())
+    splitter = BOPAlgo_Splitter()
+    splitter.SetArguments(arguments)
+    splitter.SetTools(tools)
+    splitter.SetNonDestructive(True)
+    splitter.Perform()
+    assert not splitter.HasErrors()
+    partition = splitter.Shape()
+    assert occt.topology_counts(partition)["solids"] == 2
+
+    class PartitionMaker(BOPAlgo_MakerVolume):
+        @override
+        def Shape(self) -> TopoDS_Shape:
+            return partition
+
+    def failed_union(_shapes: Sequence[TopoDS_Shape]) -> TopoDS_Shape:
+        raise occt.KernelError("ordinary partition union failed")
+
+    monkeypatch.setattr(curved_occt, "BOPAlgo_MakerVolume", PartitionMaker)
+    monkeypatch.setattr(occt, "fuse", failed_union)
+    diagnostics: dict[str, object] = {}
+    result, method = curved_occt.roof(region, 2, 4, 0.1, diagnostics=diagnostics)
+    assert method == "surface" and diagnostics["glued_draft_cells"] == 2
+    assert occt.volume(result) == pytest.approx(occt.volume(original))
+    _, report = _step(result)
+    assert report["valid"] is True
+
+
+def test_wrong_selected_top_is_rejected_before_any_partition_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnsplitMaker(BOPAlgo_MakerVolume):
+        @override
+        def Shape(self) -> TopoDS_Shape:
+            return self.Arguments().First()
+
+    def unexpected(*_args: object, **_kwargs: object) -> TopoDS_Shape:
+        pytest.fail("a partition with the wrong plateau must fail before joining")
+
+    monkeypatch.setattr(curved_occt, "BOPAlgo_MakerVolume", UnsplitMaker)
+    monkeypatch.setattr(curved_occt, "_fuse_draft_cells", unexpected)
+    with pytest.raises(occt.KernelError, match="changed fitted top area"):
+        _ = curved_occt.roof(CurvePolygon(circle(2)), 2, 4, 0.1)
+
+
+@pytest.mark.usefixtures("failed_ordinary_fuse")
 @pytest.mark.parametrize(
     "kind", ["copied", "independent", "overlap", "duplicate", "disconnected"]
 )
@@ -851,9 +966,14 @@ def test_curved_roof_retries_preimprint_and_keeps_final_checks(
     checks: list[str] = []
 
     def surface(
-        *_args: object, preimprint: bool = False, **_kwargs: object
+        *_args: object,
+        preimprint: bool = False,
+        precise_draft: bool = False,
+        **_kwargs: object,
     ) -> TopoDS_Shape:
         calls.append(preimprint)
+        if precise_draft:
+            raise occt.KernelError("precise source construction failed")
         if not preimprint and first_failure == "construction":
             raise occt.KernelError("default curved construction failed")
         return solid
@@ -872,9 +992,10 @@ def test_curved_roof_retries_preimprint_and_keeps_final_checks(
     diagnostics: dict[str, object] = {}
     result, method = curved_occt.roof(region, 2, 3, 0.1, diagnostics=diagnostics)
     assert result.IsSame(solid) and method == "surface-preimprint"
-    assert calls == [False, True]
+    assert calls == [False, False, True]
     assert checks[-2:] == ["top", "sections"]
     assert isinstance(diagnostics["surface_failure"], str)
+    assert isinstance(diagnostics["precise_surface_failure"], str)
 
 
 def test_curved_roof_preserves_both_native_failure_reasons(
@@ -930,12 +1051,12 @@ def test_curved_preimprint_result_must_pass_every_final_check(
         _ = curved_occt.roof(
             CurvePolygon(circle(2)), 2, 3, 0.1, diagnostics=diagnostics
         )
-    assert calls == [False, True]
+    assert calls == [False, False, True]
     assert diagnostics["preimprint_failure"] == "fallback physical check failed"
 
 
 @pytest.mark.parametrize("error_type", [MemoryError, Standard_OutOfMemory])
-@pytest.mark.parametrize("stage", ["default", "preimprint"])
+@pytest.mark.parametrize("stage", ["default", "precise", "preimprint"])
 def test_curved_roof_propagates_wrapped_memory_failures_without_retry(
     monkeypatch: pytest.MonkeyPatch, error_type: type[Exception], stage: str
 ) -> None:
@@ -946,9 +1067,14 @@ def test_curved_roof_propagates_wrapped_memory_failures_without_retry(
     calls: list[bool] = []
 
     def surface(
-        *_args: object, preimprint: bool = False, **_kwargs: object
+        *_args: object,
+        preimprint: bool = False,
+        precise_draft: bool = False,
+        **_kwargs: object,
     ) -> TopoDS_Shape:
         calls.append(preimprint)
+        if stage == "precise" and not precise_draft:
+            raise occt.KernelError("default curved construction failed")
         if stage == "preimprint" and not preimprint:
             raise occt.KernelError("default curved construction failed")
         raise error
@@ -957,7 +1083,14 @@ def test_curved_roof_propagates_wrapped_memory_failures_without_retry(
     with pytest.raises(occt.KernelError) as failed:
         _ = curved_occt.roof(CurvePolygon(circle(2)), 2, 3, 0.1)
     assert failed.value is error
-    assert calls == ([False] if stage == "default" else [False, True])
+    assert (
+        calls
+        == {
+            "default": [False],
+            "precise": [False, False],
+            "preimprint": [False, False, True],
+        }[stage]
+    )
 
 
 def test_native_pair_preimprint_retains_a_notched_polygon_top_and_expansion() -> None:

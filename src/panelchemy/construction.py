@@ -38,9 +38,9 @@ class ConstructionProfile:
     long_edge_mm: float = 250.0
     nozzle_diameter_mm: float = 0.4
     layer_height_mm: float = 0.2
-    black_thickness_mm: float = 2.0
-    orange_thickness_mm: float = 1.0
-    white_thickness_mm: float = 1.0
+    black_thickness_mm: float = 1.6
+    orange_thickness_mm: float = 0.4
+    white_thickness_mm: float = 0.6
     taper_angle_deg: float = 10.0
     rim_width_mm: float = 0.2
     contour_tolerance_mm: float = 0.0
@@ -48,6 +48,8 @@ class ConstructionProfile:
     corner_softening_mm: float = 0.0
     span_simplification_mm: float = 0.0
     raster_cleanup_mm: float = 0.0
+    stroke_body_width_mm: float = 0.0
+    stroke_support_length_mm: float = 3.0
 
     def __post_init__(self) -> None:
         for field in fields(self):
@@ -65,6 +67,7 @@ class ConstructionProfile:
                 "corner_softening_mm",
                 "span_simplification_mm",
                 "raster_cleanup_mm",
+                "stroke_body_width_mm",
             }:
                 if value < 0:
                     raise ValueError(f"{field.name} must be non-negative")

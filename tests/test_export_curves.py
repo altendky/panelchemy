@@ -6,10 +6,13 @@ from typing import cast
 
 import numpy as np
 import pytest
+from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
 from OCP.BRepTools import BRepTools
 from OCP.GeomAbs import GeomAbs_BezierCurve, GeomAbs_BSplineCurve
-from OCP.TopAbs import TopAbs_EDGE
+from OCP.gp import gp_Pnt
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopoDS import TopoDS
 from PIL import Image
@@ -46,6 +49,7 @@ def _model(tolerance: float) -> ReliefModel:
             # Half-millimeter pixels resolve the fitter's physical corner
             # neighborhood; millimeter pixels preserve the raster staircase.
             long_edge_mm=39,
+            black_thickness_mm=2,  # Fixed cap-height corruption fixtures below.
             taper_angle_deg=0,
             contour_tolerance_mm=tolerance,
         ),
@@ -274,6 +278,48 @@ def test_horizontal_cap_coordinate_noise_is_not_an_interior_wall(
     result = _footprints(meshes, model, uncertainty, config.linear_deflection_mm)
     assert result["vertical_outer_wall"] is True
     assert cast("float", result["black_cap_height_tolerance_mm"]) >= height_spread
+
+
+@pytest.mark.parametrize("vertex_precision", [0.0009, 0.1])
+def test_cap_classification_uses_actual_centers_without_metadata_radius(
+    curved_export: tuple[ReliefModel, ExportConfig, ExportBundle],
+    vertex_precision: float,
+) -> None:
+    original, config, bundle = curved_export
+    black = BRepBuilderAPI_Copy(original.materials["black"], True, False).Shape()
+    model = replace(original, materials={**original.materials, "black": black})
+    height = model.profile.black_top
+    vertices = TopExp_Explorer(black, TopAbs_VERTEX)
+    while vertices.More():
+        vertex = TopoDS.Vertex(vertices.Current())
+        point = BRep_Tool.Pnt_s(vertex)
+        if abs(point.Z() - height) < 1e-9:
+            BRep_Builder().UpdateVertex(
+                vertex, gp_Pnt(point.X(), point.Y(), height - 0.0008), vertex_precision
+            )
+            break
+        vertices.Next()
+    else:
+        pytest.fail("top vertex missing")
+
+    def check(deviation: float) -> dict[str, object]:
+        meshes = _meshes(bundle)
+        mesh = meshes["black"]
+        start = len(mesh.points)
+        meshes["black"] = _Mesh(
+            [
+                *mesh.points,
+                (10, 10, height - deviation),
+                (11, 10, height),
+                (10, 11, height),
+            ],
+            [*mesh.triangles, (start, start + 1, start + 2)],
+        )
+        return _footprints(meshes, model, 0, config.linear_deflection_mm)
+
+    assert check(0.0008)["vertical_outer_wall"] is True
+    with pytest.raises(ExportError, match="outer wall"):
+        _ = check(0.00081)
 
 
 @pytest.mark.parametrize("height,spread", [(2.0, 1e-6), (1.5, 1e-12), (2.0, 0.001)])

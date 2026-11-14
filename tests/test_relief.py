@@ -47,14 +47,14 @@ def test_white_supports_nest_and_thin_top_is_preserved() -> None:
     assert occt.valid(model.solid)
     assert set(model.materials) == {"black", "orange", "white"}
     expected_white_area = np.count_nonzero(result.masks["white"]) * 0.1**2
-    assert occt.area(occt.cross_section(model.solid, 4)) == pytest.approx(
-        expected_white_area, abs=1e-8
-    )
-    white_bottom = occt.cross_section(model.materials["white"], 3)
-    orange_top = occt.cross_section(model.materials["orange"], 3)
+    assert occt.area(
+        occt.cross_section(model.solid, profile.white_top)
+    ) == pytest.approx(expected_white_area, abs=1e-8)
+    white_bottom = occt.cross_section(model.materials["white"], profile.orange_top)
+    orange_top = occt.cross_section(model.materials["orange"], profile.orange_top)
     assert occt.area(occt.cut(white_bottom, orange_top)) == pytest.approx(0, abs=1e-9)
-    orange_bottom = occt.cross_section(model.materials["orange"], 2)
-    black_top = occt.cross_section(model.materials["black"], 2)
+    orange_bottom = occt.cross_section(model.materials["orange"], profile.black_top)
+    black_top = occt.cross_section(model.materials["black"], profile.black_top)
     assert occt.area(occt.cut(orange_bottom, black_top)) == pytest.approx(0, abs=1e-9)
     assert sum(occt.volume(part) for part in model.materials.values()) == pytest.approx(
         occt.volume(model.solid)
@@ -73,7 +73,8 @@ def test_nozzle_metadata_does_not_remove_fine_features() -> None:
 
 def test_external_wall_is_vertical_and_higher_sections_are_supported() -> None:
     _, result = fixture()
-    model = build_relief(result, ConstructionProfile(long_edge_mm=22))
+    profile = ConstructionProfile(long_edge_mm=22)
+    model = build_relief(result, profile)
     assert occt.area(occt.cross_section(model.solid, 0.5)) == pytest.approx(
         model.contours.silhouette.area
     )
@@ -81,11 +82,13 @@ def test_external_wall_is_vertical_and_higher_sections_are_supported() -> None:
         model.contours.silhouette.area
     )
     transform = gp_Trsf()
-    transform.SetTranslation(gp_Vec(0, 0, -1))
+    upper_height = (profile.orange_top + profile.white_top) / 2
+    lower_height = (profile.black_top + profile.orange_top) / 2
+    transform.SetTranslation(gp_Vec(0, 0, lower_height - upper_height))
     upper = BRepBuilderAPI_Transform(
-        occt.cross_section(model.solid, 3.5), transform, True
+        occt.cross_section(model.solid, upper_height), transform, True
     ).Shape()
-    lower = occt.cross_section(model.solid, 2.5)
+    lower = occt.cross_section(model.solid, lower_height)
     assert occt.area(occt.cut(upper, lower)) == pytest.approx(0, abs=1e-8)
 
 
@@ -206,10 +209,21 @@ def test_source_snapshot_remains_the_provenance_input(
         result: SeparationResult,
         profile: ConstructionProfile | None = None,
         *,
+        rgb_image: Image.Image | None = None,
         max_vertices: int = 25_000,
         workers: int = 1,
     ) -> relief_module.ReliefModel:
-        model = original(result, profile, max_vertices=max_vertices, workers=workers)
+        assert (
+            rgb_image is not None
+            and rgb_image.tobytes() == image.convert("RGB").tobytes()
+        )
+        model = original(
+            result,
+            profile,
+            rgb_image=rgb_image,
+            max_vertices=max_vertices,
+            workers=workers,
+        )
         Image.new("RGB", image.size, "black").save(source)
         return model
 

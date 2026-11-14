@@ -6,6 +6,11 @@ Use an installable Python package under `src/panelchemy/` for the processing
 core. Keep image separation, silhouette/support construction, relief generation,
 validation, and export callable independently of an interface.
 
+Optional raster preparation keeps compact cleanup and print-scale stroke
+retention in one core path shared by previews and relief construction. Original
+RGB transitions can guide the outline objective without changing material
+classification, source constraints, or geometric acceptance checks.
+
 Use OpenCascade for solid modeling, following Scansor's kernel choice, through
 Python bindings such as OCP. Keep the binding/dependency selection bounded to
 geometry implementation. OCCT provides

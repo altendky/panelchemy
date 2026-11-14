@@ -80,6 +80,39 @@ CAD is attempted, so an expensive or rejected model does not prevent inspection.
 Successful reuse of an output directory with cleanup disabled removes only its
 known stale cleanup artifacts; unrelated files and protected inputs are retained.
 
+### Retaining Long Strokes During Body Cleanup
+
+Set `stroke_body_width_mm` to a positive width to enable body cleanup with
+directional stroke retention. The default is zero. `stroke_support_length_mm`
+controls the original straight-stroke support required for retention and defaults
+to 3 mm. The stage keeps the broader body seeds and supported original strokes,
+then restores short original-material connections between surviving strokes and
+their bodies. The connection limit is half the assumed printed line width.
+
+Connections are restricted to the original material region. Equally short paths
+are considered together; seed, neighboring-material connectivity and contact
+checks can reject a proposal. This is a bounded cleanup rule, not a guarantee
+that every narrow feature will be printable. The silhouette remains fixed.
+
+Compact cleanup runs first when `raster_cleanup_mm` is positive. Both `cleanup`
+previews and model construction use the same preparation stages. The resulting
+pixel labels define the curve-fitting reference. The original RGB shades can
+guide the curve objective, while source-distance, radius and complete palette
+checks continue to use the retained geometry.
+
+The [retained tracing example](../../../examples/retained-shade-profile.json)
+combines a 0.5 mm compact cutoff, a 1 mm body width, 3 mm stroke support and
+0.2 mm curve accuracy. Review its cleanup preview before a full export:
+
+```console
+panelchemy cleanup artwork.png --profile examples/retained-shade-profile.json \
+  --output review
+panelchemy export artwork.png --profile examples/retained-shade-profile.json \
+  --format step --output model
+```
+
+The 0.2 mm curve accuracy is independent of the configured printing layer height.
+
 ## Outward Tapers and Support
 
 Each source plateau retains its original top footprint. Its lower sections
@@ -117,7 +150,24 @@ intersect and trim. This classification concerns the corner between edges,
 rather than the curvature along an edge. The selected top edges remain intact.
 
 OpenCascade intersects those surfaces inside a bounding slab and constructs
-volume cells. Where a curved hole closes, standard native shape repair can add
+volume cells. The walls extend slightly beyond that slab for intersection, so
+cells that cross its bounds are intersected with the original slab before
+material selection. This prevents construction-margin cells below the requested
+floor from becoming material; it does not impose a minimum feature volume.
+Selected cells must also have the correct total plateau area before joining.
+This rejects unresolved partitions early; the final geometric top-coverage and
+nine-section checks still apply after the join.
+
+An invalid cell can contain auxiliary `INTERNAL` shapes even though its material
+boundary is intact. Before singular UV repair, native `RemoveInternals` may
+remove these annotations without forcing a connectivity change. A separate
+guard requires identical cumulative physical topology, including face/wire
+membership, degenerate edges and endpoint orientations, plus identical geometry,
+ranges, tolerances and vertex coordinates. Shared topology used both internally
+and physically remains protected. Cleanup runs on a private copy and must yield
+a valid solid; otherwise the existing repair path retains its original guards.
+
+Where a curved hole closes, standard native shape repair can add
 missing singular UV boundary edges. Repair uses the existing native precision
 without increasing native tolerances. Supporting geometry, real edge ranges,
 orientations, and existing vertex positions must remain unchanged; only
@@ -126,11 +176,11 @@ The same guarded repair applies when a solid Boolean result reconnects UV
 wires incorrectly despite valid inputs; invalid planar results and unrelated
 fragments remain errors.
 
-Boolean annotations made only of INTERNAL edges may be removed when their
-native vertex graph is acyclic. This includes branching trees and disconnected
-chains, which enclose no counter. Closed loops, including loops whose native
-`Closed` flag is unset, remain. Cleanup must preserve the exact physical boundary
-and pass native validity and area checks.
+For planar Boolean results, annotations made only of INTERNAL edges may be
+removed when their native vertex graph is acyclic. This includes branching trees
+and disconnected chains, which enclose no counter. Closed loops, including loops
+whose native `Closed` flag is unset, remain. Cleanup must preserve the exact
+physical boundary and pass native validity and area checks.
 
 A folded wall may instead be an internal partition between two material cells.
 If both the shared invalid face and its neighboring cell's entire bounding box
@@ -150,11 +200,15 @@ The retry uses the same top and section checks, reports the original failure
 and intersection counts, and rejects work beyond its resource limits. A failed
 retry remains an error; it does not bypass cell repair or geometry validation.
 
-If ordinary union of the retry's selected cells fails, a guarded native gluing
+If ordinary union of an arrangement's selected cells fails, a guarded native gluing
 operation can reuse their existing partition interfaces. Every input must be a
 valid positive solid from that arrangement. Exact shared faces must have opposite
 owners and form a connected graph, and every pair must have zero overlapping
-volume. Physical BRep data, including input precision, must remain unchanged.
+volume. Positivity uses the existing bounded-solid/interior-point proof; final
+mass comparisons still use accurate integration. Strictly separated conservative
+boxes prove disjointness directly, including the native shape and Boolean
+precision. Remaining pairs retain native intersection and zero-volume checks.
+Physical BRep data, including input precision, must remain unchanged.
 The union still passes the original native, top, and section checks. Cell-pair
 work is bounded; memory failures, including wrapped failures, stop retries.
 
@@ -175,14 +229,22 @@ Native analytic lines use the same exact planar walls. Unrelated construction
 errors, ambiguous directions, and memory failures do not authorize this retry;
 an unresolved individual generator stops conversion.
 
+The same retry also handles a wall that cannot locate its source generator
+within the unchanged native edge/face tolerances. Exact parameter trims can
+avoid a near-linear curve being replaced by an incompatible native plane.
+Every replacement still needs the original location, direction and full roof
+checks; this does not increase the permitted source error.
+
 An individual clamped cubic B-spline can still hit that same native array error.
 When it is exactly a nonrational, four-pole Bernstein polynomial on the unit
 domain, the adapter can retry it as a native Bézier with identical poles,
 endpoint vertices, parameter trim, and orientation. Readback checks preserve
 the source geometry and vertex precision; normal draft-direction and wall
 validity checks still apply. Unsupported forms or the same array failure retain
-the existing quarter-interval trims on the original native curve. This changes
-the native representation, without refitting the selected outline.
+the existing quarter-interval trims on the original native curve. A quarter
+that hits the known array error can use the same exact Bézier retry, retaining
+its original coefficients and trim. This changes the native representation,
+without refitting the selected outline.
 
 Entirely straight regions with more than 2,048 edges use coarse, overlapping
 source pieces before native construction. Distance expansion distributes over
@@ -268,10 +330,15 @@ existing span boundaries to combine cubics only while their derivative
 directions fit a quarter turn;
 an individual wider-turn cubic remains intact. This
 avoids a regression where a closing counter lost its original top opening.
-Production taper sweeps continue to use separate input spans: OCCT's composite
-draft surfaces can change their top boundary enough to fail preservation checks.
-The core `roof(..., consolidate_draft=True)` option allows explicit experiments;
-it does not relax those checks. Planar faces and zero-taper extrusions use
+Production first tries separate input spans. If that fails, one retry combines
+smooth spans and uses the public native location-law/sweep APIs with a tighter
+surface approximation budget of 0.000001 mm. The ordinary draft wrapper fixes
+that budget at 0.0001 mm without exposing a setter. Both paths use the same
+direction verification, corner patches, slab, material selection, fitted-top
+check and nine taper sections. A failed precise retry retains the existing
+pair-preimprint fallback. Entirely straight boundaries skip the precise sweep.
+The core `roof(..., consolidate_draft=True)` option still allows explicit
+experiments; it does not relax the checks. Planar faces and zero-taper extrusions use
 consolidation by default. Diagnostics distinguish fitted spans, native top edges,
 and generated draft wall faces. Consolidation alone does not guarantee a valid
 taper arrangement.
@@ -296,6 +363,22 @@ not delete islands or counters.
 Ordinary joins may move within the requested outline tolerance. Smooth joins
 share tangent directions; detected corners and actual palette junctions can
 remain sharp. The outer silhouette remains exact.
+
+An open chain that exceeds the solver's 512-control limit can be divided at
+existing source corners into smaller solves. Those shared corners are pinned
+to their source positions; other joins retain their usual freedom. The pieces
+return to the original parameter frame for the same complete source, radius
+and palette checks. This does not add corners or increase the solver limit.
+
+File-based conversion also uses the original RGB transitions to guide the
+least-squares objective. It estimates each material pair from its interior
+colors, then uses supported mixture crossings near retained boundaries. Edited
+cleanup neighborhoods, third colors, diagonal contacts and weak transitions
+keep the hard-edge reference. This changes neither color classification nor the
+acceptance limits below. API callers can supply the original image with
+`build_relief(..., rgb_image=image)`; omitting it retains the hard-edge objective.
+If a guided fit stalls on source accuracy, one bounded local repair can target
+the hard source directly, subject to the same source, radius and palette checks.
 
 Source error is geometric distance in both directions: every fitted point must
 remain within the configured tolerance of the original boundary, and every
