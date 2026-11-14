@@ -18,17 +18,37 @@ bands. Disconnected islands remain grouped within their material component.
 Component colors use the separation palette, including custom configured colors.
 
 All components retain their original coordinates and millimeter units. With the
-default profile, black spans Z=0–2 mm, orange Z=2–3 mm and white Z=3–4 mm; no part
+default profile, black spans Z=0–1.6 mm, orange Z=1.6–2 mm and white Z=2–2.6 mm; no part
 is moved onto the build plate independently. STEP reimport verifies names,
 colors, solid counts, native validity, volumes, bounds and component placements.
 Source CAD and retained material-partition proofs are checked before export.
 
-STEP readback reports its volume difference and numerical serialization
-allowance. The allowance uses the largest of the existing absolute and relative
-limits and the source surface area times the kernel's comparison precision.
-This scales the mass check for broad, thin panels; it is not a certificate of
-whole-surface displacement. Native validity, solid counts, registration, and
-material-partition checks remain independent requirements.
+If a depth split produces a cell outside its band, one guarded retry can reduce
+overestimated edge-precision metadata on a private source copy to OCCT's default
+SameParameter precision, 0.00001 mm. Both copies must pass exact native validity;
+all geometry, topology, parameter ranges, vertex precision and face precision
+must remain identical. The same band bounds, volume accounting and shared-face
+checks decide acceptance. The report records any precision retry.
+
+Before writing a multipart component, export restricts nonperiodic B-spline
+curve bases to their existing edge parameter ranges on a private copy. This
+preserves the curves and their trims while preventing STEP reimport from
+extending an edge along an unused portion of its underlying spline. Vertex
+positions, tolerances, surfaces and topology remain unchanged. Native validity
+and the usual readback checks against the original material remain required.
+
+Construction, material splitting and STEP export allow negligible numerical
+volume drift up to 0.01% of the source volume. Their reports retain the actual
+difference, allowance and a warning when the former strict numerical limit is
+exceeded. STEP also retains its source-area-times-kernel-precision allowance;
+the larger allowance applies. Nonfinite or nonpositive volumes and changes
+exceeding the allowance still fail.
+
+This is an engineering mass-comparison policy, not a certificate of local
+surface displacement or geometric equivalence. It does not change artwork fit
+accuracy or manufacturing dimensions. Native validity, solid counts, names,
+colors, registration, band boundaries and material-partition bindings remain
+independent requirements.
 
 Two hole loops can share a vertex in valid OCCT geometry, while STEP requires
 separate boundary connectivity. Export first attempts ordinary STEP. If readback
@@ -83,6 +103,12 @@ oriented manifold topology, self-intersections, positive component volumes,
 dimensions, band heights, material-volume accounting, and shared interfaces.
 Numerical vertex normalization is recorded; failed validation aborts export.
 No nozzle-based filtering or minimum-feature cleanup is applied.
+
+Mesh registration compares geometric CAD bounds and any actual native vertex
+centers lying just outside those bounds within their own declared precision.
+The mesher may retain such a center or project it onto its incident geometry.
+Tolerance radii alone never enlarge the accepted extent; the usual rounding
+and tessellation budgets still apply, and missing geometric extents still fail.
 
 Exact-zero numerical seam triangles are replaced by conforming subdivisions
 using existing coordinates, preserving positive-area faces and material

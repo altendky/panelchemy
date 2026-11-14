@@ -7,9 +7,10 @@ from typing import cast, override
 import numpy as np
 import pytest
 from OCP.Bnd import Bnd_Box
-from OCP.BRep import BRep_Builder
+from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepTools import BRepTools
+from OCP.gp import gp_Pnt
 from OCP.IFSelect import IFSelect_ReturnStatus
 from OCP.Interface import Interface_Static
 from OCP.STEPControl import STEPControl_Writer
@@ -185,9 +186,9 @@ def test_float32_conformance_opposite_pairs_cancel_before_serialization(
     assert materials["white"]["coordinate_movement_mm"] == 0
 
 
-@pytest.mark.parametrize("colors,highest", [(1, 2), (2, 3), (3, 4)])
+@pytest.mark.parametrize("colors,highest", [(1, 1.6), (2, 2), (3, 2.6)])
 def test_serialized_exports_keep_registration_and_optional_bands(
-    colors: int, highest: int
+    colors: int, highest: float
 ) -> None:
     model = _model(colors, taper=0)
     before = _snapshot(model)
@@ -210,14 +211,14 @@ def test_serialized_exports_keep_registration_and_optional_bands(
         assert report["volume_mm3"] == pytest.approx(
             occt.volume(model.materials[name]), rel=1e-6
         )
-        assert (
-            min(p[2] for p in stl.points) == {"black": 0, "orange": 2, "white": 3}[name]
+        assert min(p[2] for p in stl.points) == pytest.approx(
+            {"black": 0, "orange": 1.6, "white": 2}[name]
         )
-        assert (
-            max(p[2] for p in stl.points) == {"black": 2, "orange": 3, "white": 4}[name]
+        assert max(p[2] for p in stl.points) == pytest.approx(
+            {"black": 1.6, "orange": 2, "white": 2.6}[name]
         )
     combined = _read_stl(bundle.files["relief.stl"])
-    assert max(p[2] for p in combined.points) == highest
+    assert max(p[2] for p in combined.points) == pytest.approx(highest)
     assert _validate_mesh(combined)["volume_mm3"] == pytest.approx(
         occt.volume(model.solid), rel=1e-6
     )
@@ -267,7 +268,41 @@ def test_shape_tolerance_envelope_does_not_cross_geometric_material_planes() -> 
     assert _snapshot(model) == before
     points = _read_stl(bundle.files["black.stl"]).points
     assert min(point[2] for point in points) == 0
-    assert max(point[2] for point in points) == model.profile.black_top
+    assert max(point[2] for point in points) == pytest.approx(model.profile.black_top)
+
+
+@pytest.mark.parametrize("vertex_precision", [0.0009, 0.1])
+def test_mesh_registration_accepts_actual_native_centers_without_their_radius(
+    vertex_precision: float,
+) -> None:
+    model = _model(1)
+    cad = model.materials["black"]
+    low, high = export_module._bounds(cad)  # pyright: ignore[reportPrivateUsage]
+    vertices = TopExp_Explorer(cad, TopAbs_VERTEX)
+    while vertices.More():
+        vertex = TopoDS.Vertex(vertices.Current())
+        point = BRep_Tool.Pnt_s(vertex)
+        if abs(point.Z()) < 1e-9:
+            BRep_Builder().UpdateVertex(
+                vertex, gp_Pnt(point.X(), point.Y(), -0.0008), vertex_precision
+            )
+            break
+        vertices.Next()
+    else:
+        pytest.fail("bottom vertex missing")
+    assert occt.valid(cad)
+    assert export_module._bounds(cad) == (low, high)  # pyright: ignore[reportPrivateUsage]
+
+    def check(bottom: float, top: float = high[2]) -> None:
+        mesh = _Mesh([(low[0], low[1], bottom), (high[0], high[1], top)], [])
+        export_module._registered_bounds(mesh, cad, 0, ExportConfig())  # pyright: ignore[reportPrivateUsage]
+
+    check(-0.0008)  # Retained native vertex center.
+    check(0)  # The same vertex projected back onto its incident cap.
+    with pytest.raises(ExportError, match="registration"):
+        check(-0.00081)  # Larger metadata does not grant extra displacement.
+    with pytest.raises(ExportError, match="registration"):
+        check(0, high[2] - 0.001)  # Missing geometric extent still fails.
 
 
 def test_actual_material_geometry_crossing_still_rejects() -> None:

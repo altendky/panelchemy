@@ -19,6 +19,7 @@ from panelchemy.separation import SeparationConfig
         ({"nozzle_diameter_mm": 0.8}, None, 1.0),
         ({"raster_cleanup_mm": 0.7}, None, 0.7),
         ({"raster_cleanup_mm": 0.7}, "0.3", 0.3),
+        ({"stroke_body_width_mm": 1.0}, None, 0),
     ],
 )
 def test_cleanup_command_uses_physical_profile_and_explicit_width(
@@ -45,10 +46,16 @@ def test_cleanup_command_uses_physical_profile_and_explicit_width(
         *,
         long_edge_mm: float = 250,
         minimum_width_mm: float = 0.5,
+        stroke_body_width_mm: float = 0,
+        stroke_support_length_mm: float = 3,
+        line_width_mm: float = 0.5,
         silhouette_path: Path | None = None,
         protected_paths: tuple[Path, ...] = (),
     ) -> dict[str, object]:
         assert silhouette_path == mask_path
+        assert stroke_body_width_mm == settings.get("stroke_body_width_mm", 0)
+        assert stroke_support_length_mm == settings.get("stroke_support_length_mm", 3)
+        assert line_width_mm == 1.25 * settings.get("nozzle_diameter_mm", 0.4)
         assert set(protected_paths) == {profile_path, config_path}
         seen.append((source, output, config, long_edge_mm, minimum_width_mm))
         return {"kind": "cleanup-preview"}

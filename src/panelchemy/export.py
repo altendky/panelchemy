@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import struct
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from io import BytesIO
@@ -31,7 +31,7 @@ from OCP.Interface import Interface_Static
 from OCP.Poly import Poly_Triangulation
 from OCP.Precision import Precision
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Reader, STEPControl_Writer
-from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED, TopAbs_SOLID
+from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED, TopAbs_SOLID, TopAbs_VERTEX
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
@@ -42,6 +42,7 @@ from shapely.geometry.base import BaseGeometry
 from panelchemy import material_partition, occt, step_topology
 from panelchemy.construction import ConstructionProfile
 from panelchemy.contours import PanelContours
+from panelchemy.volume_comparison import compare_volumes
 
 type Coordinate = tuple[float, float, float]
 type Triangle = tuple[int, int, int]
@@ -1229,7 +1230,9 @@ def _step_volume_allowance(source: TopoDS_Shape, volume_mm3: float) -> dict[str,
     ):
         raise ExportError("STEP source has no finite serialization volume allowance")
     return {
-        "volume_allowance_mm3": max(1e-7, abs(volume_mm3) * 1e-8, area * precision),
+        "numerical_volume_allowance_mm3": max(
+            1e-7, abs(volume_mm3) * 1e-8, area * precision
+        ),
         "source_surface_area_mm2": area,
         "kernel_comparison_precision_mm": precision,
     }
@@ -1300,14 +1303,18 @@ def _step_once(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
                 "STEP roundtrip has open wires at coincident endpoints", points
             )
         raise ExportError("STEP roundtrip invalidated the CAD solid")
-    if _solid_count(shape) != _solid_count(roundtrip):
+    solid_count = _solid_count(shape)
+    if solid_count != _solid_count(roundtrip):
         raise ExportError("STEP roundtrip changed the number of CAD solids")
     original, restored = occt.volume(shape), occt.volume(roundtrip)
     allowance = _step_volume_allowance(shape, original)
-    if (
-        not isfinite(restored)
-        or abs(original - restored) > allowance["volume_allowance_mm3"]
-    ):
+    comparison = compare_volumes(
+        original,
+        restored,
+        numerical_allowance_mm3=allowance["numerical_volume_allowance_mm3"],
+        allow_zero=solid_count == 0,
+    )
+    if not comparison.acceptable:
         raise ExportError("STEP roundtrip changed the CAD solid volume")
     before, after = _bounds(shape), _bounds(roundtrip)
     if (
@@ -1322,8 +1329,8 @@ def _step_once(shape: TopoDS_Shape) -> tuple[bytes, dict[str, object]]:
     return data, {
         "valid": True,
         "volume_mm3": restored,
-        "volume_difference_mm3": abs(original - restored),
         **allowance,
+        **comparison.diagnostics(),
         "units": "millimeter",
         "serialized_length_units": length_units,
         "timestamp_may_vary": True,
@@ -1436,6 +1443,15 @@ def _check_float32(original: _Mesh, serialized: _Mesh, budget: float) -> float:
     return error
 
 
+def _native_vertex_centers(shape: TopoDS_Shape) -> Iterator[tuple[Coordinate, float]]:
+    vertices = TopExp_Explorer(shape, TopAbs_VERTEX)
+    while vertices.More():
+        vertex = TopoDS.Vertex(vertices.Current())
+        point = BRep_Tool.Pnt_s(vertex)
+        yield (point.X(), point.Y(), point.Z()), BRep_Tool.Tolerance_s(vertex)
+        vertices.Next()
+
+
 def _footprints(
     meshes: dict[str, _Mesh],
     model: _Relief,
@@ -1524,9 +1540,8 @@ def _footprints(
         result["orange_source_top_coverage_tolerance_mm"] = tolerance + curve_tolerance
     black = meshes["black"]
     boundary = model.contours.silhouette.boundary
-    # Native cap vertices may differ slightly from their supporting plane even
-    # before coordinate rounding. Use that plane's existing CAD tolerance only
-    # for cap-height classification; the wall's XY boundary stays coordinate-only.
+    # Admit actual native cap-center deviations within their own precision, not
+    # their entire tolerance radii. The wall's XY boundary stays coordinate-only.
     cap_planes: list[tuple[float, float]] = []
     faces = TopExp_Explorer(model.materials["black"], TopAbs_FACE)
     while faces.More():
@@ -1536,9 +1551,17 @@ def _footprints(
             plane = surface.Plane()
             direction = plane.Axis().Direction()
             if direction.X() == 0 and direction.Y() == 0:
-                cap_planes.append(
-                    (plane.Location().Z(), BRep_Tool.Tolerance_s(face) + tolerance)
-                )
+                height = plane.Location().Z()
+                cap_tolerance = BRep_Tool.Tolerance_s(face)
+                for coordinates, precision in _native_vertex_centers(face):
+                    deviation = abs(coordinates[2] - height)
+                    if (
+                        isfinite(deviation)
+                        and isfinite(precision)
+                        and deviation <= precision
+                    ):
+                        cap_tolerance = max(cap_tolerance, deviation)
+                cap_planes.append((height, cap_tolerance + tolerance))
         faces.Next()
     for triangle in black.triangles:
         points = [black.points[index] for index in triangle]
@@ -1563,9 +1586,35 @@ def _registered_bounds(
     mesh: _Mesh, cad: TopoDS_Shape, coordinate_error: float, config: ExportConfig
 ) -> None:
     low, high = _bounds(cad)
-    for corner, measured in (
-        (low, [min(point[axis] for point in mesh.points) for axis in range(3)]),
-        (high, [max(point[axis] for point in mesh.points) for axis in range(3)]),
+    # Meshing may retain a loose native vertex center or project it onto the
+    # incident geometry. Admit those actual source extents, never tolerance
+    # radii alone; inflating metadata must not enlarge the accepted mesh.
+    outer_low, outer_high = list(low), list(high)
+    for coordinates, precision in _native_vertex_centers(cad):
+        distance = hypot(
+            *(
+                max(low[i] - value, 0.0, value - high[i])
+                for i, value in enumerate(coordinates)
+            )
+        )
+        if (
+            all(isfinite(value) for value in (*coordinates, precision))
+            and 0 <= distance <= precision
+        ):
+            for axis, value in enumerate(coordinates):
+                outer_low[axis] = min(outer_low[axis], value)
+                outer_high[axis] = max(outer_high[axis], value)
+    for lower, upper, measured in (
+        (
+            outer_low,
+            low,
+            [min(point[axis] for point in mesh.points) for axis in range(3)],
+        ),
+        (
+            high,
+            outer_high,
+            [max(point[axis] for point in mesh.points) for axis in range(3)],
+        ),
     ):
         for axis in range(3):
             tolerance = (
@@ -1573,7 +1622,7 @@ def _registered_bounds(
                 if axis == 2
                 else config.linear_deflection_mm + coordinate_error + 1e-6
             )
-            if abs(corner[axis] - measured[axis]) > tolerance:
+            if not lower[axis] - tolerance <= measured[axis] <= upper[axis] + tolerance:
                 raise ExportError(
                     "serialized mesh changed CAD registration or dimensions"
                 )

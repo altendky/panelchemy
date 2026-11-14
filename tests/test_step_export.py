@@ -77,8 +77,8 @@ def test_named_colored_assembly_roundtrip_without_meshing(
             occt.volume(model.materials[name]), rel=1e-8
         )
         bounds = cast("list[list[float]]", parts[name]["bounds_mm"])
-        assert bounds[0][2] == pytest.approx((0, 2, 3)[i], abs=1e-6)
-        assert bounds[1][2] == pytest.approx((2, 3, 4)[i], abs=1e-6)
+        assert bounds[0][2] == pytest.approx((0, 1.6, 2)[i], abs=1e-6)
+        assert bounds[1][2] == pytest.approx((1.6, 2, 2.6)[i], abs=1e-6)
     if colors == 3:
         assert parts["white"]["solid_count"] == 2
     assert bundle.validation["mesh_validated"] is False
@@ -132,13 +132,17 @@ def test_changed_retained_materials_are_rejected() -> None:
 def test_custom_materials_cannot_move_a_counter_below_volume_budget() -> None:
     model = _model(2)
     panel = box(0, 0, 20, 20)
-    black = occt.prism(panel, 0, 2)
+    black = occt.prism(panel, 0, model.profile.black_top)
     original_outline = panel.difference(box(5, 5, 5.001, 5.001))
     shifted_outline = panel.difference(box(10, 5, 10.001, 5.001))
     assert isinstance(original_outline, Polygon)
     assert isinstance(shifted_outline, Polygon)
-    original = occt.prism(original_outline, 2, 3)
-    shifted = occt.prism(shifted_outline, 2, 3)
+    original = occt.prism(
+        original_outline, model.profile.black_top, model.profile.orange_top
+    )
+    shifted = occt.prism(
+        shifted_outline, model.profile.black_top, model.profile.orange_top
+    )
     model = replace(
         model,
         solid=occt.fuse([black, original]),
@@ -202,7 +206,7 @@ def _broad_plate(hole_growth_mm: float = 0) -> TopoDS_Shape:
 
 
 @pytest.mark.parametrize("combined", [False, True], ids=["material", "combined"])
-@pytest.mark.parametrize("hole_growth_mm", [0.0001, 0.001])
+@pytest.mark.parametrize("hole_growth_mm", [0.0001, 0.001, 1.0])
 def test_step_mass_allowance_for_broad_thin_geometry(
     monkeypatch: pytest.MonkeyPatch, combined: bool, hole_growth_mm: float
 ) -> None:
@@ -223,7 +227,7 @@ def test_step_mass_allowance_for_broad_thin_geometry(
 
     difference = abs(occt.volume(original) - occt.volume(restored))
     assert difference > max(1e-7, occt.volume(original) * 1e-8)
-    if hole_growth_mm == 0.001:
+    if hole_growth_mm == 1.0:
         with pytest.raises(ExportError, match="volume"):
             _ = check()
         return
@@ -231,6 +235,7 @@ def test_step_mass_allowance_for_broad_thin_geometry(
     assert report["valid"] is True
     assert cast("float", report["volume_difference_mm3"]) == pytest.approx(difference)
     assert cast("float", report["volume_allowance_mm3"]) >= difference
+    assert (report["volume_warning"] is not None) == (hole_growth_mm == 0.001)
     assert cast("float", report["source_surface_area_mm2"]) == pytest.approx(
         occt.area(original), rel=1e-12, abs=1e-9
     )

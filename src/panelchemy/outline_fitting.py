@@ -12,7 +12,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
-from itertools import pairwise
+from itertools import accumulate, pairwise
 from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
 from multiprocessing import get_context
 from time import monotonic
@@ -41,6 +41,7 @@ from panelchemy import (
 from panelchemy import curves as c
 from panelchemy.contours import PanelContours
 from panelchemy.separation import Palette, SeparationConfig
+from panelchemy.shade_guides import GuideSamples, ShadeGuides
 from panelchemy.spline_solver import SplineRefinementNeeded, solve_coefficients
 
 type FloatArray = NDArray[np.float64]
@@ -68,6 +69,14 @@ class _Fit:
     source_corners: tuple[float, ...] = ()
     texture_intervals: tuple[tuple[float, float], ...] = ()
     texture_barriers: tuple[float, ...] = ()
+    guide: GuideSamples | None = None
+
+
+def _search_samples(fit: _Fit) -> tuple[tuple[c.Point2, ...], FloatArray]:
+    """Search may follow RGB evidence; proofs always use ``fit.chain``."""
+    if fit.guide is not None:
+        return fit.guide.points, np.asarray(fit.guide.parameters)
+    return fit.chain.points, fit.parameters
 
 
 def _detail_guidance(
@@ -335,7 +344,16 @@ def _spline(fit: _Fit, fit_target_mm: float) -> BSpline[np.float64]:
     basis = BSpline.design_matrix(parameters, knots, 3)
     weighted = (basis @ transform).multiply(weights[:, None])
     matrix = weighted.tocsr()
-    target = (points - basis @ offsets) * weights[:, None]
+    objective_points = (
+        _sample(
+            np.asarray(fit.guide.points) - origin,
+            np.asarray(fit.guide.parameters),
+            parameters,
+        )
+        if fit.guide is not None
+        else points
+    )
+    target = (objective_points - basis @ offsets) * weights[:, None]
     coefficients = solve_coefficients(
         matrix,
         target,
@@ -354,8 +372,117 @@ def _spline(fit: _Fit, fit_target_mm: float) -> BSpline[np.float64]:
 def _pieces(
     fit: _Fit, index: int, tolerance: float
 ) -> tuple[list[c._Piece], list[tuple[float, float]]]:
+    if 4 + sum(3 if k in fit.corners else 1 for k in fit.knots) > 512:
+        blocks = _fit_blocks(fit)
+        if blocks:
+            pieces: list[c._Piece] = []
+            intervals: list[tuple[float, float]] = []
+            for first, last in blocks:
+                a, b = (
+                    float(_scalar(fit.parameters, first)),
+                    float(_scalar(fit.parameters, last)),
+                )
+                width = b - a
+                local = {
+                    value: (value - a) / width
+                    for value in {a, b, *fit.knots, *fit.corners, *fit.source_corners}
+                    if a <= value <= b
+                }
+                original = {value: key for key, value in local.items()}
+                guide = None
+                if fit.guide is not None:
+                    times = np.asarray(
+                        [a, *(t for t in fit.guide.parameters if a < t < b), b]
+                    )
+                    values = fit.guide.sample(times)
+                    guide = GuideSamples(
+                        tuple(
+                            (
+                                float(_scalar(values, (i, 0))),
+                                float(_scalar(values, (i, 1))),
+                            )
+                            for i in range(len(values))
+                        ),
+                        tuple(
+                            float((_scalar(times, i) - a) / width)
+                            for i in range(len(times))
+                        ),
+                    )
+                selected = replace(
+                    fit,
+                    chain=c._Chain(fit.chain.points[first : last + 1], False),
+                    parameters=(fit.parameters[first : last + 1] - a) / width,
+                    corners=[local[t] for t in fit.corners if a <= t <= b],
+                    knots=[local[t] for t in fit.knots if a < t < b],
+                    pieces=[],
+                    intervals=[],
+                    source_corners=tuple(
+                        local[t] for t in fit.source_corners if a <= t <= b
+                    ),
+                    texture_intervals=tuple(
+                        ((max(x, a) - a) / width, (min(y, b) - a) / width)
+                        for x, y in fit.texture_intervals
+                        if max(x, a) < min(y, b)
+                    ),
+                    texture_barriers=tuple(
+                        (t - a) / width for t in fit.texture_barriers if a <= t <= b
+                    ),
+                    guide=guide,
+                )
+                try:
+                    block_pieces, block_intervals = _pieces(selected, index, tolerance)
+                except SplineRefinementNeeded as error:
+                    interval = (
+                        (original[error.interval[0]], original[error.interval[1]])
+                        if error.interval is not None
+                        else None
+                    )
+                    raise SplineRefinementNeeded(str(error), interval) from error
+                for piece, (start, stop) in zip(
+                    block_pieces, block_intervals, strict=True
+                ):
+                    position = len(pieces)
+                    pieces.append(replace(piece, start=position, stop=position + 1))
+                    intervals.append((original[start], original[stop]))
+            return pieces, intervals
     spline = _spline(fit, _FIT_TARGET_FRACTION * tolerance)
     return _spline_pieces(fit, index, tolerance, spline)
+
+
+def _fit_blocks(fit: _Fit) -> list[tuple[int, int]]:
+    """Bound dense solves by pinning only existing open-chain source corners."""
+    if (
+        fit.chain.fixed
+        or fit.chain.free_loop
+        or fit.chain.points[0] == fit.chain.points[-1]
+    ):
+        return []
+    corners = set(fit.corners) & set(fit.source_corners)
+    eligible = [
+        i
+        for i in range(len(fit.parameters))
+        if float(_scalar(fit.parameters, i)) in corners
+    ]
+    costs = [0, *accumulate(3 if k in fit.corners else 1 for k in fit.knots)]
+
+    def count(first: int, last: int) -> int:
+        a, b = (
+            float(_scalar(fit.parameters, first)),
+            float(_scalar(fit.parameters, last)),
+        )
+        return 4 + costs[bisect_left(fit.knots, b)] - costs[bisect_right(fit.knots, a)]
+
+    def split(first: int, last: int) -> list[tuple[int, int]]:
+        if count(first, last) <= 512:
+            return [(first, last)]
+        candidates = [i for i in eligible if first < i < last]
+        if not candidates:
+            return []
+        middle = min(candidates, key=lambda i: abs(count(first, i) - count(i, last)))
+        left, right = split(first, middle), split(middle, last)
+        return left + right if left and right else []
+
+    return split(0, len(fit.chain.points) - 1)
 
 
 def _spline_pieces(
@@ -1475,8 +1602,7 @@ def _local_curvature_refit(
                 try:
                     guide = local_windows.prepare(
                         window,
-                        working.chain.points,
-                        working.parameters,
+                        *_search_samples(working),
                         [p.span for p in working.pieces],
                         working.intervals,
                         periodic=working.chain.free_loop,
@@ -1638,8 +1764,7 @@ def _corner_run_curvature_candidate(
         for position, window in enumerate(windows):
             guide = local_windows.prepare(
                 window,
-                working.chain.points,
-                working.parameters,
+                *_search_samples(working),
                 [p.span for p in working.pieces],
                 working.intervals,
                 periodic=working.chain.free_loop,
@@ -1759,8 +1884,7 @@ def _whole_curvature_refit(
         try:
             guide = local_windows.prepare(
                 local_windows.Window(0, len(fit.pieces)),
-                fit.chain.points,
-                fit.parameters,
+                *_search_samples(fit),
                 [p.span for p in fit.pieces],
                 fit.intervals,
             )
@@ -1822,12 +1946,13 @@ def _whole_curvature_refit(
     plans.append((None, []))
     searches: list[dict[str, object]] = []
     diagnostics: dict[str, object] = dict(status="unrefined")
+    search_points, search_parameters = _search_samples(fit)
     for position, (breaks, selected_corners) in enumerate(plans):
         accepted.clear()
         rejected.clear()
         proposal, diagnostics = curvature_fitting.refit(
-            np.asarray(fit.chain.points),
-            fit.parameters,
+            np.asarray(search_points),
+            search_parameters,
             limit.offset_mm,
             limit.inward_sign,
             tolerance,
@@ -2408,6 +2533,112 @@ def _curvature_verified(
     )
 
 
+def _source_window_refit(
+    fit: _Fit,
+    index: int,
+    limit: boundary_tapers.BoundaryTaper,
+    tolerance: float,
+) -> _Fit | None:
+    """Offer existing local families when source-driven basis growth stalls.
+
+    Search follows the hard source here, rather than an RGB objective that has
+    repeatedly missed it. The full original source, every selected radius, and
+    the later shared-palette gates remain mandatory.
+    """
+    failed = _source_failures(fit, tolerance)
+    if not failed:
+        return None
+    deadline = monotonic() + curvature_fitting._SECONDS
+    for padding in (0, 1):
+        for window in local_windows.windows(
+            len(fit.pieces), failed, periodic=fit.chain.free_loop, neighbors=padding
+        ):
+            if window.count == len(fit.pieces) and fit.chain.free_loop:
+                continue
+            try:
+                guide = local_windows.prepare(
+                    window,
+                    fit.chain.points,
+                    fit.parameters,
+                    [p.span for p in fit.pieces],
+                    fit.intervals,
+                    periodic=fit.chain.free_loop,
+                )
+            except ValueError as error:
+                if str(error) != "local repair has an unavailable endpoint tangent":
+                    raise
+                continue
+            internal = [
+                t
+                for t in fit.corners
+                if (q := guide.to_local(t)) is not None and 0 < q < 1
+            ]
+            if len(internal) > 1:
+                continue
+            # An explicit apex represents the SAME established source corner.
+            # Removing its proposal metadata avoids the helper's new-corner
+            # guard; its exact source parameter is rebound immediately below.
+            proposal_fit = (
+                replace(fit, corners=[t for t in fit.corners if t not in internal])
+                if internal
+                else fit
+            )
+            for compact in (False,) if internal else (True, False):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return None
+                apex = guide.to_local(internal[0]) if internal else None
+                proposal, _ = _local_window_refit(
+                    proposal_fit,
+                    index,
+                    guide,
+                    limit,
+                    tolerance,
+                    remaining,
+                    compact=compact,
+                    apex=apex,
+                )
+                if proposal is None:
+                    continue
+                if internal and apex is not None:
+                    lifted = guide.start_t + apex * (guide.end_t - guide.start_t)
+                    if apex == guide.seam:
+                        lifted = 0.0
+                    elif lifted > 1:
+                        lifted -= 1
+                    original = internal[0]
+                    proposal = replace(
+                        proposal,
+                        corners=[
+                            original if t == lifted else t for t in proposal.corners
+                        ],
+                        intervals=[
+                            (
+                                original if a == lifted else a,
+                                original if b == lifted else b,
+                            )
+                            for a, b in proposal.intervals
+                        ],
+                    )
+                if (
+                    set(proposal.corners) == set(fit.corners)
+                    and not _source_failures(proposal, tolerance)
+                    and all(
+                        c._monotone(p.span)
+                        and curvature.within_curvature(
+                            p.span, limit.offset_mm, limit.inward_sign
+                        )
+                        for p in proposal.pieces
+                    )
+                    and _orientation_preserved(proposal)
+                    and not c._unsafe_pair(proposal.pieces)[0]
+                ):
+                    return replace(
+                        proposal, knots=[b for _, b in proposal.intervals[:-1]]
+                    )
+    return None
+
+
 def fit_outlines(
     source: PanelContours,
     tolerance_mm: float,
@@ -2422,6 +2653,7 @@ def fit_outlines(
     material_taper_runs_mm: tuple[float, float, float] | None = None,
     palette: Palette | None = None,
     workers: int = 1,
+    shade_guides: ShadeGuides | None = None,
 ) -> c.CurveFitResult:
     """Fit shared outlines with movable smooth joins and physical-scale corners.
 
@@ -2486,6 +2718,13 @@ def fit_outlines(
         ranges.append(range(start, len(rings)))
     ring_relationships = c._relationships(rings)
     chains, uses = c._graph(rings, split_loops=False)
+    initial_limits = (
+        boundary_tapers.boundaries(
+            uses, ranges, len(source.orange), material_taper_runs_mm
+        )
+        if material_taper_runs_mm is not None and shade_guides is not None
+        else {}
+    )
     fits: list[_Fit] = []
     for index, chain in enumerate(chains):
         points = np.asarray(chain.points)
@@ -2512,6 +2751,11 @@ def fit_outlines(
             [],
             fairing_mm,
             source_corners=tuple(corners),
+            guide=shade_guides.for_chain(
+                chain.points, parameters, free_loop=chain.free_loop
+            )
+            if shade_guides is not None and not chain.fixed
+            else None,
         )
         if chain.fixed:
             fit.pieces = [
@@ -2532,6 +2776,25 @@ def fit_outlines(
         int, tuple[list[c._Piece], list[tuple[float, float]], set[int]]
     ] = {}
     solve_attempts: Counter[int] = Counter()
+    source_repair_attempted: set[int] = set()
+    source_repaired: list[int] = []
+
+    def source_repair(index: int) -> bool:
+        if (
+            shade_guides is None
+            or index in source_repair_attempted
+            or index not in initial_limits
+        ):
+            return False
+        source_repair_attempted.add(index)
+        proposal = _source_window_refit(
+            fits[index], index, initial_limits[index], tolerance_mm
+        )
+        if proposal is None:
+            return False
+        fits[index] = proposal
+        source_repaired.append(index)
+        return True
 
     def refine(index: int, interval: int, exhausted: bool) -> None:
         nonlocal refinement_count
@@ -2561,6 +2824,9 @@ def fit_outlines(
             # constraint retries must not consume its refinement opportunities.
             # Count actual solves across topology rounds, keeping the same cap.
             while True:
+                control_count = 4 + sum(3 if k in fit.corners else 1 for k in fit.knots)
+                if control_count > 512 and fit.pieces and source_repair(index):
+                    break
                 try:
                     if fit.intervals != list(pairwise([0.0, *fit.knots, 1.0])):
                         solve_attempts[index] += 1
@@ -2593,6 +2859,17 @@ def fit_outlines(
                 else:
                     failed = cached[2]
                 if not failed:
+                    break
+                length = sum(
+                    hypot(q[0] - p[0], q[1] - p[1])
+                    for p, q in pairwise(fit.chain.points)
+                )
+                stalled = solve_attempts[index] == 14 or any(
+                    (fit.intervals[i][1] - fit.intervals[i][0]) * length
+                    < min(corner_scale_mm / 32, length / 128)
+                    for i in failed
+                )
+                if stalled and source_repair(index):
                     break
                 for interval in sorted(failed):
                     refine(index, interval, solve_attempts[index] == 14)
@@ -2766,6 +3043,9 @@ def fit_outlines(
                 diagnostics.update(curvature_diagnostics)
                 diagnostics.update(contact_diagnostics)
                 diagnostics.update(detail_diagnostics)
+                if shade_guides is not None:
+                    diagnostics["shade_guidance"] = shade_guides.diagnostics
+                    diagnostics["source_local_repairs"] = source_repaired
                 if contact_diagnostics.get("changed"):
                     diagnostics["topology_certificate"] = (
                         "native-to-proxy control-hull homotopy and interpreted palette relationships"

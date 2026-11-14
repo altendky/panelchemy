@@ -12,7 +12,8 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from panelchemy.raster_cleanup import RasterCleanupResult, cleanup
+from panelchemy.raster_cleanup import RasterCleanupResult
+from panelchemy.raster_retention import prepare_raster
 from panelchemy.separation import (
     ArtifactBundle,
     Mask,
@@ -141,6 +142,18 @@ def cleanup_files(
     after_label: str = "Cleaned reference",
 ) -> dict[str, bytes]:
     """Create reviewable previews from the exact same cleaned model input."""
+    body_width = result.diagnostics.get("body_width_mm", 0)
+    if isinstance(body_width, (int, float)) and body_width > 0:
+        if description == _DESCRIPTION:
+            description = (
+                "Print-scale body cleanup retains supported long strokes and short "
+                "original connections to their bodies. Magenta marks intentional "
+                "artwork edits; curve fitting uses the resulting reference."
+            )
+        if width_label == "compact-detail cutoff":
+            width_label = "body width"
+        if width_mm is None:
+            width_mm = body_width
     pixels = np.zeros((*result.changed.shape, 4), dtype=np.uint8)
     pixels[result.changed] = (255, 0, 180, 255)
     images = {
@@ -174,12 +187,15 @@ def prepare_cleanup_artifacts(
     *,
     long_edge_mm: float = 250,
     minimum_width_mm: float = 0.5,
+    stroke_body_width_mm: float = 0,
+    stroke_support_length_mm: float = 3,
+    line_width_mm: float = 0.5,
     silhouette_bytes: bytes | None = None,
     silhouette_name: str = "silhouette.png",
 ) -> ArtifactBundle:
     """Preview intentional edits without invoking vectorization, fitting or CAD."""
-    if minimum_width_mm == 0:
-        raise ValueError("minimum feature width must be positive for cleanup preview")
+    if minimum_width_mm == 0 and stroke_body_width_mm == 0:
+        raise ValueError("a cleanup width must be positive for cleanup preview")
     mask: Mask | None = None
     if silhouette_bytes is not None:
         with Image.open(BytesIO(silhouette_bytes)) as image:
@@ -187,7 +203,15 @@ def prepare_cleanup_artifacts(
     with Image.open(BytesIO(source_bytes)) as image:
         original = separate(image, config, silhouette=mask)
         source_preview = png_bytes(image.convert("RGBA"))
-    result = cleanup(original, long_edge_mm, minimum_width_mm)
+    result = prepare_raster(
+        original,
+        long_edge_mm=long_edge_mm,
+        compact_width_mm=minimum_width_mm,
+        body_width_mm=stroke_body_width_mm,
+        stroke_length_mm=stroke_support_length_mm,
+        line_width_mm=line_width_mm,
+    )
+    assert result is not None
     files = cleanup_files(result, source_name)
     manifest: dict[str, object] = dict(
         schema_version=1,
@@ -207,6 +231,9 @@ def prepare_cleanup_artifacts(
         ),
         long_edge_mm=long_edge_mm,
         minimum_width_mm=minimum_width_mm,
+        stroke_body_width_mm=stroke_body_width_mm,
+        stroke_support_length_mm=stroke_support_length_mm,
+        line_width_mm=line_width_mm,
         palette=[list(color) for color in original.config.palette],
         neutral_tolerance=original.config.neutral_tolerance,
         warnings=original.warnings,
@@ -227,6 +254,9 @@ def process_cleanup_file(
     *,
     long_edge_mm: float = 250,
     minimum_width_mm: float = 0.5,
+    stroke_body_width_mm: float = 0,
+    stroke_support_length_mm: float = 3,
+    line_width_mm: float = 0.5,
     silhouette_path: Path | None = None,
     protected_paths: tuple[Path, ...] = (),
 ) -> dict[str, object]:
@@ -237,6 +267,9 @@ def process_cleanup_file(
         config,
         long_edge_mm=long_edge_mm,
         minimum_width_mm=minimum_width_mm,
+        stroke_body_width_mm=stroke_body_width_mm,
+        stroke_support_length_mm=stroke_support_length_mm,
+        line_width_mm=line_width_mm,
         silhouette_bytes=silhouette_path.read_bytes() if silhouette_path else None,
         silhouette_name=silhouette_path.name if silhouette_path else "silhouette.png",
     )

@@ -42,7 +42,7 @@ palette or art-generation system remains a later product decision.
 ## Open Choices
 
 The user selected configurable defaults: 250 mm on the long edge, 0.4 mm nozzle,
-0.2 mm layer height, and black/orange/white band thicknesses of 2/1/1 mm (4 mm
+0.2 mm layer height, and black/orange/white band thicknesses of 1.6/0.4/0.6 mm (2.6 mm
 total). Taper angle is also configurable, in degrees from vertical. Zero gives
 vertical internal walls; larger angles expand the lower footprint while retaining
 the original top. Nozzle size guides tracing and bounded contact cleanup; the

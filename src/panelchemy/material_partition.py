@@ -10,11 +10,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from io import BytesIO
-from math import isclose, isfinite
+from math import isfinite
 from time import monotonic
 
 from OCP.Bnd import Bnd_Box
-from OCP.BRep import BRep_Builder
+from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy, BRepBuilderAPI_MakeFace
@@ -25,23 +25,36 @@ from OCP.collections import (
     List_TopoDS_Shape,
 )
 from OCP.gp import gp_Ax3, gp_Dir, gp_Pln, gp_Pnt
+from OCP.Precision import Precision
+from OCP.ShapeFix import ShapeFix_ShapeTolerance
 from OCP.TopAbs import (
     TopAbs_COMPOUND,
     TopAbs_COMPSOLID,
+    TopAbs_EDGE,
     TopAbs_FACE,
     TopAbs_FORWARD,
     TopAbs_REVERSED,
+    TopAbs_SHAPE,
     TopAbs_SOLID,
+    TopAbs_VERTEX,
 )
 from OCP.TopExp import TopExp
-from OCP.TopoDS import TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
+from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Iterator, TopoDS_Shape
 from OCP.TopTools import TopTools_FormatVersion_VERSION_3
 
 from panelchemy import occt
 from panelchemy.construction import ConstructionProfile
+from panelchemy.volume_comparison import compare_volumes
 
 _NAMES = ("black", "orange", "white")
+# OCCT's BRepLib.SameParameter default. This limits only overestimated EDGE
+# metadata on a checked private copy; it never grants extra geometric error.
+_EDGE_PRECISION_LIMIT = 1e-5
 type Band = tuple[str, float, float]
+
+
+class _BandBoundaryFailure(occt.KernelError):
+    """A native partition cell fails the unchanged geometric band bounds."""
 
 
 @dataclass(frozen=True)
@@ -185,7 +198,7 @@ def _audit(
             )
         name, bottom, top = matches[0]
         if low[2] < bottom - 1e-6 or high[2] > top + 1e-6:
-            raise occt.KernelError("partition cell crosses a material boundary")
+            raise _BandBoundaryFailure("partition cell crosses a material boundary")
         cells.append(MaterialCell(name, solid))
         counts[name] += 1
         volumes[name] += volume
@@ -194,9 +207,8 @@ def _audit(
         for index in range(1, local.Extent() + 1):
             face = local.FindKey(index)
             owners[faces.Add(face)].append((name, face.Orientation()))
-    if set(counts) != {name for name, _, _ in bands} or not isclose(
-        sum(volumes.values()), source_volume, rel_tol=1e-8, abs_tol=1e-7
-    ):
+    comparison = compare_volumes(source_volume, sum(volumes.values()))
+    if set(counts) != {name for name, _, _ in bands} or not comparison.acceptable:
         raise occt.KernelError("material volumes do not account for the combined solid")
     shared: Counter[str] = Counter()
     boundaries = {
@@ -233,6 +245,7 @@ def _audit(
         "cell_counts": dict(counts),
         "material_volumes_mm3": dict(volumes),
         "volume_accounting_difference_mm3": abs(sum(volumes.values()) - source_volume),
+        "volume_comparison": comparison.diagnostics(),
         "shared_face_counts": dict(shared),
     }
 
@@ -248,17 +261,8 @@ def seal_partition(
     )
 
 
-def build_partition(
-    source: TopoDS_Shape, profile: ConstructionProfile, names: Sequence[str]
-) -> MaterialPartition:
-    started = monotonic()
-    bands = _bands(profile, names)
-    copied = BRepBuilderAPI_Copy(source, True, False).Shape()
-    if not occt.valid(copied) or len(_solids(copied)) != 1:
-        raise occt.KernelError("copied source relief must be one valid positive solid")
-    source_volume = occt.volume(copied)
-    if not isfinite(source_volume) or source_volume <= 0:
-        raise occt.KernelError("copied source relief must be one valid positive solid")
+def _split_bands(copied: TopoDS_Shape, bands: tuple[Band, ...]) -> TopoDS_Shape:
+    """Keep one native graph for all finite horizontal cutting planes."""
     shape = TopoDS_Compound()
     builder = BRep_Builder()
     builder.MakeCompound(shape)
@@ -287,7 +291,99 @@ def build_partition(
                 "OCCT could not split the source into material bands"
             )
         shape = operation.Shape()
-    cells, diagnostics = _audit(shape, bands, source_volume)
+    return shape
+
+
+def _geometry_digest(shape: TopoDS_Shape) -> str:
+    """Normalize only precision on a second copy to bind all other BRep data."""
+    copied = BRepBuilderAPI_Copy(shape, True, False).Shape()
+    ShapeFix_ShapeTolerance().SetTolerance(
+        copied, Precision.Confusion_s(), TopAbs_SHAPE
+    )
+    return shape_digest(copied)
+
+
+def _precisions(shape: TopoDS_Shape) -> tuple[tuple[float, ...], ...]:
+    result: list[tuple[float, ...]] = []
+    for kind, cast_shape in (
+        (TopAbs_VERTEX, TopoDS.Vertex),
+        (TopAbs_FACE, TopoDS.Face),
+        (TopAbs_EDGE, TopoDS.Edge),
+    ):
+        shapes = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
+        TopExp.MapShapes_s(shape, kind, shapes)
+        result.append(
+            tuple(
+                BRep_Tool.Tolerance_s(cast_shape(shapes.FindKey(i)))
+                for i in range(1, shapes.Extent() + 1)
+            )
+        )
+    return tuple(result)
+
+
+def _condition_edge_precisions(
+    source: TopoDS_Shape,
+) -> tuple[TopoDS_Shape, dict[str, object]] | None:
+    """Reject any tighter metadata that cannot represent the exact source."""
+    copied = BRepBuilderAPI_Copy(source, True, False).Shape()
+    before = _precisions(copied)
+    if not any(tolerance > _EDGE_PRECISION_LIMIT for tolerance in before[2]):
+        return None
+    if not BRepCheck_Analyzer(copied, True, False, True).IsValid():
+        return None
+    geometry = _geometry_digest(copied)
+    _ = ShapeFix_ShapeTolerance().LimitTolerance(
+        copied, 0, _EDGE_PRECISION_LIMIT, TopAbs_EDGE
+    )
+    after = _precisions(copied)
+    if before[:2] != after[:2] or _geometry_digest(copied) != geometry:
+        raise occt.KernelError("edge precision conditioning changed source geometry")
+    changed = sum(a != b for a, b in zip(before[2], after[2], strict=True))
+    if (
+        not changed
+        or any(
+            b > a or b > _EDGE_PRECISION_LIMIT
+            for a, b in zip(before[2], after[2], strict=True)
+        )
+        or not BRepCheck_Analyzer(copied, True, False, True).IsValid()
+    ):
+        return None
+    return copied, {
+        "metadata_only": True,
+        "changed_edges": changed,
+        "target_mm": _EDGE_PRECISION_LIMIT,
+        "maximum_before_mm": max(before[2]),
+        "maximum_after_mm": max(after[2]),
+        "vertices_faces_precision_unchanged": True,
+        "geometry_digest_unchanged": geometry,
+        "exact_native_valid": True,
+    }
+
+
+def build_partition(
+    source: TopoDS_Shape, profile: ConstructionProfile, names: Sequence[str]
+) -> MaterialPartition:
+    started = monotonic()
+    bands = _bands(profile, names)
+    copied = BRepBuilderAPI_Copy(source, True, False).Shape()
+    if not occt.valid(copied) or len(_solids(copied)) != 1:
+        raise occt.KernelError("copied source relief must be one valid positive solid")
+    source_volume = occt.volume(copied)
+    if not isfinite(source_volume) or source_volume <= 0:
+        raise occt.KernelError("copied source relief must be one valid positive solid")
+    shape = _split_bands(copied, bands)
+    try:
+        cells, diagnostics = _audit(shape, bands, source_volume)
+    except _BandBoundaryFailure:
+        if len(bands) == 1:
+            raise
+        candidate = _condition_edge_precisions(source)
+        if candidate is None:
+            raise
+        conditioned, conditioning = candidate
+        shape = _split_bands(conditioned, bands)
+        cells, diagnostics = _audit(shape, bands, source_volume)
+        diagnostics["edge_precision_retry"] = conditioning
     diagnostics.update(
         method="single-source-depth-split" if len(bands) > 1 else "single-band-copy",
         elapsed_seconds=monotonic() - started,

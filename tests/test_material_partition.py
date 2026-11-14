@@ -71,7 +71,9 @@ def test_native_depth_partition_and_copy_share_opposite_interface_faces(
     if colors == 3:
         shapes.append(occt.prism(box(2, 2, 3, 3), 3, 4))
     source = occt.fuse(shapes)
-    profile = ConstructionProfile()
+    profile = ConstructionProfile(
+        black_thickness_mm=2, orange_thickness_mm=1, white_thickness_mm=1
+    )
     names = ("black", "orange", "white")[:colors]
     proof = build_partition(source, profile, names)
     materials = materials_for(proof)
@@ -110,6 +112,28 @@ def test_white_only_artwork_retains_orange_support_and_both_interfaces() -> None
     assert set(value.materials) == {"black", "orange", "white"}
     assert value.material_partition is not None
     assert value.material_partition.diagnostics["internal_plane_count"] == 2
+
+
+@pytest.mark.parametrize("drift", [5e-5, 2e-4])
+def test_partition_accounting_warns_for_negligible_drift_only(drift: float) -> None:
+    shape = occt.prism(box(0, 0, 10, 10), 0, 2)
+    source_volume = occt.volume(shape) / (1 + drift)
+    if drift == 2e-4:
+        with pytest.raises(occt.KernelError, match="volumes"):
+            _ = material_partition._audit(shape, (("black", 0, 2),), source_volume)  # pyright: ignore[reportPrivateUsage]
+        return
+    _, diagnostics = material_partition._audit(shape, (("black", 0, 2),), source_volume)  # pyright: ignore[reportPrivateUsage]
+    comparison = diagnostics["volume_comparison"]
+    assert isinstance(comparison, dict)
+    assert comparison["volume_warning"] is not None
+
+
+def test_negligible_volume_drift_does_not_hide_a_missing_material_band() -> None:
+    shape = occt.prism(box(0, 0, 10, 10), 0, 2)
+    with pytest.raises(occt.KernelError, match="volumes"):
+        _ = material_partition._audit(  # pyright: ignore[reportPrivateUsage]
+            shape, (("black", 0, 2), ("orange", 2, 3)), occt.volume(shape)
+        )
 
 
 def test_export_preserves_retained_partition_and_tessellation_cache_snapshots() -> None:
@@ -155,7 +179,7 @@ def test_equal_volume_moved_counter_cannot_replace_a_retained_material() -> None
     assert len(white.interiors) == 1
     moved = translate(Polygon(white.interiors[0]), xoff=1)
     replacement = Polygon(white.exterior.coords, [moved.exterior.coords])
-    changed = occt.prism(replacement, 3, 4)
+    changed = occt.prism(replacement, value.profile.orange_top, value.profile.white_top)
     assert occt.volume(changed) == pytest.approx(occt.volume(value.materials["white"]))
     value.materials["white"] = changed
     before = snapshots(value)

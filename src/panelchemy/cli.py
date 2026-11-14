@@ -141,7 +141,7 @@ def main() -> None:
             if minimum_width is None:
                 minimum_width = (
                     profile.raster_cleanup_mm
-                    if profile.raster_cleanup_mm > 0
+                    if profile.raster_cleanup_mm > 0 or profile.stroke_body_width_mm > 0
                     else profile.assumed_line_width_mm
                 )
             manifest = process_cleanup_file(
@@ -150,6 +150,9 @@ def main() -> None:
                 load_config(config_path),
                 long_edge_mm=profile.long_edge_mm,
                 minimum_width_mm=minimum_width,
+                stroke_body_width_mm=profile.stroke_body_width_mm,
+                stroke_support_length_mm=profile.stroke_support_length_mm,
+                line_width_mm=profile.assumed_line_width_mm,
                 silhouette_path=cast("Path | None", args.silhouette_mask),
                 protected_paths=tuple(
                     p for p in (config_path, profile_path) if p is not None

@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from io import BytesIO
-from math import isclose, isfinite
+from math import isfinite
 from typing import Protocol, cast
 
 from OCP.BRep import BRep_Builder
@@ -28,7 +28,7 @@ from OCP.XCAFDoc import (
     XCAFDoc_ShapeTool,
 )
 
-from panelchemy import material_partition, occt, step_topology
+from panelchemy import material_partition, occt, step_curve_domains, step_topology
 from panelchemy.construction import ConstructionProfile
 from panelchemy.export import (
     _STEP_LOCK,  # pyright: ignore[reportPrivateUsage]
@@ -40,6 +40,7 @@ from panelchemy.export import (
     _step_volume_allowance,  # pyright: ignore[reportPrivateUsage]
 )
 from panelchemy.separation import Palette, SeparationConfig
+from panelchemy.volume_comparison import compare_volumes
 
 _NAMES = ("black", "orange", "white")
 
@@ -121,7 +122,12 @@ def _check_shape(original: TopoDS_Shape, restored: TopoDS_Shape) -> dict[str, ob
         raise ExportError("STEP roundtrip invalidated a material solid")
     before, after = occt.volume(original), occt.volume(restored)
     allowance = _step_volume_allowance(original, before)
-    if not isfinite(after) or abs(before - after) > allowance["volume_allowance_mm3"]:
+    comparison = compare_volumes(
+        before,
+        after,
+        numerical_allowance_mm3=allowance["numerical_volume_allowance_mm3"],
+    )
+    if not comparison.acceptable:
         raise ExportError("STEP roundtrip changed material volume")
     low, high = _bounds(restored)
     if any(
@@ -135,8 +141,8 @@ def _check_shape(original: TopoDS_Shape, restored: TopoDS_Shape) -> dict[str, ob
         "solid_count": len(cells),
         "bounds_mm": [list(low), list(high)],
         "volume_mm3": after,
-        "volume_difference_mm3": abs(before - after),
         **allowance,
+        **comparison.diagnostics(),
     }
 
 
@@ -239,12 +245,15 @@ def _multipart_once(
     colors = XCAFDoc_DocumentTool.ColorTool_s(document.Main())
     root = shapes.NewShape()
     _ = TDataStd_Name.Set_s(root, TCollection_ExtendedString("Panelchemy relief"))
+    domain_preparations: dict[str, object] = {}
     for name in _NAMES:
         if name not in materials:
             continue
         # A single part definition can contain disconnected islands. They remain
         # grouped by band rather than becoming one top-level part per island.
-        prepared = BRepBuilderAPI_Copy(materials[name], True, False).Shape()
+        prepared, domain_preparations[name] = step_curve_domains.prepare_curve_domains(
+            materials[name]
+        )
         label = shapes.AddShape(prepared, False)
         _ = TDataStd_Name.Set_s(label, TCollection_ExtendedString(name))
         rgb = palette[_NAMES.index(name)]
@@ -276,7 +285,9 @@ def _multipart_once(
             if not Interface_Static.SetCVal_s("write.step.unit", previous):
                 raise ExportError("OCCT could not restore the STEP output unit")
     data = stream.getvalue()
-    return data, _read_assembly(data, materials, palette)
+    report = _read_assembly(data, materials, palette)
+    report["curve_domain_preparation"] = domain_preparations
+    return data, report
 
 
 def _multipart(
@@ -333,7 +344,8 @@ def export_step(model: StepModel, *, palette: Palette | None = None) -> ExportBu
             raise ExportError("source relief CAD must be one valid positive solid")
         materials, method = _copy_materials(model)
         total = sum(occt.volume(shape) for shape in materials.values())
-        if not isclose(total, volume, rel_tol=1e-8, abs_tol=1e-7):
+        comparison = compare_volumes(volume, total)
+        if not comparison.acceptable:
             raise ExportError("material volumes do not account for the combined solid")
         fused, fused_report = _step(source)
         multipart, multipart_report = _multipart(materials, palette)
@@ -347,6 +359,7 @@ def export_step(model: StepModel, *, palette: Palette | None = None) -> ExportBu
             "material_partition_method": method,
             "source_volume_mm3": volume,
             "material_volume_difference_mm3": abs(total - volume),
+            "material_volume_comparison": comparison.diagnostics(),
             "mesh_validated": False,
         },
     )

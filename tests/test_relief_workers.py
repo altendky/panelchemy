@@ -34,9 +34,11 @@ def test_build_relief_forwards_default_and_explicit_worker_counts(
     image.paste("white", (5, 5, 15, 15))
     result = separate(image, silhouette=np.ones((20, 20), dtype=np.bool_))
     profile = ConstructionProfile(long_edge_mm=20, contour_tolerance_mm=0.2)
-    kwargs = {} if workers is None else {"workers": workers}
     with pytest.raises(ReachedFitter):
-        _ = relief.build_relief(result, profile, **kwargs)
+        if workers is None:
+            _ = relief.build_relief(result, profile)
+        else:
+            _ = relief.build_relief(result, profile, workers=workers)
     assert seen == [1 if workers is None else workers]
     assert "workers" not in profile.as_dict()
 
@@ -53,10 +55,12 @@ def test_file_adapter_forwards_worker_count_before_native_construction(
         _result: SeparationResult,
         _profile: ConstructionProfile | None = None,
         *,
+        rgb_image: Image.Image | None = None,
         max_vertices: int = 25_000,
         workers: int = 1,
     ) -> relief.ReliefModel:
         assert max_vertices == 123
+        assert rgb_image is not None and rgb_image.size == (3, 3)
         seen.append(workers)
         raise ReachedFitter
 

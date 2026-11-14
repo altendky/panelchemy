@@ -89,7 +89,8 @@ def test_successful_initial_native_path_does_not_construct_an_alternative(
 ) -> None:
     token = cast("BRepFill_Draft", object())
 
-    def verified(*_args: object) -> BRepFill_Draft:
+    def verified(*_args: object, precise_draft: bool = False) -> BRepFill_Draft:
+        assert not precise_draft
         return token
 
     monkeypatch.setattr(n, "_verified_draft", verified)
@@ -101,8 +102,9 @@ def test_successful_initial_native_path_does_not_construct_an_alternative(
     assert diagnostics == {}
 
 
+@pytest.mark.parametrize("failure", [n._DraftArrayFailure, n._DraftLocationFailure])
 def test_known_failure_tries_identical_bezier_with_stock_arguments(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, failure: type[occt.KernelError]
 ) -> None:
     edge = generator(reverse=True)
     seen: list[GeomAbs_CurveType] = []
@@ -115,7 +117,10 @@ def test_known_failure_tries_identical_bezier_with_stock_arguments(
         slope: float,
         internal: bool,
         _diagnostics: dict[str, object] | None,
+        *,
+        precise_draft: bool = False,
     ) -> BRepFill_Draft:
+        assert not precise_draft
         part = BRepTools_WireExplorer(wire).Current()
         kind = BRepAdaptor_Curve(part).GetType()
         seen.append(kind)
@@ -123,7 +128,7 @@ def test_known_failure_tries_identical_bezier_with_stock_arguments(
         assert _diagnostics is diagnostics
         assert part.Orientation() == edge.Orientation()
         if kind == GeomAbs_BSplineCurve:
-            raise n._DraftArrayFailure("known native array failure")
+            raise failure("known native construction failure")
         assert kind == GeomAbs_BezierCurve
         return token
 
@@ -169,7 +174,10 @@ def test_unsupported_basis_keeps_the_original_quarter_trim_fallback(
     token = cast("BRepFill_Draft", object())
     full = adapter.FirstParameter(), adapter.LastParameter()
 
-    def verified(wire: TopoDS_Wire, *_args: object) -> BRepFill_Draft:
+    def verified(
+        wire: TopoDS_Wire, *_args: object, precise_draft: bool = False
+    ) -> BRepFill_Draft:
+        assert not precise_draft
         part = BRepAdaptor_Curve(BRepTools_WireExplorer(wire).Current())
         assert part.GetType() == GeomAbs_BSplineCurve
         assert n._geometry_bytes(part.BSpline()) == before
@@ -198,7 +206,10 @@ def test_unrelated_bezier_failure_propagates_without_quarter_retry(
 ) -> None:
     kinds: list[GeomAbs_CurveType] = []
 
-    def verified(wire: TopoDS_Wire, *_args: object) -> BRepFill_Draft:
+    def verified(
+        wire: TopoDS_Wire, *_args: object, precise_draft: bool = False
+    ) -> BRepFill_Draft:
+        assert not precise_draft
         kind = BRepAdaptor_Curve(BRepTools_WireExplorer(wire).Current()).GetType()
         kinds.append(kind)
         if kind == GeomAbs_BSplineCurve:
@@ -229,3 +240,95 @@ def test_changed_bernstein_coefficients_are_rejected(
     with pytest.raises(occt.KernelError, match="changed cubic coefficients"):
         _ = n._bezier_generator(edge, adapter)
     assert n._geometry_bytes(adapter.BSpline()) == before
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("failure", [n._DraftArrayFailure, n._DraftLocationFailure])
+def test_known_quarter_failure_retries_identical_bernstein_trim(
+    monkeypatch: pytest.MonkeyPatch,
+    reverse: bool,
+    failure: type[occt.KernelError],
+) -> None:
+    edge = generator(reverse=reverse)
+    adapter = BRepAdaptor_Curve(edge)
+    poles = [adapter.BSpline().Pole(i).Coord() for i in range(1, 5)]
+    before = n._geometry_bytes(adapter.BSpline())
+    seen: list[tuple[GeomAbs_CurveType, tuple[float, float]]] = []
+    token = cast("BRepFill_Draft", object())
+
+    def verified(
+        wire: TopoDS_Wire, *_args: object, precise_draft: bool = False
+    ) -> BRepFill_Draft:
+        assert not precise_draft
+        selected = BRepTools_WireExplorer(wire).Current()
+        actual = BRepAdaptor_Curve(selected)
+        kind = actual.GetType()
+        interval = actual.FirstParameter(), actual.LastParameter()
+        seen.append((kind, interval))
+        assert selected.Orientation() == edge.Orientation()
+        if interval == (0, 1) or (
+            kind == GeomAbs_BSplineCurve and interval == (0.75, 1)
+        ):
+            raise failure("known native construction failure")
+        if kind == GeomAbs_BezierCurve:
+            assert interval == (0.75, 1)
+            assert [actual.Bezier().Pole(i).Coord() for i in range(1, 5)] == poles
+        return token
+
+    monkeypatch.setattr(n, "_verified_draft", verified)
+    diagnostics: dict[str, object] = {}
+    assert (
+        n._independent_drafts(edge, BOTTOM, 4, SLOPE, True, diagnostics) == [token] * 4
+    )
+    assert seen == [
+        (GeomAbs_BSplineCurve, (0, 1)),
+        (GeomAbs_BezierCurve, (0, 1)),
+        *[(GeomAbs_BSplineCurve, (i / 4, (i + 1) / 4)) for i in range(4)],
+        (GeomAbs_BezierCurve, (0.75, 1)),
+    ]
+    assert diagnostics == {
+        "bezier_draft_generators": 1,
+        "subdivided_draft_generators": 1,
+    }
+    assert n._geometry_bytes(adapter.BSpline()) == before
+
+
+@pytest.mark.parametrize("bezier_retry", [False, True])
+def test_unrelated_quarter_failure_is_never_masked(
+    monkeypatch: pytest.MonkeyPatch, bezier_retry: bool
+) -> None:
+    seen: list[tuple[GeomAbs_CurveType, tuple[float, float]]] = []
+
+    def verified(
+        wire: TopoDS_Wire, *_args: object, precise_draft: bool = False
+    ) -> BRepFill_Draft:
+        assert not precise_draft
+        actual = BRepAdaptor_Curve(BRepTools_WireExplorer(wire).Current())
+        kind = actual.GetType()
+        interval = actual.FirstParameter(), actual.LastParameter()
+        seen.append((kind, interval))
+        if interval == (0, 1) or (bezier_retry and kind == GeomAbs_BSplineCurve):
+            raise n._DraftArrayFailure("known native array failure")
+        raise RuntimeError("unrelated quarter failure")
+
+    monkeypatch.setattr(n, "_verified_draft", verified)
+    with pytest.raises(RuntimeError, match="unrelated quarter failure"):
+        _ = n._independent_drafts(generator(), BOTTOM, 4, SLOPE, True, {})
+    assert seen[-1] == (
+        GeomAbs_BezierCurve if bezier_retry else GeomAbs_BSplineCurve,
+        (0, 0.25),
+    )
+
+
+def test_unsupported_quarter_basis_retains_the_known_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(n, "Geom_BezierCurve", unexpected)
+
+    def verified(*_args: object, precise_draft: bool = False) -> Never:
+        assert not precise_draft
+        raise n._DraftArrayFailure("known native array failure")
+
+    monkeypatch.setattr(n, "_verified_draft", verified)
+    with pytest.raises(n._DraftArrayFailure, match="known native array failure"):
+        _ = n._independent_drafts(unsupported("rational"), BOTTOM, 4, SLOPE, True, {})
