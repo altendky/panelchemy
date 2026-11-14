@@ -7,14 +7,15 @@ import pytest
 from panelchemy.construction import ConstructionProfile
 
 
-def test_user_defaults_define_thirteen_layers_and_three_bands() -> None:
+def test_user_defaults_define_fourteen_layers_and_three_bands() -> None:
     profile = ConstructionProfile()
     assert profile.long_edge_mm == 250
     assert profile.nozzle_diameter_mm == 0.4
     assert profile.layer_height_mm == 0.2
-    assert (profile.black_top, profile.orange_top, profile.white_top) == (1.6, 2, 2.6)
+    assert (profile.black_top, profile.orange_top, profile.white_top) == (1.6, 2, 2.8)
     assert profile.black_top / profile.layer_height_mm == 8
-    assert profile.white_top / profile.layer_height_mm == 13
+    assert profile.white_thickness_mm / profile.layer_height_mm == 4
+    assert profile.white_top / profile.layer_height_mm == pytest.approx(14)
     assert profile.contour_tolerance_mm == 0
 
 

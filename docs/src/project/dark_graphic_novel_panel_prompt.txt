@@ -1,0 +1,245 @@
+DARK GRAPHIC-NOVEL RELIEF-PANEL PROMPT
+
+Create a single, self-contained dark graphic-novel panel using the subject and captions supplied by the user. The artwork should also be suitable for eventual vector conversion and fabrication as a relief panel.
+
+Follow the visual principles below while making fresh compositional choices for each subject. Do not reuse a fixed arrangement of highlights, printed shading textures, scratches, tears, or ink marks.
+
+Required user inputs
+
+The user supplies:
+
+- A subject: a written description, one or more reference images, or both.
+- Captions: the exact text to include. The user may specify roles, emphasis, or placement, or explicitly request no text.
+
+The user may additionally provide physical dimensions, aspect ratio, orientation, minimum feature sizes, a preferred printed-shading texture, and other creative preferences.
+
+If the subject or caption instructions are missing, ask one concise question for the missing information. Use the defaults below for unspecified optional settings. Make reasonable artistic decisions about composition, lighting, and wear without requiring the user to specify individual marks.
+
+When photographs and illustrated references are both supplied, use photographs to establish identity and anatomy, and illustrations to establish visual treatment. Follow explicit user instructions where they differ from a reference. Do not automatically inherit wording, anatomical errors, or incidental details from a style reference.
+
+Default dimensions and detail limits
+
+Unless the user specifies otherwise:
+
+- Orientation: portrait.
+- Finished panel size: 180 mm wide × 250 mm high.
+- Aspect ratio of the panel itself: 18:25, width to height.
+- Measurement boundary: the outside edge of the black outer rim.
+- Minimum feature width: approximately 0.5 mm, treated as the lower design limit for substantial feature bodies, narrow connections, and isolated marks.
+- Minimum gap or recess width: approximately 0.5 mm.
+- Outer black rim: continuous, with a target width of at least 2 mm.
+- Exterior padding: plain white on every side, added outside the finished panel dimensions.
+
+Explicit user dimensions and aspect ratios override these defaults. If the user supplies only an aspect ratio, use it with a default longest panel edge of 250 mm. If explicit dimensions and an explicit aspect ratio conflict, resolve the conflict rather than silently stretching the artwork.
+
+The minimum detail size is a floor, not a uniform stroke weight. Preserve a useful range of line weights and feature sizes.
+
+Overall visual character
+
+Aim for a high-contrast, dark graphic-novel illustration with the character of bold ink artwork and limited-color printing.
+
+The panel should feel like one complete comic-book cell that could belong among other panels in a book. It should have a clear visual hierarchy, a strong subject, integrated lettering, and a definite physical boundary.
+
+Use:
+
+- Substantial, connected black shadow shapes.
+- Selective white highlights that reveal form.
+- Broad areas of uninterrupted black.
+- Crisp, expressive contours and purposeful interior marks.
+- A restrained orange accent.
+- Readable caption areas.
+- Controlled printing wear that gives the image character.
+
+The subject should retain believable proportions and recognizable form. Stylization comes through the selection of light, shadow, contour, and texture. Avoid exaggerated cartoon anatomy, photographic shading, soft airbrushing, and generic filter effects.
+
+Subject treatment and lighting
+
+Choose a composition appropriate to the supplied subject. For a person or animal, default to a close portrait with only the necessary neck or shoulder transition unless the user requests a wider view. For other subjects, use a similarly focused composition.
+
+Preserve identifying proportions, markings, distinctive features, and the intended expression. Do not replace a recognizable subject with a generic version of its type.
+
+Keep anatomy and perspective coherent. Features must follow the orientation of the head or body. A tilted subject should retain corresponding tilted feature relationships; do not independently align features to the page edges.
+
+Use strong directional illumination, choosing its direction to suit the subject and composition. Let substantial parts of the shadow side merge into the black background. Allow some contours to disappear naturally instead of outlining the entire subject in white.
+
+Keep enough information to recognize the subject and read its expression. Interpret fur, hair, feathers, fabric, and other textures through directional strokes and grouped shapes that follow the underlying form. Avoid lightning-like texture, arbitrary jaggedness, and indiscriminate microscopic hatching.
+
+Three-color palette
+
+Use only these flat, opaque colors unless the user explicitly requests a different palette:
+
+- Black — #000000
+- Orange — #F5A623
+- White — #FFFFFF
+
+Keep the subject predominantly black and white. Use orange primarily for lettering, caption fields, and a few appropriate focal accents. Choose those accents according to the subject; do not force an eye treatment or other accent onto every design.
+
+Express illumination through the shapes and placement of black and white. Do not introduce gray, extra shades of orange, smooth color or opacity gradients, translucent shading, glow, simulated paper color, or photographic lighting effects. Apparent tonal transitions made from discrete opaque printed marks are allowed as described below.
+
+For eventual relief conversion:
+
+- Black represents the base or recessed regions.
+- Orange represents the intermediate height.
+- White represents the highest features.
+
+These are artwork and height assignments. Do not draw simulated bevels, cast shadows, or colored outlines merely to illustrate the future layer stack.
+
+All interior regions must remain opaque. Internal black areas represent recesses, not transparent cutout holes.
+
+Captions and typography
+
+Reproduce the user’s captions verbatim, preserving spelling, capitalization, punctuation, and the number of punctuation marks. Add no invented wording.
+
+Use bold, expressive lettering with a graphic-novel character. Heavy italic or slanted display lettering is appropriate where it suits the supplied text. Keep the letter bodies, counters, and spaces robust and readable.
+
+Integrate caption areas into the composition. Orange lettering against black and black lettering within orange fields are characteristic treatments. Choose the arrangement according to the subject, text length, and visual balance rather than following a rigid layout.
+
+Keep lettering prominent enough to read comfortably without overwhelming the subject. If the text needs more room, adjust the composition or line breaks rather than making it excessively narrow or small.
+
+Wear may affect lettering, but it must not change the intended words or make punctuation ambiguous.
+
+Panel shape and boundary
+
+Enclose the artwork within an unbroken black outer rim.
+
+Use a generally rectangular panel with clipped, off-square, or subtly irregular corners where appropriate. The shape should feel intentionally drawn rather than mechanically perfect, while remaining a clear, closed boundary.
+
+A white inset rule or similar internal framing treatment can reinforce the comic-panel appearance. Its wear may vary, but the outer black rim must remain continuous and substantial.
+
+The outside of the black rim defines the eventual solid panel. Keep all artwork inside that boundary. Leave clean white padding outside it on every side.
+
+Printing wear and damage
+
+Use moderate, varied wear on lettering, colored fields, and internal framing, with much sparser wear in the black background.
+
+The subject and typography should remain the first things the viewer notices. Preserve the dark negative space that makes the lighting effective.
+
+Choose a restrained mixture of effects such as:
+
+- Scratched or chipped ink.
+- Rubbed patches and short scuffs.
+- Dry-ink breakup and dragged ink.
+- Small, irregular ink-drop clusters.
+- A few smears or blotches.
+- Localized creases or occasional tears.
+- Limited wear in the inset frame.
+
+Not every effect is needed in every image.
+
+Favor a little extra black ink damage on orange areas: small drops, compact rubbed patches, irregular chips, and purposeful scuffs. White abrasion in black areas should be selective and sparse.
+
+Vary the shapes, scales, directions, and grouping of marks. Avoid identical repeated scratches, evenly spaced damage, uniform grunge overlays, or marks distributed mechanically around every edge.
+
+Let wear follow the composition and suggest plausible handling or printing imperfections. Tears and creases should feel naturally situated rather than neatly aimed through the center of a particular letter. Preserve critical letter structures and subject features.
+
+Ink drops should read as irregular printing artifacts rather than extra punctuation. Keep them distinguishable from the supplied text.
+
+Use crisp, substantial shapes that respect the detail limit. Do not create clouds of microscopic dust, tiny pinholes, or fine random noise. Do not create damage by blurring edges or adding translucent texture.
+
+Printed shading textures and corner fades
+
+Use a deliberate printed-shading field when it helps balance the composition and reinforces the graphic-novel character. Choose one principal texture from the four options below unless the user requests a combination. The user may select a texture; otherwise choose one that suits the subject and layout. Do not automatically include all four in one panel.
+
+These textures are controlled shading devices, separate from incidental scratches, ink drops, tears, and other wear. A broader shading field does not call for more random background damage.
+
+Shared corner-fade treatment
+
+Anchor the field in a corner chosen to suit the composition, reaching the two adjoining edges. Do not prescribe the same corner, side, or orientation for every image. Keep the marks inside the panel's physical boundary.
+
+Make the field densest near its anchor, then progressively open it into the surrounding black. Use a broad, extended transition with a clearly visible middle-density region followed by a generous sparse fade. Give the texture enough area for the transition to read; do not confine it to a tiny dense patch followed by a few distant specks.
+
+The inner fade should have a gentle but visible CONCAVE sweep. Its middle boundary bows back toward the anchor corner, allowing the open black interior to scoop into the texture. The field reaches farther along the adjoining edges than through the middle of its inward-facing boundary. Avoid a rigid straight triangular cutoff or a convex bubble bulging into the open interior. Do not draw an outline around the fade.
+
+Let the marks' direction, placement, and density support this curving flow. Scale the field to the available composition and preserve a clear region of quiet black beyond it. To increase its coverage, extend the graded distribution farther inward rather than simply enlarging every mark or adding marks only along the edges.
+
+Use fully opaque marks in the specified palette, normally white on black. The apparent tonal gradient must come from mark size, spacing, and coverage, never gray, blur, transparency, or a smooth color gradient.
+
+The first three options should visibly feel artistic and hand-drawn. The halftone should remain deliberately machine-ordered.
+
+1. Loose, long-line cross-hatching
+
+Use predominantly long, continuous, flowing ink strokes in two loosely curved families. Let substantial strokes sweep across the corner field and follow its concave flow, with the second family crossing at varied oblique angles.
+
+Vary stroke length, width, spacing, curvature, pressure, and taper naturally. Keep a coherent directional rhythm and confident drawn lines. Avoid a perpendicular lattice, repeated diamond grid, identical rails, a tangled scribble, or numerous isolated little scratch-starbursts.
+
+Build density through more overlap near the corner. Progress toward fewer crossings and more open, separated long strokes through the fade. Retain substantial stroke bodies even where their ends taper to sharp points.
+
+2. Varied hand-drawn dashes
+
+Use individual short-to-medium ink gestures with visibly varied lengths, widths, orientations, and end shapes. Include a restrained mixture of tapered slashes, slightly curved dashes, and brush-like ends.
+
+Let their general direction turn along the concave sweep, while keeping individual marks separate and their grouping irregular. Avoid aligned rows, identical capsule shapes, and repeated machine stamps.
+
+Create the extended fade through fewer marks, more open spacing, and appropriate size variation. Do not shrink the sparse end into hairline dust.
+
+3. Coarse stippling and irregular chips
+
+Use compact, uneven rounded spots and small blot-like shapes, mixed with a minority of angular chips or fragments. Vary size, shape, orientation, spacing, and loose grouping with an intentional hand-placed character.
+
+Carry the density and size changes through the broad concave field. Keep clear black gaps even near the dense corner; avoid a merged white puddle. Do not turn the field into a regular dot grid, elongated dash pattern, or cloud of microscopic speckles.
+
+4. Curved, non-orthogonal machine halftone
+
+Use precise circular dots whose centers follow an orderly, gently curved and skewed lattice. The two underlying grid directions must meet at oblique, non-right angles. Both families of dot rows should bend smoothly across the corner flow.
+
+Do not merely rotate a conventional square grid. Curve and skew the positions of the dot centers while keeping the dots themselves circular; do not stretch them into ellipses or jitter them randomly.
+
+Maintain a controlled mechanical rhythm, with orderly local spacing and smooth changes through the curved grid. Do not require globally identical pitch after warping, but avoid abrupt spacing changes, disorder, or a radial vortex.
+
+Give the dots generous black breathing room, including at the dense end. Keep the largest dots moderate enough to remain clearly separated. If more spacing is needed, move dot centers farther apart while retaining a useful range of diameters; do not substitute smaller dots for the requested spacing.
+
+Create the fade primarily by reducing dot diameter toward the concave inner boundary. Spread that progression over a substantial area so the intermediate sizes and sparse end are visible. Keep the curved, oblique row structure readable throughout.
+
+Detail limits and interaction with the composition
+
+All four textures must respect the user's minimum feature-body and gap sizes, approximately 0.5 mm by default. Check the small enclosed spaces created by crossing strokes as well as the strokes themselves. End dot or chip fades before isolated marks become undersized. Sharp terminal points on substantial strokes remain acceptable.
+
+Use omission, increasing separation, fewer crossing layers, or selective shortening to keep the sparse end printable. Preserve expressive variation without creating tiny pinholes, slivers, accidental point-only joins, or hairline noise.
+
+Texture may pass behind caption areas where legibility permits, but it must not obscure important subject features, turn into extra punctuation, or overwhelm the composition. Keep the subject and captions dominant, and retain the separate, restrained wear treatment described above.
+
+Preserve detail while preparing for relief
+
+Retain the expressive detail that makes the artwork distinctive. Do not interpret the fabrication constraints as a request to remove all texture or thicken every line equally.
+
+Apply the minimum feature target to:
+
+- Meaningful stroke bodies.
+- Narrow structural connections.
+- Isolated dots and other marks.
+- Important gaps and enclosed recesses.
+
+Substantial features may taper to sharp terminal points. Preserve crisp corners and pointed tufts rather than rounding every contour.
+
+Where a detail is too fine, make a selective correction: strengthen its body, open the adjacent gap, join it into a meaningful larger shape, or simplify only the insignificant portion.
+
+Give important delicate features—such as whiskers, fine appendages, and defining contour strokes—enough body to survive conversion without turning them into heavy bands.
+
+Remove accidental pinholes, tiny slivers, and meaningless isolated fragments. Avoid point-only connections, self-touching outlines, and holes that touch their enclosing boundaries. Use either a clear gap or a substantial connection.
+
+Preserve intentional scratches, ink drops, other characteristic wear, and the selected printed-shading texture while applying these rules.
+
+Output and review
+
+Generate the actual artwork using the available image-generation capability.
+
+Deliver one complete, opaque PNG unless the user requests another format or a set of images. Use the highest available native resolution, preferably at least 2,000 pixels along the panel’s longest edge, excluding exterior padding.
+
+At the default 250 mm panel height, a 2,000-pixel panel has 8 pixels per millimeter, so a 0.5 mm feature is 4 pixels wide.
+
+Keep the final palette limited to the specified colors. When tools permit, verify opacity and color values and correct unintended intermediate shades.
+
+Before delivering, review:
+
+- Subject identity and coherent anatomy or geometry.
+- Exact caption wording, capitalization, and punctuation.
+- Strong light-and-shadow structure.
+- Restrained background wear and readable lettering.
+- When a printed-shading field is used, its broad concave fade, appropriate handmade or machine-ordered character, and clear separation from incidental wear.
+- The continuous outer rim and clean exterior padding.
+- Preservation of important fine details.
+- Minimum feature sizes and gaps to the extent they can actually be checked.
+
+Report the actual output resolution. Do not describe an enlarged file as higher native detail, or claim exact dimensional or minimum-feature compliance unless those properties have been measured.
+
+For a series, keep the palette, ink treatment, typography character, framing weight, and general wear intensity consistent. Let each subject have its own composition, lighting, selected shading texture, and naturally varied artifacts so the images complement one another without looking stamped from the same template. Preserve a user-selected texture across the series when requested; otherwise the four texture families provide controlled variation within the shared aesthetic.

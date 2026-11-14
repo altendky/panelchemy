@@ -18,7 +18,7 @@ bands. Disconnected islands remain grouped within their material component.
 Component colors use the separation palette, including custom configured colors.
 
 All components retain their original coordinates and millimeter units. With the
-default profile, black spans Z=0–1.6 mm, orange Z=1.6–2 mm and white Z=2–2.6 mm; no part
+default profile, black spans Z=0–1.6 mm, orange Z=1.6–2 mm and white Z=2–2.8 mm; no part
 is moved onto the build plate independently. STEP reimport verifies names,
 colors, solid counts, native validity, volumes, bounds and component placements.
 Source CAD and retained material-partition proofs are checked before export.
